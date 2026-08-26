@@ -174,6 +174,53 @@ struct HcclOpResParam {
     bool utraceStatusFlag;
 };
 
+#if (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)) || defined(__DAV_C310__)
+constexpr uint32_t HCCL_MTE_MAX_RANK_NUM = 64;
+constexpr uint64_t A5_MTE_STATE_WIN_SIZE = 1024UL * 1024UL;
+
+struct HcclA5OpResParam {
+    uint64_t workSpace;
+    uint64_t workSpaceSize;
+    uint32_t rankId;
+    uint32_t rankDim;
+    uint64_t winSize;
+    uint64_t windowsIn[HCCL_MTE_MAX_RANK_NUM];
+    uint64_t windowsOut[HCCL_MTE_MAX_RANK_NUM];
+    uint64_t xnAddr;
+    uint64_t ckeAddr;
+    uint64_t msAddr;
+    uint64_t msSize;
+};
+
+__aicore__ inline GM_ADDR GetHcclLocalWindowsIn()
+{
+    __gm__ HcclA5OpResParam *ctx = (__gm__ HcclA5OpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
+    return (GM_ADDR)(ctx->windowsIn[ctx->rankId] + A5_MTE_STATE_WIN_SIZE);
+}
+
+__aicore__ inline GM_ADDR GetHcclRankWindowsIn(int32_t rankId, int32_t curRank)
+{
+    (void)curRank;
+    __gm__ HcclA5OpResParam *ctx = (__gm__ HcclA5OpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
+    return (GM_ADDR)(ctx->windowsIn[rankId] + A5_MTE_STATE_WIN_SIZE);
+}
+#else
+__aicore__ inline GM_ADDR GetHcclLocalWindowsIn()
+{
+    __gm__ HcclOpResParam *ctx = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
+    return (GM_ADDR)(ctx->localWindowsIn);
+}
+
+__aicore__ inline GM_ADDR GetHcclRankWindowsIn(int32_t rankId, int32_t curRank)
+{
+    __gm__ HcclOpResParam *ctx = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
+    if (rankId == curRank) {
+        return (GM_ADDR)(ctx->localWindowsIn);
+    }
+    return (GM_ADDR)(((HcclRankRelationResV2 *)(ctx->remoteRes[rankId].nextDevicePtr))->windowsIn);
+}
+#endif
+
 // Transport
 enum class HcclAiRMAMemType : uint32_t {
     LOCAL_INPUT = 0,

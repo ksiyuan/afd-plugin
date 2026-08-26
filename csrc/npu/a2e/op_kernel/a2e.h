@@ -73,10 +73,10 @@ public:
 
         pipe.InitBuffer(tBuf, UB_SINGLE_TOTAL_SIZE_MAX);
 
-        epWinContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+        GM_ADDR localWindowsIn = GetHcclLocalWindowsIn();
 
-        magicTensor_.SetGlobalBuffer((__gm__ int32_t*)((epWinContext_->localWindowsIn) + 
-            IPC_DATA_OFFSET - blockNum * sizeof(int32_t) * INT32_COUNT_PER_BLOCK)); 
+        magicTensor_.SetGlobalBuffer((__gm__ int32_t*)(localWindowsIn +
+            IPC_DATA_OFFSET - blockNum * sizeof(int32_t) * INT32_COUNT_PER_BLOCK));
 
         LocalTensor<int32_t> tempLocal = tBuf.GetWithOffset<int32_t>(INT32_COUNT_PER_BLOCK, 0);
         tempLocal(0) = 1;
@@ -91,20 +91,15 @@ public:
         PipeBarrier<PIPE_ALL>();
 
         if (rank >= expertRankSize) {
-            shareAddrs[rank] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
-            shareAddrs[rank % expertRankSize] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->
-                remoteRes[rank % expertRankSize].nextDevicePtr))->windowsIn) + (rank % expertRankSize) * OPT_RANK_OFFSET;
+            shareAddrs[rank] = localWindowsIn + rank * OPT_RANK_OFFSET;
+            int32_t remoteRank = rank % expertRankSize;
+            shareAddrs[remoteRank] = GetHcclRankWindowsIn(remoteRank, rank) + remoteRank * OPT_RANK_OFFSET;
             pipe_barrier(PIPE_ALL);
         } else {
             pipe_barrier(PIPE_ALL);
 
             for (int i = 0; i < rankSize; i++) {
-                if (i == rank) {
-                    shareAddrs[i] = (GM_ADDR)(epWinContext_->localWindowsIn) + rank * OPT_RANK_OFFSET;
-                    continue;
-                }
-                shareAddrs[i] = (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->remoteRes[i].nextDevicePtr))->
-                    windowsIn) + i * OPT_RANK_OFFSET;
+                shareAddrs[i] = GetHcclRankWindowsIn(i, rank) + i * OPT_RANK_OFFSET;
             }
         }
 
@@ -357,7 +352,6 @@ private:
     __gm__ T *x;
     __gm__ TQ *expandX;
     __gm__ float *dynamicScales;
-    __gm__ HcclOpResParam *epWinContext_{nullptr};
     TPipe pipe;
     TBuf<QuePosition::VECCALC> tBuf;
     GM_ADDR shareAddrs[CAM_MAX_RANK_SIZE];

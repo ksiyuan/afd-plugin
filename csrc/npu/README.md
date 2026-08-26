@@ -40,7 +40,9 @@ Common environment variables:
   `/usr/local/Ascend/ascend-toolkit/latest`.
 - `TORCH_NPU_PATH`: optional path to the `torch_npu` package.
 - `SOC_VERSION`: `910c`, `ascend910_93*`, and `ascend910_9392` build
-  `a2e;e2a`.
+  `a2e;e2a` for Ascend 910C. `950`, `a5`, `ascend950*`, and `ascend910_95*`
+  build the same operators for Atlas A5 (DAV_3510). CANN 9.1 compiles
+  `ascend950`; CANN 8.5 uses the older `ascend910_95` alias.
 - `MAX_JOBS`: number of parallel CMake build jobs for the PyTorch extension.
 - `AFD_SKIP_ACLNN_BUILD=1`: skip rebuilding the ACLNN operator package and
   build the PyTorch extension against an existing custom-op installation.

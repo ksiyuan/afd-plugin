@@ -171,3 +171,24 @@ def test_ascend_ops_use_isolated_namespace_and_vendor_path():
     assert '"vllm-ascend"' not in cann_cmake
     assert "AFD_CUST_OPAPI_LIB_PATH" in op_api_common
     assert 'return "libcust_opapi.so"' not in op_api_common
+
+
+def test_a2e_e2a_ops_are_registered_for_910c_and_a5():
+    root = Path(__file__).resolve().parents[3]
+    a2e_def = (root / "csrc/npu/a2e/op_host/a2e_def.cpp").read_text()
+    e2a_def = (root / "csrc/npu/e2a/op_host/e2a_def.cpp").read_text()
+    build_script = (root / "csrc/npu/build_aclnn.sh").read_text()
+    a2e_tiling = (root / "csrc/npu/a2e/op_host/a2e_tiling.cpp").read_text()
+    e2a_tiling = (root / "csrc/npu/e2a/op_host/e2a_tiling.cpp").read_text()
+
+    assert 'AddConfig("ascend910_93")' in a2e_def
+    assert 'AddConfig("ascend910_95")' in a2e_def
+    assert 'AddConfig("ascend950")' in a2e_def
+    assert 'AddConfig("ascend910_93")' in e2a_def
+    assert 'AddConfig("ascend910_95")' in e2a_def
+    assert 'AddConfig("ascend950")' in e2a_def
+    assert "resolve_a5_compute_unit" in build_script
+    assert "ascend950" in build_script
+    assert "ascend910_95" in build_script
+    assert "SetCommEngine(HCCL_COMM_ENGINE_MTE)" in a2e_tiling
+    assert "SetCommEngine(HCCL_COMM_ENGINE_MTE)" in e2a_tiling

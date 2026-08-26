@@ -37,6 +37,18 @@ constexpr int ATTR_AIV_NUM = 7;
 constexpr int ATTR_COMPUTE_GATE = 8;
 
 constexpr uint32_t OP_TYPE_ALL_TO_ALL = 8;
+constexpr uint32_t DAV_3510_ARCH = 3510;
+constexpr uint32_t HCCL_COMM_ENGINE_MTE = 3;
+
+bool IsDav3510(gert::TilingContext *context)
+{
+    auto *platformInfo = context->GetPlatformInfo();
+    if (platformInfo == nullptr) {
+        return false;
+    }
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+    return static_cast<uint32_t>(ascendcPlatform.GetCurNpuArch()) == DAV_3510_ARCH;
+}
 }
 
 namespace optiling {
@@ -87,6 +99,9 @@ namespace optiling {
         std::string algConfigAllToAllStr = "AlltoAll=level0:fullmesh;level1:pairwise";
 
         AscendC::Mc2CcTilingConfig mc2CcTilingConfig(groupEp, opType1, algConfigAllToAllStr);
+        if (IsDav3510(context)) {
+            mc2CcTilingConfig.SetCommEngine(HCCL_COMM_ENGINE_MTE);
+        }
         mc2CcTilingConfig.GetTiling(tiling->mc2InitTiling);
         mc2CcTilingConfig.GetTiling(tiling->mc2CcTiling1);
 
