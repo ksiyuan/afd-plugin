@@ -61,7 +61,7 @@ CAMP2p 使用插件自带的 a2e/e2a 算子，不依赖 CAM 包，是 A5 上唯�
 
 - `validation.py` 仅拒绝 310P/XLite worker，接受标准 `NPUWorker` —— A5 用标准 NPUWorker，无需改。
 - NPU 连接器 / model runner 依赖的 vLLM-Ascend 接口（`get_hccl_comm_name`、forward_context 等）
-  随 ① 的版本变化需复核。
+  在固定基线 `80d8c194f` 上无需改动；**仅当后续升级 vLLM-Ascend 版本时**需随新版本复核。
 
 ### ⑤ 构建系统
 
