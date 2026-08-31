@@ -8,24 +8,33 @@
 
 - 目标硬件：**Atlas A5**，芯片 **Ascend 950PR**（CANN SOC 名 `ascend950`，架构 DAV_3510，
   arch 值 3510）；另一变体 950DT 的 SOC 名为 `ascend950dt_9582`。
-- 现状基线（910C）：vLLM `0.26.0` + vLLM-Ascend commit `80d8c194f` + 配套 CANN/torch_npu，
-  仅验证过 Ascend 910C / Atlas A3。
+- 现状基线（910C）：vLLM `0.26.0` + vLLM-Ascend commit `80d8c194f` + 配套 CANN/torch_npu。
+  **验证记录只覆盖 Ascend 910C / Atlas A3**，但代码层面 `80d8c194f` **已包含 ascend950/A5 支持**
+  （见 ①）。
 - 本分支（`a5-adapt`）：私有 fork `ksiyuan/afd-plugin` 的 main + PR #276（A5 算子适配）+
   B 修改（移除 `SetCommEngine(MTE)`）。
 
 ## 适配清单（按优先级）
 
-### ① vLLM-Ascend 版本基线（最高优先级，工作量最大）
+### ① vLLM-Ascend 版本基线（代码已支持 A5，缺的是验证）
+
+**已确认：commit `80d8c194f`（2026-08-01）本身已包含 ascend950/A5 支持**：
+
+- 构建层：`CMakeLists.txt` 有 `ascend950` 分支，`Dockerfile.a5` / `Dockerfile.a5.openEuler` 存在，
+  `csrc/scripts/util/const_var.py` 含 `"ascend950": "Ascend950"`；
+- 运行时层：`vllm_ascend/attention/dsa_v1.py`、`vllm_ascend/device/mxfp_compat.py` 均有 Ascend950 分支；
+- A5 支持由 `#7151`（Add support for Ascend950 chip）与 `#9271`（A5 custom op build）引入，均早于 `80d8c194f`。
 
 | 项 | 现状 | 需要做的事 |
 | --- | --- | --- |
-| vLLM-Ascend 版本 | AFD 锁定 commit `80d8c194f`（910C 时代），该快照**无 ascend950 支持** | 换成支持 ascend950 的 vLLM-Ascend 版本（当前 main 已有） |
-| AFD 兼容补丁 | `compat/patches/npu/` 全部按 80d8c194f 内部接口编写 | 逐一对齐新版本：`ascend_platform.py`、`force_load_balance.py`、`mla_graph.py`、`config_validation.py` |
-| CANN / torch_npu | 未确认（需 `version.info`） | 用与 vLLM-Ascend A5 快照互配的 CANN（CANN 9.1 命名为 `ascend950`）+ torch_npu |
+| vLLM-Ascend 基线 | `80d8c194f` 代码层已支持 ascend950，AFD 补丁也锚定此版本 | **无需换版本**；在该版本上完整验证 A5 链路（正在做） |
+| AFD 兼容补丁 | `compat/patches/npu/` 按 80d8c194f 内部接口编写 | 在 80d8c194f 上应用无问题；**仅当后续升级 vLLM-Ascend 版本时才需逐条重新核对**（版本升级问题，非 A5 特有问题） |
+| CANN / torch_npu | 未确认（需 `version.info`） | 用与 80d8c194f A5 路径互配的 CANN（CANN 9.1 命名为 `ascend950`）+ torch_npu |
 
+> 注：afd-plugin README 的 "Ascend 910C / Atlas A3" 指的是**验证证据**，不是代码能力边界。
+> A5 上的真正风险点是把 `a2e/e2a` 算子、连接器、图/DBO 等整条 AFD 链路在 A5 上跑通并记录证据。
 > 补丁锚点示例：`compat/patches/npu/ascend_platform.py` 注释
 > "Upstream source: `vllm_ascend/platform.py` at commit `80d8c194f`"。
-> 换版本后必须逐条核对补丁是否仍命中，否则会悄悄失效。
 
 ### ② a2e/e2a 自定义算子（当前进行中）
 
