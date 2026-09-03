@@ -1,11 +1,12 @@
 # A5 SHMEM 重写 —— 启动前置验证清单
 
-状态：**冷冻方案 b 的解冻门禁** · 最后更新：2026-09-03
+状态：**主线（SHMEM 重写）的可行性门禁 + 分工清单** · 最后更新：2026-09-03
 
-> 上游文档：[`A5_custom_op_investigation.md`](A5_custom_op_investigation.md) 的
-> 《SHMEM 重写的新证据》《下一步方案 › 冷冻 b》两节。本清单把那里列的 3 条
-> 启动前置拆成可在 A5 节点逐条执行的动作，每条都给出**明确的通过/失败判据**。
-> 三条全绿才允许把 SHMEM 重写从冷冻转为在研；任意一条红，写回本文件并维持冷冻。
+> 上游文档：[`A5_custom_op_investigation.md`](A5_custom_op_investigation.md)。
+> SHMEM 重写是当前主线（B2 降为备用）。本清单把启动前置拆成可在 A5 节点逐条
+> 执行的动作，每条给出**明确的通过/失败判据**。P3/P4 是可行性门禁：双绿则
+> 正式进入重写实现；任一红则 SHMEM 在当前 A5 软件栈上不成立，回退备用方案
+> e（B2 优化），并把红的读数写回本文件。
 >
 > 本地快照 [`shmem-src/`](../../../shmem-src/)（工作区根，59 文件）是 device 侧 +
 > transport 侧的**子集**：**不含** `include/host/`(init/team/mem 头)、
@@ -119,7 +120,7 @@ bash scripts/build.sh -DSHMEM_RDMA=ON        # 具体 flag 名以 build 脚本�
 
 ## P3 —— 混合拓扑的引擎选择探针（决定性测试）
 
-**这是解冻门禁的核心。** 2-rank，device 只用 0/1，1 Attention + 1 FFN，
+**这是可行性门禁的核心。** 2-rank，device 只用 0/1，1 Attention + 1 FFN，
 复现 AFD 的混合组形状。
 
 ### probe 要做的事
@@ -165,10 +166,10 @@ extern "C" __global__ __aicore__ void ShmemTopoProbe(GM_ADDR win) {
 
 | `topo_list[peer]`（对端 rank，非自己） | 含义 | 门禁 |
 | --- | --- | --- |
-| 含 `UDMA` 位 | 跨端走 UDMA 引擎，AI core 不寻址对端 | **绿 —— 解冻。** 进 P4 |
+| 含 `UDMA` 位 | 跨端走 UDMA 引擎，AI core 不寻址对端 | **绿。** 进 P4 |
 | 只含 `ROCE` 位 | 跨端走 RDMA 引擎 | **绿（次选）。** 进 P4，注意延迟 |
 | 含 `SDMA` 位 | 同 die/同 super-node 的 SDMA | 绿，但确认 A/F 跨节点时还成立 |
-| **只含 `MTE` 位** | AI core 直接寻址对端 heap | **红 —— 与 a2e/e2a 同根因，SHMEM 不解决。** 写回文档，维持冷冻 |
+| **只含 `MTE` 位** | AI core 直接寻址对端 heap | **红 —— 与 a2e/e2a 同根因，SHMEM 不解决。** 写回读数，回退备用方案 e |
 | 全 0 / peer 不可达 | 混合组没建立 transport | **红。** 等价于 `remoteResNum==0`，SHMEM init 没为这个拓扑建链 |
 
 附加观察：
@@ -231,7 +232,7 @@ P3 绿之后做。验证「对称窗口 + 引擎搬运 + 旗标同步」这条�
 
 ## P6 —— AFD 集成面盘点（Windows 侧，无需 NPU）
 
-与 P1–P5 并行，为解冻后的设计做准备：
+与 P1–P5 并行，为重写实现做准备：
 
 - [ ] **init 时机 / bootstrap**：SHMEM `aclshmemx_init_attr` 需要 rank0 UID 广播。
       对上 [`afd_plugin/connectors/npu/camp2p.py`](../../afd_plugin/connectors/npu/camp2p.py)
@@ -260,13 +261,13 @@ P3 绿之后做。验证「对称窗口 + 引擎搬运 + 旗标同步」这条�
 | --- | --- | --- | --- |
 | P0 完整源码 | A5 clone | 完整仓 + 构建脚本就位 | —— |
 | P1 运行时自带？ | A5 | `shmem.h` + `*shmem*.so` + init 声明 | 转 P2 |
-| P2 源码构建 | A5 | `libaclshmem*.so` + `ACLSHMEM_UDMA_SUPPORTED=1` | 记录缺失依赖，维持冷冻 |
-| **P3 引擎选择探针** | **A5 2-rank** | **`topo_list[peer]` 含 UDMA / ROCE / SDMA 位** | **只有 MTE 位或全 0 → 维持冷冻，写回文档** |
+| P2 源码构建 | A5 | `libaclshmem*.so` + `ACLSHMEM_UDMA_SUPPORTED=1` | 记录缺失依赖，回退备用方案 e |
+| **P3 引擎选择探针** | **A5 2-rank** | **`topo_list[peer]` 含 UDMA / ROCE / SDMA 位** | **只有 MTE 位或全 0 → 回退备用方案 e，写回读数** |
 | P4 put+signal 往返 | A5 2-rank | payload 校验通过，无 507035 | 记录崩溃原语 |
 | P5 官方示例 | A5 2-rank | （参考）失败点与 P4 一致 | —— |
 | P6 集成面盘点 | Windows | 替换点清单 + team 映射清楚 | —— |
 
-**P3 + P4 双绿 = 解冻 SHMEM 重写。** 否则 investigation 文档主线保持 e（B2 优化）
+**P3 + P4 双绿 = 正式进入 SHMEM 重写实现。** 否则回退备用方案 e（B2 优化）
 + 并行 d（问 CANN/HCCL）。
 
 ---

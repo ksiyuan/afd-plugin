@@ -1,6 +1,6 @@
 # A5（Ascend 950）自定义算子 507035 定位：混合组拿不到远端窗口资源
 
-状态：**自定义算子经 HCCL 窗口路径已确认封死；主线转 B2 优化** · 最后更新：2026-09-03
+状态：**HCCL 窗口路径已封死；主线 = SHMEM 对称内存重写（preflight P0–P6），B2 降为备用** · 最后更新：2026-09-03
 
 > 先读 [`A5_ADAPTATION.md`](A5_ADAPTATION.md)。那份文档记录了前一轮调查
 > （分支 tag `backup/a5-debug-507035`、`backup/a5-full-record`），结论是
@@ -90,15 +90,16 @@ a2e[rank=0] flat: windowsIn[0]=120b00000000  windowsIn[1]=124000000000
 | 方案 | 成本 | 概率 | 状态 |
 | --- | --- | --- | --- |
 | ~~a. comm engine 扫值~~ | ~1h | — | **已做，全灭**（0..7 无一分配，见上节）。路封死。 |
-| **b. SHMEM / 对称内存改造** | 几周，要 NPU | 中 | **蓝本已确认（见下节）**：CANN SHMEM 仓库（gitcode.com/cann/shmem）的 device RMA 走 UDMA/RDMA 引擎 + 对称内存，官方已带 MoE dispatch/combine 双平面示例。不是拿 `shmem_ptr` 直读对端（A5 会崩），而是引擎代劳。**唯一还活着的自定义算子路径。** |
+| **b. SHMEM / 对称内存改造** | 几周，要 NPU | 中 | **主线（2026-09-03 晚定）**。蓝本：CANN SHMEM 仓库（gitcode.com/cann/shmem）的 topo-aware device RMA（`aclshmem_putmem/getmem` 内部按 `topo_list` 选 SDMA→UDMA→MTE→ROCE），跨端由 UDMA/RDMA 引擎代劳、AI core 不寻址对端。不是 `shmem_ptr` 直读（A5 会崩）。启动前置见 [`A5_shmem_preflight.md`](A5_shmem_preflight.md)。 |
 | c. 拆成 A5 认可的组 | 大 | 低 | 让 a2e/e2a 跑在一个均匀子拓扑上。混合组形状是根因，但 AFD 的 A/F 切分本质上就是非均匀，映射代价不明，暂缓。 |
-| **d. 找 CANN / HCCL** | 阻塞 | — | 问法现在更硬：ascend950 上混合了 MC2 专家 rank 与非专家 rank 的组，`HcclAllocComResourceByTiling` **在 comm engine 0..7 全部取值下**都不给 `remoteRes`，是否有支持的配置？附本文档 dump + 扫值结果。**并行推进，不阻塞 e。** |
-| **e. 优化 B2** | 几天～，要 NPU | 高 | **确定的主线。** 2-ubatch overlap 是主杠杆，见下文。 |
+| **d. 找 CANN / HCCL** | 阻塞 | — | 问法现在更硬：ascend950 上混合了 MC2 专家 rank 与非专家 rank 的组，`HcclAllocComResourceByTiling` **在 comm engine 0..7 全部取值下**都不给 `remoteRes`，是否有支持的配置？附本文档 dump + 扫值结果。**并行推进，不阻塞 b。** |
+| e. 优化 B2 | 几天～，要 NPU | 高 | **降级为备用方案**。SHMEM 若在 preflight 门禁被判死（P3 只有 MTE 位 / P4 崩）再回到这条。2-ubatch overlap 仍是这条路的主杠杆。 |
 
-**当前判断（2026-09-03 更新）**：comm engine 扫值已排除，自定义算子除 SHMEM
-重写外没有便宜的救法。**主线锁定 e（优化 B2）**；同时把 d（找 CANN/HCCL）作为
-并行的低成本动作发出去；b（SHMEM）只有在 B2 优化后吞吐仍不达标、且愿意压几周
-NPU 排期时才启动。
+**当前判断（2026-09-03 晚更新）**：**主线锁定 b（SHMEM 重写）**，B2 降为备用。
+理由：B2 是串行往返，吞吐上限 `1/(t_attn+t_ffn+2·t_comm)`，优化只能压常数、
+拿不回 `1/max(t_attn,t_ffn)` 的量级；SHMEM 走 AI core 轮询 IPC 窗口、可流水，
+是唯一能追平 910C 自定义算子形态的路。d（找 CANN/HCCL）并行发出。
+**下一步：执行 [`A5_shmem_preflight.md`](A5_shmem_preflight.md) 的 P0–P6。**
 
 ---
 
@@ -231,62 +232,49 @@ OpenSHMEM 风格对称内存 RMA 库，master = v1.6.0，2026-07）扒下来做�
   直接抄官方双平面示例。
 - 前置仍需验证：CANN 9.1.0 是否随带 SHMEM 运行时（`source set_env.sh` +
   `-DSHMEM_RDMA=ON` 构建）、A5 上 `topo_list[pe]` 实际给 UDMA 还是 RDMA。
-  **维持冷冻**，主线仍是 e（B2 优化）+ 并行 d（问 CANN）。
+  拆成可执行清单 [`A5_shmem_preflight.md`](A5_shmem_preflight.md)。
 
-## 下一步方案（2026-09-03 起）
+## 下一步方案（2026-09-03 晚起 —— SHMEM 转主线）
 
-### 主线 — e. B2 优化
+### 主线 — b. SHMEM 重写
 
-分三步，只有 step 1 卡在"需要 A5 机时"，其余我在 Windows 侧就能推代码：
+执行 [`A5_shmem_preflight.md`](A5_shmem_preflight.md) 的 P0–P6。分工：
 
-**Step 1（你，A5）— 拿基准数，回答"B2 比 910C 自定义算子差多少"**
+**A5 机时（你）— preflight P1–P5，按顺序做，遇红即停**
 
-- 清残留 vLLM 进程，device 只用 0/1。
-- 跑 B2 2-rank eager 1A+1F DeepSeek-V2-Lite，decode-only 计时循环，量：
-  - TPOT / 单卡吞吐（token/s），和 910C 自定义算子同模型同 A/F 切分的历史数对比
-  - 每 decode step 的 comm 字节数、`send`/`recv` 次数
-  - comm 是否与 FFN 计算串行（预期"是"，确认量级）
-- harness：扩 `tests/e2e/runner.py` 加一个 A5 2-rank 场景 + decode 计时段，
-  或照 `tools/npu_a5_p2p_probe.py` 写独立脚本。**脚本我来写**，你只跑。
+- P1：CANN 9.1.0 是否随带 SHMEM 运行时 + 头（一条 `find` 命令，见清单）。
+- P2：不带则从完整 cann/shmem 源码构建，确认 `ACLSHMEM_UDMA_SUPPORTED=1`。
+- **P3（门禁）**：2-rank 1A+1F 跑 topo 探针，读 `state->topo_list[peer]` ——
+  含 UDMA/ROCE 位 → 绿；只有 MTE 位 / 全 0 → 红，SHMEM 死，回退 e。
+- **P4（门禁）**：最小 put+signal 往返，payload 校验通过且无 507035。
+- P5：官方 doubleplane 示例跑一遍（参考，非门禁）。
+- 探针的 host + kernel 代码我在 Windows 侧写好给你，你只 build + run。
 
-**Step 2（我，开分支）— 低风险快速优化，先合入**
+**Windows 侧（我）— 不依赖 NPU 的准备**
 
-- `p2p_recv` 按 `(shape, dtype, peer)` 预分配 / 缓存 recv buffer，去掉每层
-  `torch.empty`。
-- FFN 侧逐 peer recv 循环 → `dist.batch_isend_irecv`（1 次 launch 代替 N 次），
-  参考 `vllm_ascend/eplb/eplb_updator.py`。
-- 阻塞 `send`/`recv` → `isend`/`irecv` + 显式 `.wait()`，让第 L 层 send 与
-  recv buffer 准备重叠。
-- 确认 `p2p_send` 的 `.contiguous()` 对正常路径是 no-op。
-- 910C 冒烟回归后合。你在 A5 上复跑 Step 1 的计时，看这批改动吃掉多少。
+- P0：尽量用 gitcode v5 API 补全 `shmem-src/` 快照（host/init 头 + 构建系统）。
+- P3/P4 探针代码：host launch + `ShmemTopoProbe` / `ShmemPutSignalProbe` kernel。
+- **P6：a2e/e2a 集成面盘点** —— `winBaseOf` / `shareAddrs[]` /
+  `waitFlagWithScalar` / `sendX` / `sendExpertIds` / `sendExpertScales` /
+  `sendBatchSize` / `recvWithMte` / `recvExpertIdsWithMte` 逐个映射到 SHMEM
+  对称 offset + `aclshmem_putmem/getmem` + `aclshmemx_signal_op`；team 切分
+  （A/F 混合组 → `aclshmem_team_split_strided`）；窗口尺寸对称化。
+- 构建集成：`csrc/npu/CMakeLists.txt` + `build_aclnn.sh` 加 SHMEM 开关。
 
-**Step 3（我设计 + 你验）— 主杠杆：连接器内 2-ubatch 乒乓（DBO-lite）**
-
-- FFN 算第 L 层 ubatch A 时，attention 算第 L 层 ubatch B，交替用已按 ubatch
-  建好的 `afd` / `afd1` 组，藏住 comm 延迟。
-- **不碰原生 DBO / 不需要自定义 yield 算子**，只在 `CAMP2pAFDConnector` +
-  `attention_model_runner` / `ffn_model_runner` 的 ubatch 处理里做交替。
-- 有 Step 1/2 的数后再定工作量，但大概率是唯一能把吞吐拉到接近
-  `1/max(t_attn, t_ffn)` 的手段。
-
-### 并行 — d. 升级问 CANN / HCCL（不阻塞 e）
+### 并行 — d. 升级问 CANN / HCCL（不阻塞 b）
 
 带上本文档的 dump + "comm engine 0..7 全灭"结果，问：ascend950 上一个混了
 MC2 专家 rank 和非专家 rank 的组，`HcclAllocComResourceByTiling` 在所有 comm
 engine 取值下都不分配 `remoteRes`，有没有支持的 tiling / 建组配置？渠道：
-CANN issue / HCCL 对接人 / 内部 Ascend 群。
+CANN issue / HCCL 对接人 / 内部 Ascend 群。**顺带问 SHMEM 在这个混合拓扑上
+`topo_list` 会给什么引擎**（等于让对方先回答 P3）。
 
-### 冷冻 — b. SHMEM 重写
+### 备用 — e. B2 优化
 
-仅当 B2 三步做完吞吐仍不达生产要求、且能排几周 A5 机时才启动。**蓝本已从
-`hccl_shmem.hpp` 的 `shmem_ptr`（MTE 直读，A3/910C 模式，A5 上会 507035）
-修正为 CANN SHMEM 仓库的 UDMA/RDMA device RMA + 官方 dispatch/combine
-双平面示例**（见上节《SHMEM 重写的新证据》）。
-
-启动前置已拆成可执行清单：[`A5_shmem_preflight.md`](A5_shmem_preflight.md)。
-门禁是 **P3（在 A5 混合组上测 `state->topo_list[peer]` 是否给出非 MTE 引擎位）
-+ P4（最小 put+signal 往返不 507035）双绿**。只有 MTE 位 = SHMEM 与 a2e/e2a
-同根因、不解决问题，维持冷冻。
+仅当 SHMEM 在 P3/P4 门禁被判死才启动。三步（基准计时 → recv buffer 缓存 +
+`batch_isend_irecv` + isend/irecv 重叠 → 连接器内 2-ubatch 乒乓 DBO-lite）
+详见 git 历史里本节的旧版本（commit `0efec9c` 之前）。B2 吞吐上限是
+`1/(t_attn+t_ffn+2·t_comm)`，优化只压常数。
 
 ### 构建参数备忘
 
