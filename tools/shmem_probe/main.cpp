@@ -100,11 +100,20 @@ int main(int argc, char** argv)
 
     // ---- uniqueid bootstrap (file-based) --------------------------------
     // VERIFY exact names against shmem_host_init.h:
-    //   aclshmemx_uniqueid_t, ACLSHMEM_UNIQUEID_INITIALIZER,
-    //   aclshmemx_get_uniqueid(&uid),
+    //   aclshmemx_uniqueid_t, aclshmemx_get_uniqueid(&uid),
     //   aclshmemx_set_attr_uniqueid_args(pe, pe_size, local_mem_size, &uid, &attr),
     //   aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attr)
-    aclshmemx_uniqueid_t uid = ACLSHMEM_UNIQUEID_INITIALIZER;
+    //
+    // NOT using ACLSHMEM_UNIQUEID_INITIALIZER: its `{ 0 }` sub-initializer trips
+    // -Wbraced-scalar-init, and the example CMake macro compiles main.cpp with
+    // -Werror. memset is equivalent.
+    //
+    // FALLBACK if aclshmemx_set_attr_uniqueid_args does not exist: copy
+    // test_set_attr() from examples/utils/utils.h (it takes an ip:port and calls
+    // aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, ...)); pass
+    // SHMEM_PROBE_IPPORT and drop the file-based exchange.
+    aclshmemx_uniqueid_t uid;
+    std::memset(&uid, 0, sizeof(uid));
     if (pe == 0) {
         std::remove(uid_file.c_str());
         if (aclshmemx_get_uniqueid(&uid) != 0) {
