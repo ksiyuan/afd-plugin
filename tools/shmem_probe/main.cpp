@@ -132,9 +132,12 @@ int main(int argc, char** argv)
     aclshmemx_init_attr_t attr;
     std::memset(&attr, 0, sizeof(attr));
     aclshmemx_set_attr_uniqueid_args(pe, pe_size, local_mem_size, &uid, &attr);
-    if (aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attr) != 0) {
-        std::fprintf(stderr, "[probe] pe=%d aclshmemx_init_attr FAILED "
-            "(product_strategy may not recognise the A5 mainboard_id)\n", pe);
+    std::printf("[probe] pe=%d set_attr_uniqueid_args done, calling init_attr...\n", pe);
+    int rc_init = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attr);
+    std::printf("[probe] pe=%d aclshmemx_init_attr rc=%d\n", pe, rc_init);
+    if (rc_init != 0) {
+        std::fprintf(stderr, "[probe] pe=%d aclshmemx_init_attr FAILED rc=%d "
+            "(see SHMEM log; try ASCEND_GLOBAL_LOG_LEVEL=1)\n", pe, rc_init);
         return 1;
     }
     std::printf("[probe] pe=%d aclshmemx_init_attr OK  my_pe=%d n_pes=%d\n",
