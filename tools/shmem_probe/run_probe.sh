@@ -38,7 +38,12 @@ echo "  logdir    : $LOGDIR"
 echo "  timeout   : ${PROBE_TIMEOUT}s/proc"
 echo
 
-export LD_LIBRARY_PATH="$SHMEM_INSTALL/lib:${LD_LIBRARY_PATH:-}"
+# libafd_probe_kernel.so lives next to / one level up from the built binary
+# (e.g. build/bin/afd_probe -> build/lib/); libshmem_utils.so is in $SHMEM_INSTALL/lib.
+BIN_LIB_DIR="$(cd "$(dirname "$PROBE_BIN")/../lib" 2>/dev/null && pwd || true)"
+BIN_DIR="$(cd "$(dirname "$PROBE_BIN")" && pwd)"
+export LD_LIBRARY_PATH="${BIN_LIB_DIR}:${BIN_DIR}:$SHMEM_INSTALL/lib:${LD_LIBRARY_PATH:-}"
+echo "  LD_LIBRARY_PATH prepend: ${BIN_LIB_DIR} ${BIN_DIR} $SHMEM_INSTALL/lib"
 if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
   # shellcheck disable=SC1091
   source /usr/local/Ascend/ascend-toolkit/set_env.sh
