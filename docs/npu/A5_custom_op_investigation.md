@@ -1,121 +1,46 @@
-# A5 (Ascend 950) custom-op — can the 507035 remote-window blocker be salvaged?
+# A5（Ascend 950）自定义算子 507035 定位：混合组拿不到远端窗口资源
 
-Status: **open follow-up** · Last updated: 2026-09-03
+状态：**进行中的后续跟进** · 最后更新：2026-09-03
 
-> Read [`A5_ADAPTATION.md`](A5_ADAPTATION.md) first. That doc records the prior
-> investigation (branch tags `backup/a5-debug-507035`, `backup/a5-full-record`)
-> which concluded the custom-op path is **infeasible on A5 as written**, with
-> driver-log proof. This doc only covers whether a *different* kernel approach
-> can still recover custom-op performance, since Route B2 (HCCL p2p) throughput
-> is not acceptable for production.
+> 先读 [`A5_ADAPTATION.md`](A5_ADAPTATION.md)。那份文档记录了前一轮调查
+> （分支 tag `backup/a5-debug-507035`、`backup/a5-full-record`），结论是
+> a2e/e2a 自定义算子在 A5 上按现有实现不可行，并有驱动日志佐证。本文档在此
+> 基础上把根因定位到更精确的层面，并给出"自定义算子是否还有救 + B2 怎么优化"
+> 的判断，因为 Route B2（HCCL p2p）的吞吐达不到生产要求。
 
-## What was already proven (do NOT re-run)
+---
 
-| Step | Result |
-| --- | --- |
-| Build for `ascend950` (PR #295 / `b089f3c`) | ✅ compiles; `HcclAllocComResourceByTiling ret=5` fixed by gated `SetCommEngine(3)` + flat-window ABI |
-| Struct layout check (hypothesis A) | Dump code exists: `AFD_A5_DUMP_WINDOWS` in `a2e.h`/`e2a.h` (commit `22ebf96`) prints `rankId/rankDim/winSize/workSpace` + `windowsIn[]/windowsOut[]`. Prefix fields read back sane. |
-| Kernel bisection (local vs remote) | ✅ **local window: magic write, 8 MB copy, flag write all OK. ANY read/write of `windowsIn[peerRank]` → 507035.** Reproduced on 2 machines, incl. clean code, both a2e (write) and e2a (read). |
-| Driver log | `MTE_ERROR_T0_0=0x80000000` (MTE out-of-range), faulting insn `A2e_..._mix_aiv+0x26d4`, all 8 AIV cores. |
-| Native MC2 fallback (`npu_moe_distribute_dispatch_v2` / `combine_v2`) | ✅ param validation passes; ❌ **same 507035 in the dispatch kernel** on the AFD mixed group. `tools/npu_a5_probe.py` stage 2 (pure EP) vs stage 3 (mixed) isolates this. |
+## 结论（2026-09-03）
 
-**Conclusion carried forward:** on A5, the peer entries of `HcclCombinOpParam.windowsIn[]`
-are *not* directly MTE-addressable from another card for this group type —
-contrary to the vLLM-Ascend header comment. The 910C protocol (peer writes into
-a remote IPC window, ping-pong flags) has no direct A5 equivalent, and native
-MC2 ops only support all-expert (standard EP) groups.
+**A5 的 `HcclAllocComResourceByTiling` 不会给 AFD 的"attention + FFN 混合组"
+分配任何跨卡窗口资源。** 这不是 kernel bug，kernel 侧改不动。
 
-## What is actually still open
+- PR #276 / 不加 `SetCommEngine`：直接 `ret=5 (HCCL_E_NOT_SUPPORT)`
+- PR #295 `SetCommEngine(3)`：不报错了，但**什么资源也没分配**
+  （`remoteResNum == 0`）→ kernel 一访问对端窗口就 507035（MTE 越界）
+- 纯 EP 组在 A5 上能正常分配（前一轮 probe 验证过 native MC2 可用）
+- vllm-ascend 的 `dispatch_ffn_combine` 用**完全相同**的
+  `Mc2CcTilingConfig(group, 8, "AlltoAll=...")`、**不加** `SetCommEngine`，
+  在 A5 能跑
 
-The only way custom-op comes back is a kernel design that does **not** rely on
-direct cross-card window MTE for the attention↔FFN hop. Candidates, roughly in
-order of effort:
+→ 卡点是**"组里混了非专家 rank"这个拓扑形状**，与算子实现、kernel 无关。
 
-1. **Authoritative answer from the CANN / HCCL team.** Is `windowsIn[peer]`
-   *supposed* to be MTE-accessible on A5 for a group that mixes ranks with and
-   without expert resources? Is there a missing transport/registration step
-   (the A3 side builds a `remoteRes` tree — what is the A5 equivalent, and does
-   AFD's group creation skip it)? This is the highest-leverage question and
-   avoids months of trial-and-error. Package the `AFD_A5_DUMP_WINDOWS` output +
-   the plog `MTE_ERROR` extract when asking.
+---
 
-2. **Peer access via an HCCL primitive instead of raw MTE.** Check how A5's own
-   symmetric-memory / `HcclCombinOpParam` consumers move data to a peer window
-   (SDMA copy, `HcclXxx` device API, `AscendC` remote-copy intrinsic). If such
-   a path exists, port the 4 transfer points in `a2e.h`/`e2a.h` to it. Look at
-   the A5 branch of vLLM-Ascend `TokenDispatcherWithMC2` and CANN 950 MoE
-   samples.
+## 定位过程与证据
 
-3. **Make the group a real standard-EP group.** Register attention ranks as
-   zero-expert members so native `dispatch_v2`/`combine_v2` accept the group.
-   Colleague tried a first cut and still hit 507035 (stage 3); worth confirming
-   whether that was the zero-token-receive / capacity-overflow path
-   (`tools/npu_a5_probe.py` notes both hypotheses) rather than a hard limit.
+### dump 方法
 
-4. **Optimise Route B2 instead.** Quantify what "perf not acceptable" means
-   first (see below) — the gap may be closable without custom ops: batch the
-   per-peer `send/recv`, drop the debug `torch.npu.synchronize()`, overlap the
-   transfer with compute, use `batch_isend_irecv`. This is the pragmatic path
-   if 1–3 stall.
+`a2e.h` / `e2a.h` 里 `AFD_A5_DUMP_WINDOWS` 编译开关：在 block 0 上同时按
+**两种解读**打印 HCCL 上下文——
 
-## B2 perf analysis (code read, 2026-09-03)
+- 树形（A3 结构，`HcclOpResParam`）：`localUsrRankId` / `rankSize` /
+  `winSize` / `localWindowsIn` / `localWindowsOut` / `remoteResNum`，以及每个
+  peer 的 `remoteRes[i].nextDevicePtr` 和 `windowsIn`
+- 扁平（PR #276/#295 假设的 `HcclCombinOpParam`）：`windowsIn[i]` /
+  `windowsOut[i]`
 
-`RemoteFFNProxy.forward` (`model_executor/models/deepseek_v2.py`) runs **once per
-MoE layer** — 26 for DeepSeek-V2-Lite, 58 for V3. Each call:
-
-1. attention rank: `send_attn_output` → **blocking `dist.send`** to its FFN rank
-2. `maybe_apply_dbo_yield`
-3. attention rank: `recv_ffn_output` → **blocking `dist.recv`**
-
-FFN side mirrors it: `recv_attn_output` (a **per-peer loop of blocking
-`dist.recv`** when `attn_size > ffn_size`) → `torch.cat` → MoE → `send_ffn_output`
-(per-peer blocking `dist.send`).
-
-**The problem is serialisation, not HCCL bandwidth.** Per decode step the
-attention rank is idle for the entire FFN compute of all 26–58 layers and vice
-versa — throughput ≈ `1/(t_attn + t_ffn + 2·t_comm)` instead of
-`1/max(t_attn, t_ffn)`. The 910C custom op does the same logical round trip but
-via AIV-core flag polling on IPC windows (no host HCCL launch, no full device
-sync, pipelineable).
-
-### Quick wins (low risk, still need NPU to verify)
-
-- `p2p_recv` does `torch.empty(shape)` on every call → **preallocate / cache
-  recv buffers** per `(shape, dtype, peer)`.
-- FFN-side per-peer recv loop → **`dist.batch_isend_irecv`** (one launch, not N).
-  `vllm_ascend/eplb/eplb_updator.py` already uses this pattern.
-- Blocking `send`/`recv` → **`isend`/`irecv` + explicit `.wait()`** so the send
-  of layer L overlaps recv-buffer setup for L.
-- Confirm `.contiguous()` in `p2p_send` is a no-op for the normal path (it
-  should be — hidden_states is contiguous).
-
-### The real lever: 2-ubatch overlap (DBO-lite)
-
-While FFN computes ubatch A of layer L, attention computes ubatch B of layer L.
-Hides comm latency and removes most of the cross-role idle. Full native DBO is a
-known A5 gap, but a **B2-specific two-ubatch ping-pong in the connector** may be
-much simpler than native DBO (no custom yield op, just alternate the `afd`/`afd1`
-groups already created per ubatch). This is the highest-value work and needs no
-external input. Design it against `attention_model_runner` / `ffn_model_runner`
-ubatch handling.
-
-### Benchmark first (needs NPU)
-
-Route B2 is only validated for 2-rank eager. Before optimising, measure on A5:
-
-- decode TPOT / throughput: B2 vs the 910C custom-op number (same model, same
-  A/F split) — 10% gap or 2x?
-- profile the split: comm bytes/step, `send`/`recv` count, sync stalls, whether
-  comm serialises with FFN compute (it does — confirm the magnitude).
-
-Harness: extend `tests/e2e/runner.py` (`--device-backend npu`, an A5 2-rank
-scenario) with a decode-only timing loop, or a standalone script modelled on
-`tools/npu_a5_p2p_probe.py`.
-
-## RESULT (2026-09-03): the mixed group has NO remote resources on A5
-
-Ran the tree-ABI default + `AFD_A5_DUMP_WINDOWS=1`, 2-rank 1A+1F. Still 507035.
-Dump (both ranks):
+### dump 输出（A5，2-rank，1 Attention + 1 FFN）
 
 ```
 a2e[rank=1] tree: localUsrRankId=1 rankSize=2 winSize=4296015872
@@ -124,121 +49,164 @@ a2e[rank=1] tree: remoteRes[0].nextDevicePtr=0 windowsIn=0
 a2e[rank=1] tree: remoteRes[1].nextDevicePtr=0 windowsIn=0
 a2e[rank=1] flat: windowsIn[0]=403440000000  windowsOut[0]=4034c0080000
 a2e[rank=1] flat: windowsIn[1]=1200c0000000  windowsOut[1]=120140080000
+
 a2e[rank=0] tree: localUsrRankId=0 rankSize=2 winSize=4296015872
                   localWindowsIn=120b00000000 localWindowsOut=124000000000 remoteResNum=0
 a2e[rank=0] tree: remoteRes[0..1].nextDevicePtr=0 windowsIn=0
 a2e[rank=0] flat: windowsIn[0]=120b00000000  windowsIn[1]=124000000000
 ```
 
-Conclusions:
+### 读数结论
 
-1. **The struct is read correctly.** Prefix fields are all sane; vLLM-Ascend's
-   MC2 uses the identical `HcclOpResParam` layout on A5 and works. `remoteResNum
-   = 0` is a true read.
-2. **The flat ABI is bogus.** On each rank `flat.windowsIn[1]` == that rank's own
-   `localWindowsOut` (offset 40 aliases offset 40). It was never a peer address.
-3. **Root cause:** `HcclAllocComResourceByTiling` allocates **no** remote window
-   resources for the AFD **mixed attention+FFN** group on A5. `SetCommEngine(3)`
-   only turned the old `ret=5 (NOT_SUPPORT)` into "runs, allocates nothing".
-   Pure-EP groups *do* get resources on A5 (native MC2 dispatch works there, per
-   the earlier probe) and vLLM-Ascend's `dispatch_ffn_combine` uses the exact
-   same `Mc2CcTilingConfig(group, 8, "AlltoAll=...")` with **no** `SetCommEngine`
-   — so the blocker is specifically the non-uniform (mixed expert / non-expert)
-   group shape, not the op or the kernel.
-
-This is **not fixable in the kernel.** The A3 protocol needs a peer window that
-A5's HCCL will not hand out for this group.
-
-### What is left for the custom-op path
-
-| Option | Cost | Odds | Notes |
-| --- | --- | --- | --- |
-| **Comm-engine sweep** | ~1 h | low | `AFD_A5_COMM_ENGINE={0,1,2,4,5}` (env, no rebuild — reads `std::getenv` in tiling) + `AFD_A5_DUMP_WINDOWS=1`; look for `remoteResNum > 0`. |
-| **SHMEM / symmetric-memory rework** | weeks, needs NPU | medium | vLLM-Ascend's non-`HCCL_COMM` MC2 path addresses peers via `shmem_ptr(symmetricPtr, rank)` (CANN `shmem_api.h`), not the HCCL window tree. Host side allocates a cross-rank symmetric region and passes its pointer as an op input; kernel replaces `winBaseOf` with `shmem_ptr`. Independent of HCCL resource alloc. |
-| **Split into a group A5 accepts** | large | ? | Run a2e/e2a over a uniform sub-topology. Unclear it maps to AFD's A/F split. |
-| **Escalate to CANN/HCCL** | blocked | — | Precise ask now: "`HcclAllocComResourceByTiling` returns no `remoteRes` for a group mixing MC2-expert and non-expert ranks on ascend950; which comm engine / tiling config allocates cross-card windows for it?" Attach this dump. |
-| **Optimise B2 instead** | days, needs NPU | high | 2-ubatch overlap is the big lever. See B2 section. |
-
-Given CANN/HCCL is currently unreachable and the SHMEM rework is large, the
-pragmatic path is **B2 optimisation**, with the comm-engine sweep as a cheap
-side-bet first.
+1. **结构体没读错。** 前缀字段全部合理；vllm-ascend 的 MC2 在 A5 上用的是
+   同一个 `HcclOpResParam` 布局且能跑通。`remoteResNum == 0` 是真实读数。
+2. **扁平 ABI 是假的。** 每个 rank 的 `flat.windowsIn[1]` 正好等于该 rank
+   自己的 `localWindowsOut`（偏移 40 撞偏移 40）。它从来就不是对端地址。
+   `flat.windowsIn[0]` 恰好撞上 `localWindowsIn`（偏移 32），所以"本地能用、
+   远端全崩"——正是把树形结构当扁平数组读的指纹。
+3. **`remoteRes` 树是空的。** `remoteResNum == 0`，所有
+   `remoteRes[*].nextDevicePtr == 0`。混合组根本没建立任何对端 transport。
+4. 驱动日志：`A2e_..._mix_aiv+0x....`，8 个 AIV core 全 MTE 越界，与前一轮
+   记录的签名一致。
 
 ---
 
-## (superseded) Earlier hypothesis: the flat window ABI is wrong, A5 uses the tree
+## 自定义算子还剩的路
 
-Offsets of the first three fields (`rankId`/`rankDim`/`winSize`) are byte-identical
-between the flat `HcclCombinOpParam` and the tree `HcclOpResParam`, so the
-`AFD_A5_DUMP_WINDOWS` "prefix looks sane" check never distinguished them. But:
+| 方案 | 成本 | 概率 | 说明 |
+| --- | --- | --- | --- |
+| **a. comm engine 扫值** | ~1h | 低 | 已加 `AFD_A5_COMM_ENGINE` 环境变量（tiling 里读 `std::getenv`，**不用重编**）。跑 `AFD_A5_COMM_ENGINE=0/1/2/4 AFD_A5_DUMP_WINDOWS=1 ...`，看有没有哪个值让 `remoteResNum > 0`。 |
+| **b. SHMEM / 对称内存改造** | 几周，要 NPU | 中 | vllm-ascend 的非 `HCCL_COMM` MC2 路径用 `shmem_ptr(symmetricPtr, rank)`（CANN `shmem_api.h`）访问对端，**不走 HCCL 窗口树**。host 侧分配一块跨 rank 对称内存、作为算子输入传进去；kernel 里把 `winBaseOf` 换成 `shmem_ptr`。与 `HcclAllocComResourceByTiling` 无关。 |
+| **c. 拆成 A5 认可的组** | 大 | ? | 让 a2e/e2a 跑在一个均匀子拓扑上。不清楚能否映射到 AFD 的 A/F 切分。 |
+| **d. 找 CANN / HCCL** | 阻塞 | — | 问法很具体了：ascend950 上，一个混合了 MC2 专家 rank 和非专家 rank 的组，`HcclAllocComResourceByTiling` 不给 `remoteRes`，该用哪个 comm engine / tiling 配置才能分配跨卡窗口？附本文档的 dump。 |
+| **e. 转而优化 B2** | 几天，要 NPU | 高 | 2-ubatch overlap 是主杠杆，见下文。 |
 
-- `flat.windowsIn[0]` (offset 32) aliases `tree.localWindowsIn` → a valid local
-  window → "local access works".
-- `flat.windowsIn[1]` (offset 40) aliases `tree.localWindowsOut` (documented
-  "全F为无效值" / all-F = invalid in some modes).
-- `flat.windowsIn[>=2]` aliases bytes of `tree.hcomId[128]` → garbage pointer →
-  **507035 on any remote access**.
+**当前判断**：华为联系不上、SHMEM 改造是几周的活，务实路线是 **e（优化 B2）**，
+先花 1 小时做 **a（comm engine 扫值）** 当个便宜的侧注。
 
-vLLM-Ascend's own MC2 op `dispatch_ffn_combine` (`csrc/mc2/`, supports arch35 /
-A5) reads peer windows from `HcclOpResParamCustom` + `remoteRes[i].nextDevicePtr
-->windowsIn` — the tree — on every arch. No flat array anywhere.
+---
 
-**Nobody has tried the tree ABI *with* PR #295's working host config**
-(`SetCommEngine(3)` + `AddConfig("ascend950")` + `ascend950` build). PR #276 =
-flat ABI + `SetCommEngine(MTE)` → `ret=5`. PR #295 = flat ABI + `SetCommEngine(3)`
-→ `ret=5` fixed but 507035. Tree ABI + `SetCommEngine(3)` = the untested cell.
+## B2 性能分析（代码走读，2026-09-03）
 
-## The change on this branch (`a5-custom-op-research`, 2026-09-03)
+`RemoteFFNProxy.forward`（`model_executor/models/deepseek_v2.py`）**每个 MoE
+层调一次**——DeepSeek-V2-Lite 26 层，V3 58 层。每次调用：
 
-`a2e.h` / `e2a.h` / `comm_args.h` now **default A5 to the A3 remoteRes-tree
-window path** while keeping PR #295's host-side tiling/build. Two env toggles are
-forwarded to the AscendC kernel compile via `*/op_host/CMakeLists.txt`:
+1. attention rank：`send_attn_output` → **阻塞 `dist.send`** 给对应 FFN rank
+2. `maybe_apply_dbo_yield`
+3. attention rank：`recv_ffn_output` → **阻塞 `dist.recv`**
 
-| Env at build time | Effect |
-| --- | --- |
-| *(none)* | A5 uses the tree path (`remoteRes[peer].nextDevicePtr->windowsIn`), same as 910C. **Default — this is the test.** |
-| `AFD_A5_FLAT_WINDOW_ABI=1` | restores the old flat `HcclCombinOpParam.windowsIn[]` interpretation (PR #295 behaviour). |
-| `AFD_A5_DUMP_WINDOWS=1` | on block 0, `printf` both interpretations: tree `localWindowsIn/Out`, `remoteRes[i].nextDevicePtr` + `windowsIn`, and flat `windowsIn[i]/windowsOut[i]`. |
+FFN 侧对称：`recv_attn_output`（`attn_size > ffn_size` 时是**逐 peer 阻塞
+`dist.recv` 的循环**）→ `torch.cat` → MoE → `send_ffn_output`（逐 peer 阻塞
+`dist.send`）。
 
-910C path is untouched (`AFD_ARCH_A5` undefined → every toggle is inert).
+**瓶颈是串行，不是 HCCL 带宽。** 每个 decode step，attention rank 在整个 FFN
+的 26~58 层计算期间完全空转，反之亦然——吞吐 ≈ `1/(t_attn + t_ffn + 2·t_comm)`，
+而不该是 `1/max(t_attn, t_ffn)`。910C 自定义算子逻辑上做同样的往返，但走 AIV
+core 轮询 IPC 窗口（无 host HCCL launch、无全设备 sync、可流水）。
 
-## Concrete next actions (A5 node)
+### 快速优化（低风险，仍需 NPU 验证）
 
-1. **Just try the new default.** Rebuild the ops for A5 and run the 2-rank eager
-   1A+1F DeepSeek-V2-Lite smoke:
-   ```bash
-   AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=ascend950_9391 \
-     python -m pip install -v --no-build-isolation --no-deps -e .
-   # then the CAMP2p 2-rank smoke (tests/e2e/runner.py --device-backend npu ...)
-   ```
-   - Completes → the flat ABI was the bug. Custom-op path is back; move to graph
-     capture / DBO / multi-rank.
-   - `HcclAllocComResourceByTiling ret=5` returns → `SetCommEngine(3)` and the
-     flat ABI are coupled; go to step 3.
-   - Still 507035 → go to step 2.
-2. **Dump and read the values:**
-   ```bash
-   AFD_A5_DUMP_WINDOWS=1 AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=ascend950_9391 \
-     python -m pip install -v --no-build-isolation --no-deps -e .
-   ```
-   Run once, capture the `A5 a2e/e2a[...] tree:` / `flat:` lines. Paste them into
-   this doc. `remoteRes[peer].windowsIn` being sane GM addresses while flat
-   `windowsIn[peer]` is 0 / 0xFFFF... / ASCII confirms the hypothesis; if the
-   tree values are *also* garbage the group's transports were never built and
-   this is a group-creation problem (option 3 / escalate).
-3. **If `ret=5` came back:** try the *real* `HcclA2CombineOpParam` layout from
-   vLLM-Ascend `csrc/utils/inc/kernel/moe_distribute_base.h` (with `res[8328]`,
-   `windowsIn[HCCL_MAX_RANK_NUM]`) in place of the hand-rolled 64-entry struct,
-   still with `AFD_A5_FLAT_WINDOW_ABI=1`.
-4. File the option-1 question with Huawei when reachable — attach the step-2 dump.
-5. In parallel (needs no NPU decision): benchmark B2 so option 4 has numbers.
+- `p2p_recv` 每次调用都 `torch.empty(shape)` → 按 `(shape, dtype, peer)`
+  **预分配 / 缓存 recv buffer**。
+- FFN 侧逐 peer recv 循环 → **`dist.batch_isend_irecv`**（1 次 launch 代替 N 次）。
+  `vllm_ascend/eplb/eplb_updator.py` 已有这个用法。
+- 阻塞 `send`/`recv` → **`isend`/`irecv` + 显式 `.wait()`**，让第 L 层的 send
+  与第 L 层 recv buffer 的准备重叠。
+- 确认 `p2p_send` 里的 `.contiguous()` 对正常路径是 no-op（hidden_states 一般
+  已连续）。
 
-## Files / refs
+### 主杠杆：2-ubatch overlap（DBO-lite）
 
-- [`A5_ADAPTATION.md`](A5_ADAPTATION.md) — prior investigation, authoritative.
-- Tags: `backup/a5-debug-507035` (kernel bisection commits),
-  `backup/a5-full-record` (B2 + full doc).
-- `tools/npu_a5_probe.py` (in `backup/a5-*` / commit `26da97a`) — stage 2 pure
-  EP vs stage 3 mixed group, native `dispatch_v2`/`combine_v2`.
-- `tools/npu_a5_p2p_probe.py` — B2 carrier probe (2-rank round trip).
-- PR #295 (`b089f3c`) — A5 build + flat-window ABI. PR #303 — Route B2.
-- A5 node: devices `0/1` healthy only; kill stale vLLM procs before re-runs.
+FFN 算第 L 层 ubatch A 的时候，attention 算第 L 层 ubatch B。把 comm 延迟藏
+起来，消掉大部分跨角色空转。原生 DBO 是已知的 A5 gap，但**连接器里做一个
+B2 专用的两 ubatch 乒乓**可能比原生 DBO 简单得多（不需要自定义 yield 算子，
+只是交替用已经按 ubatch 建好的 `afd` / `afd1` 组）。这是最有价值、且不依赖
+任何外部输入的工作。设计时对着 `attention_model_runner` / `ffn_model_runner`
+的 ubatch 处理。
+
+### 先做基准（需要 NPU）
+
+B2 目前只验证过 2-rank eager。优化前先在 A5 上量：
+
+- decode TPOT / 吞吐：B2 vs 910C 自定义算子的数（同模型、同 A/F 切分）——
+  差 10% 还是差 2 倍？
+- 拆分 profile：每步 comm 字节数、`send`/`recv` 次数、sync 停顿、comm 是否
+  与 FFN 计算串行（是——确认量级）。
+
+harness：扩 `tests/e2e/runner.py`（`--device-backend npu`，加一个 A5 2-rank
+场景）加一段 decode-only 计时循环，或照 `tools/npu_a5_p2p_probe.py` 写个独立
+脚本。
+
+---
+
+## 本分支（`a5-custom-op-research`）的改动
+
+已推送 `fork/a5-custom-op-research`：
+
+```
+66c291b  feat(npu): make A5 MC2 comm engine configurable via AFD_A5_COMM_ENGINE
+4f26513  feat(npu): default A5 a2e/e2a to the A3 remoteRes-tree window ABI
+cbf0562  docs(npu): restore A5 investigation record and p2p probe
+b089f3c  [NPU] add A5/ascend950 support for A2E and E2A ops   （原 PR #295）
+```
+
+三个环境变量开关（910C 路径完全不受影响，`AFD_ARCH_A5` 未定义时全部失效）：
+
+| 环境变量 | 作用 | 生效时机 |
+| --- | --- | --- |
+| *(不设)* | A5 走树形窗口路径（`remoteRes[peer].nextDevicePtr->windowsIn`），和 910C 一样。默认。 | 编译期 |
+| `AFD_A5_FLAT_WINDOW_ABI=1` | 恢复旧的扁平 `HcclCombinOpParam.windowsIn[]` 解读（PR #295 行为）。 | 编译期 |
+| `AFD_A5_DUMP_WINDOWS=1` | block 0 上 `printf` 两种解读的实际地址值。 | 编译期 |
+| `AFD_A5_COMM_ENGINE=<n>` | 覆盖 A5 tiling 里 `SetCommEngine` 的值（默认 3）。 | **运行时**，不用重编 |
+
+---
+
+## 下一步具体命令（A5 节点）
+
+### a. comm engine 扫值（先做这个，便宜）
+
+先按默认（树形 + dump）编一次：
+
+```bash
+AFD_A5_DUMP_WINDOWS=1 AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=<A5 SOC 名> \
+  python -m pip install -v --no-build-isolation --no-deps -e .
+```
+
+然后**不重编**，逐个试 comm engine 值，各跑一次 2-rank 冒烟，看日志里的
+`remoteResNum`：
+
+```bash
+for e in 0 1 2 4 5; do
+  AFD_A5_COMM_ENGINE=$e <启动 2-rank 1A+1F 冒烟的命令>
+  # grep 'remoteResNum' 看有没有 > 0
+done
+```
+
+- 某个值让 `remoteResNum > 0` 且对端 `windowsIn` 是合理地址 → 自定义算子有救，
+  把默认 comm engine 改成那个值
+- 全都是 0 → comm engine 这条路封死，转 b 或 e
+
+### e. B2 优化（主线）
+
+1. 写基准脚本（我来），你在 A5 上跑 B2 2-rank eager decode 计时，拿到"差多少"
+2. 快速优化（预分配 buffer + `batch_isend_irecv`）开分支改好，你验
+3. 有基准数后评估 2-ubatch overlap 是否值得（大概率值）
+
+`<A5 SOC 名>`：`build_aclnn.sh` 接受 `950` / `ascend950*` / `Ascend950*`，
+以你们之前编 A5 算子用的值为准（950PR 一般 `ascend950`，950DT 是
+`ascend950dt_9582`，`npu-smi info` 确认）。
+
+---
+
+## 参考
+
+- [`A5_ADAPTATION.md`](A5_ADAPTATION.md) —— 前一轮调查，含驱动日志证据和时间线
+- tag `backup/a5-debug-507035`（kernel 二分的调试提交）、
+  `backup/a5-full-record`（B2 + 完整文档）
+- `tools/npu_a5_probe.py`（在 `backup/a5-*` / commit `26da97a`）—— stage 2 纯
+  EP vs stage 3 混合组，native `dispatch_v2` / `combine_v2`
+- `tools/npu_a5_p2p_probe.py` —— B2 载体探针（2-rank 往返）
+- vllm-ascend `csrc/mc2/dispatch_ffn_combine/op_kernel/utils/hccl_shmem.hpp`
+  —— 树形窗口访问 + 非 `HCCL_COMM` 的 `shmem_ptr` 路径
+- PR #295（`b089f3c`）—— A5 构建 + 扁平窗口 ABI；PR #303 —— Route B2
+- A5 节点：只有 device 0/1 健康；重跑前先清残留 vLLM 进程
