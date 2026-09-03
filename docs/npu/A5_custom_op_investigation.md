@@ -1,6 +1,6 @@
 # A5（Ascend 950）自定义算子 507035 定位：混合组拿不到远端窗口资源
 
-状态：**进行中的后续跟进** · 最后更新：2026-09-03
+状态：**自定义算子经 HCCL 窗口路径已确认封死；主线转 B2 优化** · 最后更新：2026-09-03
 
 > 先读 [`A5_ADAPTATION.md`](A5_ADAPTATION.md)。那份文档记录了前一轮调查
 > （分支 tag `backup/a5-debug-507035`、`backup/a5-full-record`），结论是
@@ -24,6 +24,20 @@
   在 A5 能跑
 
 → 卡点是**"组里混了非专家 rank"这个拓扑形状**，与算子实现、kernel 无关。
+
+### comm engine 扫值结果（2026-09-03，方案 a 已执行）
+
+`AFD_A5_COMM_ENGINE=0..7` 全部实测，**没有任何一个值让 `remoteResNum > 0`**：
+
+- 一部分值：`HcclAllocComResourceByTiling` 直接返回失败（tiling 阶段就报错，
+  与不加 `SetCommEngine` 时的 `ret=5 HCCL_E_NOT_SUPPORT` 同类）。
+- 另一部分值（含默认 3）：tiling 调用成功但**静默不分配**，kernel 一访问对端
+  窗口即 507035，dump 里 `remoteResNum == 0` 不变。
+
+→ **comm engine 这条路彻底封死。** 混合组在 A5 上通过
+`HcclAllocComResourceByTiling` 拿跨卡窗口资源，无论哪个 engine 值都不成立。
+自定义算子若要在 A5 复活，只剩**方案 b（SHMEM / 对称内存，绕开 HCCL 窗口树）**
+一条路，且需要专门几周投入 + NPU。
 
 ---
 
@@ -73,16 +87,18 @@ a2e[rank=0] flat: windowsIn[0]=120b00000000  windowsIn[1]=124000000000
 
 ## 自定义算子还剩的路
 
-| 方案 | 成本 | 概率 | 说明 |
+| 方案 | 成本 | 概率 | 状态 |
 | --- | --- | --- | --- |
-| **a. comm engine 扫值** | ~1h | 低 | 已加 `AFD_A5_COMM_ENGINE` 环境变量（tiling 里读 `std::getenv`，**不用重编**）。跑 `AFD_A5_COMM_ENGINE=0/1/2/4 AFD_A5_DUMP_WINDOWS=1 ...`，看有没有哪个值让 `remoteResNum > 0`。 |
-| **b. SHMEM / 对称内存改造** | 几周，要 NPU | 中 | vllm-ascend 的非 `HCCL_COMM` MC2 路径用 `shmem_ptr(symmetricPtr, rank)`（CANN `shmem_api.h`）访问对端，**不走 HCCL 窗口树**。host 侧分配一块跨 rank 对称内存、作为算子输入传进去；kernel 里把 `winBaseOf` 换成 `shmem_ptr`。与 `HcclAllocComResourceByTiling` 无关。 |
-| **c. 拆成 A5 认可的组** | 大 | ? | 让 a2e/e2a 跑在一个均匀子拓扑上。不清楚能否映射到 AFD 的 A/F 切分。 |
-| **d. 找 CANN / HCCL** | 阻塞 | — | 问法很具体了：ascend950 上，一个混合了 MC2 专家 rank 和非专家 rank 的组，`HcclAllocComResourceByTiling` 不给 `remoteRes`，该用哪个 comm engine / tiling 配置才能分配跨卡窗口？附本文档的 dump。 |
-| **e. 转而优化 B2** | 几天，要 NPU | 高 | 2-ubatch overlap 是主杠杆，见下文。 |
+| ~~a. comm engine 扫值~~ | ~1h | — | **已做，全灭**（0..7 无一分配，见上节）。路封死。 |
+| **b. SHMEM / 对称内存改造** | 几周，要 NPU | 中 | vllm-ascend 的非 `HCCL_COMM` MC2 路径用 `shmem_ptr(symmetricPtr, rank)`（CANN `shmem_api.h`）访问对端，**不走 HCCL 窗口树 / `HcclAllocComResourceByTiling`**。host 侧分配一块跨 rank 对称内存、作为算子输入传进去；kernel 里把 `winBaseOf` 换成 `shmem_ptr`。**唯一还活着的自定义算子路径。** |
+| c. 拆成 A5 认可的组 | 大 | 低 | 让 a2e/e2a 跑在一个均匀子拓扑上。混合组形状是根因，但 AFD 的 A/F 切分本质上就是非均匀，映射代价不明，暂缓。 |
+| **d. 找 CANN / HCCL** | 阻塞 | — | 问法现在更硬：ascend950 上混合了 MC2 专家 rank 与非专家 rank 的组，`HcclAllocComResourceByTiling` **在 comm engine 0..7 全部取值下**都不给 `remoteRes`，是否有支持的配置？附本文档 dump + 扫值结果。**并行推进，不阻塞 e。** |
+| **e. 优化 B2** | 几天～，要 NPU | 高 | **确定的主线。** 2-ubatch overlap 是主杠杆，见下文。 |
 
-**当前判断**：华为联系不上、SHMEM 改造是几周的活，务实路线是 **e（优化 B2）**，
-先花 1 小时做 **a（comm engine 扫值）** 当个便宜的侧注。
+**当前判断（2026-09-03 更新）**：comm engine 扫值已排除，自定义算子除 SHMEM
+重写外没有便宜的救法。**主线锁定 e（优化 B2）**；同时把 d（找 CANN/HCCL）作为
+并行的低成本动作发出去；b（SHMEM）只有在 B2 优化后吞吐仍不达标、且愿意压几周
+NPU 排期时才启动。
 
 ---
 
@@ -161,40 +177,65 @@ b089f3c  [NPU] add A5/ascend950 support for A2E and E2A ops   （原 PR #295）
 
 ---
 
-## 下一步具体命令（A5 节点）
+## 下一步方案（2026-09-03 起）
 
-### a. comm engine 扫值（先做这个，便宜）
+### 主线 — e. B2 优化
 
-先按默认（树形 + dump）编一次：
+分三步，只有 step 1 卡在"需要 A5 机时"，其余我在 Windows 侧就能推代码：
+
+**Step 1（你，A5）— 拿基准数，回答"B2 比 910C 自定义算子差多少"**
+
+- 清残留 vLLM 进程，device 只用 0/1。
+- 跑 B2 2-rank eager 1A+1F DeepSeek-V2-Lite，decode-only 计时循环，量：
+  - TPOT / 单卡吞吐（token/s），和 910C 自定义算子同模型同 A/F 切分的历史数对比
+  - 每 decode step 的 comm 字节数、`send`/`recv` 次数
+  - comm 是否与 FFN 计算串行（预期"是"，确认量级）
+- harness：扩 `tests/e2e/runner.py` 加一个 A5 2-rank 场景 + decode 计时段，
+  或照 `tools/npu_a5_p2p_probe.py` 写独立脚本。**脚本我来写**，你只跑。
+
+**Step 2（我，开分支）— 低风险快速优化，先合入**
+
+- `p2p_recv` 按 `(shape, dtype, peer)` 预分配 / 缓存 recv buffer，去掉每层
+  `torch.empty`。
+- FFN 侧逐 peer recv 循环 → `dist.batch_isend_irecv`（1 次 launch 代替 N 次），
+  参考 `vllm_ascend/eplb/eplb_updator.py`。
+- 阻塞 `send`/`recv` → `isend`/`irecv` + 显式 `.wait()`，让第 L 层 send 与
+  recv buffer 准备重叠。
+- 确认 `p2p_send` 的 `.contiguous()` 对正常路径是 no-op。
+- 910C 冒烟回归后合。你在 A5 上复跑 Step 1 的计时，看这批改动吃掉多少。
+
+**Step 3（我设计 + 你验）— 主杠杆：连接器内 2-ubatch 乒乓（DBO-lite）**
+
+- FFN 算第 L 层 ubatch A 时，attention 算第 L 层 ubatch B，交替用已按 ubatch
+  建好的 `afd` / `afd1` 组，藏住 comm 延迟。
+- **不碰原生 DBO / 不需要自定义 yield 算子**，只在 `CAMP2pAFDConnector` +
+  `attention_model_runner` / `ffn_model_runner` 的 ubatch 处理里做交替。
+- 有 Step 1/2 的数后再定工作量，但大概率是唯一能把吞吐拉到接近
+  `1/max(t_attn, t_ffn)` 的手段。
+
+### 并行 — d. 升级问 CANN / HCCL（不阻塞 e）
+
+带上本文档的 dump + "comm engine 0..7 全灭"结果，问：ascend950 上一个混了
+MC2 专家 rank 和非专家 rank 的组，`HcclAllocComResourceByTiling` 在所有 comm
+engine 取值下都不分配 `remoteRes`，有没有支持的 tiling / 建组配置？渠道：
+CANN issue / HCCL 对接人 / 内部 Ascend 群。
+
+### 冷冻 — b. SHMEM 重写
+
+仅当 B2 三步做完吞吐仍不达生产要求、且能排几周 A5 机时才启动。届时以
+`vllm_ascend/.../dispatch_ffn_combine/op_kernel/utils/hccl_shmem.hpp` 的非
+`HCCL_COMM` `shmem_ptr` 路径为蓝本。
+
+### 构建参数备忘
+
+`<A5 SOC 名>`：`build_aclnn.sh` 接受 `950` / `ascend950*` / `Ascend950*`，
+以你们之前编 A5 算子用的值为准（950PR 一般 `ascend950`，950DT 是
+`ascend950dt_9582`，`npu-smi info` 确认）。默认（树形 + dump）编译：
 
 ```bash
 AFD_A5_DUMP_WINDOWS=1 AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=<A5 SOC 名> \
   python -m pip install -v --no-build-isolation --no-deps -e .
 ```
-
-然后**不重编**，逐个试 comm engine 值，各跑一次 2-rank 冒烟，看日志里的
-`remoteResNum`：
-
-```bash
-for e in 0 1 2 4 5; do
-  AFD_A5_COMM_ENGINE=$e <启动 2-rank 1A+1F 冒烟的命令>
-  # grep 'remoteResNum' 看有没有 > 0
-done
-```
-
-- 某个值让 `remoteResNum > 0` 且对端 `windowsIn` 是合理地址 → 自定义算子有救，
-  把默认 comm engine 改成那个值
-- 全都是 0 → comm engine 这条路封死，转 b 或 e
-
-### e. B2 优化（主线）
-
-1. 写基准脚本（我来），你在 A5 上跑 B2 2-rank eager decode 计时，拿到"差多少"
-2. 快速优化（预分配 buffer + `batch_isend_irecv`）开分支改好，你验
-3. 有基准数后评估 2-ubatch overlap 是否值得（大概率值）
-
-`<A5 SOC 名>`：`build_aclnn.sh` 接受 `950` / `ascend950*` / `Ascend950*`，
-以你们之前编 A5 算子用的值为准（950PR 一般 `ascend950`，950DT 是
-`ascend950dt_9582`，`npu-smi info` 确认）。
 
 ---
 
