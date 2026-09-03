@@ -138,44 +138,21 @@ bash scripts/build.sh -DSHMEM_RDMA=ON        # 具体 flag 名以 build 脚本�
 **这是可行性门禁的核心。** 2-rank，device 只用 0/1，1 Attention + 1 FFN，
 复现 AFD 的混合组形状。
 
-### probe 要做的事
+### probe 代码 ✅ 已就位
 
-host 侧（参照完整仓 `examples/dispatch_gmm_combine/` 的 host launch）：
+[`tools/shmem_probe/`](../../tools/shmem_probe/) —— host driver + 两个 kernel
+（P3 `ShmemTopoProbe` + P4 `ShmemPutSignalProbe`）+ `run_probe.sh` + README。
 
-1. 用 PyTorch 起 2 进程（bootstrap：rank0 广播 UID(ip/port/magic)，同 AFD 连接器
-   建 `afd` 组的方式），各绑 device 0 / 1。
-2. `aclshmemx_init_attr(bootstrap_flags, &attr)`，`attr.local_mem_size` 两 rank
-   一致。
-3. `aclshmem_malloc(window_bytes)` —— 两 rank **同步、同大小**（对称性前提，
-   见 `principles_en.md`：malloc 必须所有 PE 同步同尺寸）。
-4. launch 一个只做打印的 kernel（下）。
+- bootstrap：**文件共享 UID**（PE0 `aclshmemx_get_uniqueid` 写临时文件，PE1
+  自旋读），`aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attr)`。standalone，
+  不依赖 MPI / torch。连接器集成时改用现成 `afd` PG 广播（见 integration map §4）。
+- `aclshmem_malloc(window_bytes)` 两 rank 同步同大小（对称性前提，`principles_en.md`）。
+- 代码在 Windows 侧照同事的 P3 素材写，**未对真实 `install/shmem/include`
+  头编译过**，每处不确定点标了 `VERIFY`。A5 节点上按 README 的 Option A（嫁接到
+  `examples/dispatch/dispatch_classic`）build 最省事。
 
-kernel 侧：
-
-```cpp
-#include "shmem.h"
-extern "C" __global__ __aicore__ void ShmemTopoProbe(GM_ADDR win) {
-    if (AscendC::GetBlockIdx() != 0) return;
-    __gm__ aclshmem_device_host_state_t* st = aclshmemi_get_state();
-    int me = aclshmem_my_pe();
-    int npes = aclshmem_n_pes();
-    for (int pe = 0; pe < npes; ++pe) {
-        AscendC::printf("SHMEM probe[me=%d] topo_list[%d]=0x%02x  "
-            "(SDMA_sup=%d UDMA_sup=%d)\n",
-            me, pe, (unsigned)st->topo_list[pe],
-            ACLSHMEM_TRANSPORT_SDMA_SUPPORTED, ACLSHMEM_UDMA_SUPPORTED);
-    }
-    // p2p_device_heap_base[pe] 是否非空（MTE 直读路径是否「看起来可用但会崩」）
-    for (int pe = 0; pe < npes; ++pe) {
-        AscendC::printf("SHMEM probe[me=%d] p2p_heap_base[%d]=%p rdma_heap_base[%d]=%p\n",
-            me, pe, st->p2p_device_heap_base ? st->p2p_device_heap_base[pe] : (void*)0,
-            pe, st->rdma_device_heap_base ? st->rdma_device_heap_base[pe] : (void*)0);
-    }
-}
-```
-
-`ACLSHMEM_TRANSPORT_*` 位常量定义在快照没拉到的头里（`shmem_common_types` 附近
-或 `host/shmem_host_def.h`）；完整仓拿到后把实际数值填到下表。
+`topo_list` 位常量（同事已确认，probe 里也硬编了同一套，编译时以真实头为准）：
+`MTE = 1<<0`、`ROCE = 1<<1`、`SDMA = 1<<2`、`UDMA = 1<<3`。
 
 ### 读数与判据
 
@@ -200,6 +177,10 @@ extern "C" __global__ __aicore__ void ShmemTopoProbe(GM_ADDR win) {
 ## P4 —— 最小 put + signal 往返（a2e/e2a 数据面的缩影）
 
 P3 绿之后做。验证「对称窗口 + 引擎搬运 + 旗标同步」这条链在 A5 混合组上真的通。
+**probe 代码同 P3：`ShmemPutSignalProbe` in [`tools/shmem_probe/`](../../tools/shmem_probe/)**
+（rank0 `aclshmem_putmem` + `aclshmemx_signal_op` 推 16KB payload → rank1
+`aclshmem_signal_wait_until` 后逐元素校验，输出 `pass=1/0` + `first_bad_idx`）。
+`run_probe.sh` 默认 P3+P4 连跑；`PROBE_RUN_P4=0` 只跑 P3。
 
 ### 要覆盖的原语（对应 a2e 的哪一步）
 
