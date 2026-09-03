@@ -90,7 +90,7 @@ a2e[rank=0] flat: windowsIn[0]=120b00000000  windowsIn[1]=124000000000
 | 方案 | 成本 | 概率 | 状态 |
 | --- | --- | --- | --- |
 | ~~a. comm engine 扫值~~ | ~1h | — | **已做，全灭**（0..7 无一分配，见上节）。路封死。 |
-| **b. SHMEM / 对称内存改造** | 几周，要 NPU | 中 | vllm-ascend 的非 `HCCL_COMM` MC2 路径用 `shmem_ptr(symmetricPtr, rank)`（CANN `shmem_api.h`）访问对端，**不走 HCCL 窗口树 / `HcclAllocComResourceByTiling`**。host 侧分配一块跨 rank 对称内存、作为算子输入传进去；kernel 里把 `winBaseOf` 换成 `shmem_ptr`。**唯一还活着的自定义算子路径。** |
+| **b. SHMEM / 对称内存改造** | 几周，要 NPU | 中 | **蓝本已确认（见下节）**：CANN SHMEM 仓库（gitcode.com/cann/shmem）的 device RMA 走 UDMA/RDMA 引擎 + 对称内存，官方已带 MoE dispatch/combine 双平面示例。不是拿 `shmem_ptr` 直读对端（A5 会崩），而是引擎代劳。**唯一还活着的自定义算子路径。** |
 | c. 拆成 A5 认可的组 | 大 | 低 | 让 a2e/e2a 跑在一个均匀子拓扑上。混合组形状是根因，但 AFD 的 A/F 切分本质上就是非均匀，映射代价不明，暂缓。 |
 | **d. 找 CANN / HCCL** | 阻塞 | — | 问法现在更硬：ascend950 上混合了 MC2 专家 rank 与非专家 rank 的组，`HcclAllocComResourceByTiling` **在 comm engine 0..7 全部取值下**都不给 `remoteRes`，是否有支持的配置？附本文档 dump + 扫值结果。**并行推进，不阻塞 e。** |
 | **e. 优化 B2** | 几天～，要 NPU | 高 | **确定的主线。** 2-ubatch overlap 是主杠杆，见下文。 |
@@ -177,6 +177,62 @@ b089f3c  [NPU] add A5/ascend950 support for A2E and E2A ops   （原 PR #295）
 
 ---
 
+## SHMEM 重写的新证据（2026-09-03 晚）— cann/shmem 仓库分析
+
+原方案 b（冷冻）的蓝本只有 vllm-ascend 里 `hccl_shmem.hpp` 的 `shmem_ptr`
+片段。当天把真正的 **CANN SHMEM 仓库**（`gitcode.com/cann/shmem`，
+OpenSHMEM 风格对称内存 RMA 库，master = v1.6.0，2026-07）扒下来做了分析：
+
+- **git clone 在本机连 gitcode 会挂死**（智能协议的 pack 传输不通，ls-remote
+  偶尔通）；改用 gitcode v5 API（`/api/v5/repos/cann/shmem/git/trees/<sha>`）
+  + raw 直链（`raw.gitcode.com/cann/shmem/files/master/<path>`）拿到 **59 个
+  核心文件**，本地快照在工作区根 `shmem-src/`（非仓库目录）。远端还有未合入
+  master 的 `feat/ascend950-relay-barrier` 分支（A5 relay/barrier 仍在演进）。
+- **device 侧 API**（可直接编进自定义算子，`#include "shmem.h"`）：
+  `aclshmem_putmem/getmem`、逐类型 put/get、`_nbi` 异步、strided
+  `iput/iget`、GlobalTensor 重载、单元素 `_p/_g`、atomic 与 signal。
+- **引擎分发**（`src/device/gm2gm/shmem_device_rma.hpp`，按
+  `device_state->topo_list[pe]` 位掩码**逐对端**选）：SDMA → UDMA → MTE →
+  ROCE(RDMA)：
+  - **MTE 路径 = 910C 老模式**：`aclshmem_ptr(src,pe)` =
+    `p2p_device_heap_base[pe] + offset`，AI core 直接 DataCopy 读远端地址——
+    与我们的 a2e/e2a 同样依赖"内核可寻址的对端基址"，**A5 上一样会 507035**。
+    所以拿 `hccl_shmem.hpp` 的 `shmem_ptr`（MTE 直读）当 A5 蓝本是**错的**，
+    那是 A3/910C 模式。
+  - **UDMA 引擎（A5 新增）= 正确蓝本**：AI core 只把 WQE 塞进 SQ ring
+    （`aclshmemx_udma_put/get_nbi`，PIPE_MTE3 暂存或 PIPE_S 标量），**跨端
+    访问由 UDMA 引擎完成**，AI core 不碰远端地址；`quiet(pe)` 等完成。还带
+    relay put/get（`relay_pe` 多链路分流，需 `ACLSHMEM_RELAY_SUPPORT=ON`）、
+    `put_signal_nbi`（WRITE_WITH_NOTIFY，数据+旗标一条 WQE）、按 QP
+    （`*_qp_*`，多 QP）、UDMA 原子操作。
+  - **RDMA（A5 新增）**：backends = `xscale` / `hns_1825` / `in_die`
+    （`src/device/gm2gm/engine/rdma_backends/`）；host 侧 QP/传输管理在
+    `src/host/transport/device_rdma/`（fixed/dynamic_ranks_qp_manager）。
+  - host 拓扑已支持 950：`aclshmemi_product_strategy.cpp` 走
+    `driver/topo/950` + `atlas_950_1.json` + DCMI URMA EID（MESH/CLOS/ROCE
+    平面），内存注册带远端 R/W 权限位 + MemoryKey（RDMA 式 MR）。
+- **官方 MoE dispatch/combine 参考实现就在仓库里**：
+  `examples/dispatch/dispatch_doubleplane/` 与
+  `examples/combine/combine_doubleplane/` —— 用对称 `shmem_window`
+  （payload + assist + ready + count 区）+ per-AIV-per-peer 循环 +
+  `aclshmemx_signal_op` 旗标，功能上就是 a2e/e2a 的翻版。
+  **勘误（读本地快照后）**：这两个 doubleplane 例子的数据面**硬编码
+  `aclshmemx_sdma_put_nbi` + `aclshmemx_mte_put_nbi`**（doubleplane = SDMA 平面
+  + MTE-direct 平面按字节阈值二选一），**含 MTE 直读平面 → A5 混合组上大概率
+  仍 507035**。可抄的是协议骨架（四区窗口 + 信号三元组 + Stage 分段），数据面
+  必须换成 topo-aware 的 `aclshmem_putmem/getmem`（内部按 `topo_list` 选
+  SDMA→UDMA→MTE→ROCE）。这正是 preflight P3 要先测的。
+
+**对方案 b 的意义**：
+- 可行性显著上升：A5 上"AI core 参与、低延迟、自定义 dispatch/combine"的
+  正确形态 = **SHMEM 对称内存 + UDMA/RDMA 引擎**，Huawei 自己给了示例实现。
+- 改造方向修正：不是把 a2e/e2a 窗口读写换成 `shmem_ptr` 直读（A5 会崩），
+  而是换成 **SHMEM device RMA（对称 offset + 引擎代劳）**，flag/count 协议可
+  直接抄官方双平面示例。
+- 前置仍需验证：CANN 9.1.0 是否随带 SHMEM 运行时（`source set_env.sh` +
+  `-DSHMEM_RDMA=ON` 构建）、A5 上 `topo_list[pe]` 实际给 UDMA 还是 RDMA。
+  **维持冷冻**，主线仍是 e（B2 优化）+ 并行 d（问 CANN）。
+
 ## 下一步方案（2026-09-03 起）
 
 ### 主线 — e. B2 优化
@@ -222,9 +278,15 @@ CANN issue / HCCL 对接人 / 内部 Ascend 群。
 
 ### 冷冻 — b. SHMEM 重写
 
-仅当 B2 三步做完吞吐仍不达生产要求、且能排几周 A5 机时才启动。届时以
-`vllm_ascend/.../dispatch_ffn_combine/op_kernel/utils/hccl_shmem.hpp` 的非
-`HCCL_COMM` `shmem_ptr` 路径为蓝本。
+仅当 B2 三步做完吞吐仍不达生产要求、且能排几周 A5 机时才启动。**蓝本已从
+`hccl_shmem.hpp` 的 `shmem_ptr`（MTE 直读，A3/910C 模式，A5 上会 507035）
+修正为 CANN SHMEM 仓库的 UDMA/RDMA device RMA + 官方 dispatch/combine
+双平面示例**（见上节《SHMEM 重写的新证据》）。
+
+启动前置已拆成可执行清单：[`A5_shmem_preflight.md`](A5_shmem_preflight.md)。
+门禁是 **P3（在 A5 混合组上测 `state->topo_list[peer]` 是否给出非 MTE 引擎位）
++ P4（最小 put+signal 往返不 507035）双绿**。只有 MTE 位 = SHMEM 与 a2e/e2a
+同根因、不解决问题，维持冷冻。
 
 ### 构建参数备忘
 
@@ -248,6 +310,7 @@ AFD_A5_DUMP_WINDOWS=1 AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=<A5 SOC 名> \
   EP vs stage 3 混合组，native `dispatch_v2` / `combine_v2`
 - `tools/npu_a5_p2p_probe.py` —— B2 载体探针（2-rank 往返）
 - vllm-ascend `csrc/mc2/dispatch_ffn_combine/op_kernel/utils/hccl_shmem.hpp`
-  —— 树形窗口访问 + 非 `HCCL_COMM` 的 `shmem_ptr` 路径
+  —— 树形窗口访问 + 非 `HCCL_COMM` 的 `shmem_ptr` 路径（注意：`shmem_ptr` MTE 直读是 A3/910C 模式，A5 蓝本应改用 SHMEM 的 UDMA/RDMA 引擎）
+- CANN SHMEM（对称内存 RMA 库）`gitcode.com/cann/shmem`：master = v1.6.0；本地快照在工作区根 `shmem-src/`（59 文件）；device API `include/device/gm2gm/shmem_device_rma.h`；UDMA 引擎 `include/device/gm2gm/engine/shmem_device_udma.h`；官方 MoE 示例 `examples/dispatch/dispatch_doubleplane/`、`examples/combine/combine_doubleplane/`；未合入 master 的 `feat/ascend950-relay-barrier` 分支
 - PR #295（`b089f3c`）—— A5 构建 + 扁平窗口 ABI；PR #303 —— Route B2
 - A5 节点：只有 device 0/1 健康；重跑前先清残留 vLLM 进程
