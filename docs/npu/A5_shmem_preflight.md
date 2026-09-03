@@ -148,8 +148,9 @@ bash scripts/build.sh -DSHMEM_RDMA=ON        # 具体 flag 名以 build 脚本�
   不依赖 MPI / torch。连接器集成时改用现成 `afd` PG 广播（见 integration map §4）。
 - `aclshmem_malloc(window_bytes)` 两 rank 同步同大小（对称性前提，`principles_en.md`）。
 - 代码在 Windows 侧照同事的 P3 素材写，**未对真实 `install/shmem/include`
-  头编译过**，每处不确定点标了 `VERIFY`。A5 节点上按 README 的 Option A（嫁接到
-  `examples/dispatch/dispatch_classic`）build 最省事。
+  头编译过**，每处不确定点标了 `VERIFY`。build 方式：作为**树内 example**
+  （`$SHMEM_SRC/examples/afd_probe/`，`aclshmem_add_collective_example(afd_probe)`
+  宏 + `bash scripts/build.sh -examples`）。详见 `tools/shmem_probe/RUNBOOK.md`。
 
 `topo_list` 位常量（同事已确认，probe 里也硬编了同一套，编译时以真实头为准）：
 `MTE = 1<<0`、`ROCE = 1<<1`、`SDMA = 1<<2`、`UDMA = 1<<3`。

@@ -3,11 +3,15 @@
  * SHMEM preflight P3/P4 probe host driver — AFD A5 (Ascend 950) SHMEM rewrite.
  * See docs/npu/A5_shmem_preflight.md.
  *
- * One process per PE (rank). Launch two of them, PE0 -> device 0, PE1 -> device 1.
+ * Built as the `main.cpp` of an in-tree CANN SHMEM example
+ * ($SHMEM_SRC/examples/afd_probe/), via aclshmem_add_collective_example(afd_probe).
+ * The <<<>>> launch wrappers live in afd_probe_kernel.cpp (-> libafd_probe_kernel.so).
+ *
+ * One process per PE (rank). Launch two, PE0 -> device 0, PE1 -> device 1.
  * UID bootstrap is file-based (no MPI, no torch): PE0 writes the uniqueid bytes
  * to $SHMEM_PROBE_UID_FILE, PE1 spin-reads it. run_probe.sh wires this up.
  *
- * Build: see CMakeLists.txt. Run: see run_probe.sh / README.md.
+ * Build + run: see RUNBOOK.md.
  *
  * VERIFY markers = check against install/shmem/include (SHMEM 1.7.0) before build.
  */
@@ -23,16 +27,12 @@
 #include "acl/acl.h"
 #include "shmem.h"
 
-// P4 kernel-side constants (keep in sync with probe_kernel.cpp).
+// P4 kernel-side constants (keep in sync with afd_probe_kernel.cpp).
 static constexpr uint32_t PROBE_PAYLOAD_BYTES = 4096u * 4u;
 static constexpr uint32_t PROBE_SIGNAL_BYTES  = 64u;
 static constexpr uint64_t PROBE_WINDOW_BYTES  = PROBE_PAYLOAD_BYTES + PROBE_SIGNAL_BYTES;
 
-// Kernel entry declarations. VERIFY: the SHMEM examples wrap <<<>>> launches in a
-// small .cpp compiled by the bisheng/ascendc toolchain and expose a plain C++
-// launcher; mirror examples/dispatch/dispatch_classic. If the build links the
-// kernel object directly, declare the __global__ symbols here instead and launch
-// with ShmemTopoProbe<<<block_dim, nullptr, stream>>>(...).
+// Launch wrappers exported from libafd_probe_kernel.so (afd_probe_kernel.cpp).
 extern void launch_shmem_topo_probe(uint32_t block_dim, void* stream, uint8_t* shmem_window);
 extern void launch_shmem_put_signal_probe(
     uint32_t block_dim, void* stream, uint8_t* shmem_window, uint8_t* result_out);

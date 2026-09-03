@@ -18,46 +18,26 @@ P3 + P4 both green → start the rewrite (see
 
 | file | what |
 | --- | --- |
-| `probe_kernel.cpp` | the two `__aicore__` kernels (single AIV core, no SyncAll) |
-| `probe_launch.cpp` | `<<<>>>` launch wrappers (bisheng-compiled) |
-| `probe_host.cpp` | host driver: ACL init → file-based UID bootstrap → `aclshmemx_init_attr` → `aclshmem_malloc` → launch → print |
+| `afd_probe_kernel.cpp` | both `__aicore__` kernels + host-callable `<<<>>>` launch wrappers (one file → `libafd_probe_kernel.so`, per the `aclshmem_add_collective_example` macro) |
+| `main.cpp` | host driver: ACL init → file-based UID bootstrap → `aclshmemx_init_attr` → `aclshmem_malloc` → launch → print |
+| `example_CMakeLists.txt` | one-liner `aclshmem_add_collective_example(afd_probe)` → copy to `$SHMEM_SRC/examples/afd_probe/CMakeLists.txt` |
 | `run_probe.sh` | 2-process launcher, PE0→dev0 / PE1→dev1, wires `LD_LIBRARY_PATH` + UID file |
-| `CMakeLists.txt` | **skeleton** — reconcile with the SHMEM examples' build (see below) |
+| `RUNBOOK.md` | **the step-by-step** — build as an in-tree SHMEM example, run, report |
 
-## Build (A5 node)
+## Build + run
 
-These files were written on the Windows side against the colleague's P3 material,
-**not** the real `install/shmem/include` headers. Every risky spot is marked
-`VERIFY` in the source. Two ways to build:
+Written on the Windows side against the colleague's P3 material, **not** the real
+`install/shmem/include` headers — every risky spot is marked `VERIFY`. The
+example CMake is not standalone (uses the SHMEM repo's `aclshmem_add_collective_example`
+macro), so the probe builds **as an in-tree example**:
 
-**Option A (recommended, least guesswork)** — graft onto an existing example:
+1. drop `afd_probe_kernel.cpp` + `main.cpp` + `CMakeLists.txt` into
+   `$SHMEM_SRC/examples/afd_probe/`
+2. add `afd_probe` to the `foreach(EXAMPLE ...)` list in `examples/CMakeLists.txt`
+3. `bash scripts/build.sh -examples <950 flag>`
+4. `run_probe.sh <built afd_probe binary>` on device 0/1
 
-```bash
-cd /home/k00930897/shmem
-cp -r examples/dispatch/dispatch_classic /tmp/shmem_probe_build
-cd /tmp/shmem_probe_build
-# replace the example's kernel + main with the probe sources
-cp <afd-plugin>/tools/shmem_probe/probe_kernel.cpp   ./
-cp <afd-plugin>/tools/shmem_probe/probe_launch.cpp   ./
-cp <afd-plugin>/tools/shmem_probe/probe_host.cpp     ./
-# edit the example's CMakeLists.txt: swap source file names, keep its ascendc
-# kernel target + link rules; target name -> shmem_probe
-cmake -B build -DSOC_VERSION=ascend950 && cmake --build build
-```
-
-**Option B** — make `CMakeLists.txt` here work by filling in the ascendc kernel
-target from `examples/dispatch/dispatch_classic/CMakeLists.txt`
-(`add_ascendc_kernel` / bisheng flags / `--cce-aicore-arch=dav-c310`).
-
-## Run (A5 node, 2-rank, device 0/1)
-
-```bash
-# clear leftover vLLM procs first; only device 0/1 are healthy on the A5 node
-export SHMEM_INSTALL=/home/k00930897/shmem/install/shmem
-<afd-plugin>/tools/shmem_probe/run_probe.sh /tmp/shmem_probe_build/build/shmem_probe
-```
-
-P3-only: `PROBE_RUN_P4=0 run_probe.sh ...`
+Full commands + inspection steps + fix-up list: **see [`RUNBOOK.md`](RUNBOOK.md)**.
 
 ## Reading the output
 

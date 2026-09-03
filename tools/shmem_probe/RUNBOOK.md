@@ -4,115 +4,120 @@ Copy-paste steps for an agent on the A5 Linux node. Goal: build + run the
 preflight P3/P4 probe, report the output. Decision gate for the AFD A5 SHMEM
 rewrite — see [`../../docs/npu/A5_shmem_preflight.md`](../../docs/npu/A5_shmem_preflight.md).
 
+The probe is built **as an in-tree CANN SHMEM example** (the example CMake uses
+the repo's `aclshmem_add_collective_example` macro — it is NOT standalone).
+
 Assumed on the node:
-- this repo checked out, branch `a5-custom-op-research`, pulled to latest
+- afd-plugin checked out, branch `a5-custom-op-research`, pulled latest
   (so `tools/shmem_probe/` exists)
-- SHMEM 1.7.0 built at `/home/k00930897/shmem` (P2 artifact);
-  install prefix `/home/k00930897/shmem/install/shmem` (`include/` + `lib/libshmem.so`)
+- SHMEM 1.7.0 source at `/home/k00930897/shmem` (P2); it builds for Ascend950
 - CANN 9.1.0, `set_env.sh` sourceable
-- A5 node: only device 0 and 1 are healthy; kill leftover vLLM procs first
+- A5: only device 0 and 1 healthy; kill leftover vLLM procs first
 
 ---
 
-## Step 0 — env + sanity
+## Step 0 — env
 
 ```bash
 set -e
-export AFD=$(git -C "$(pwd)" rev-parse --show-toplevel)          # afd-plugin root
+export AFD=$(cd <afd-plugin-root> && pwd)
 export SHMEM_SRC=/home/k00930897/shmem
 export SHMEM_HOME=$SHMEM_SRC/install/shmem
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-# kill leftovers, confirm device health
 pkill -f 'vllm|python.*engine' 2>/dev/null || true
 npu-smi info | head -30
-
-test -f "$SHMEM_HOME/lib/libshmem.so" && echo "libshmem OK"
-ls "$SHMEM_HOME/include/"                       # expect shmem.h, shmem_host_init.h, host/, device/, host_device/
-git -C "$AFD" log --oneline -1
+git -C "$AFD" pull --ff-only
 ```
 
 ---
 
-## Step 1 — VERIFY the probe against the real headers
-
-The probe sources were written without these headers. Check each and fix the
-`VERIFY` spots in `tools/shmem_probe/probe_host.cpp` / `probe_kernel.cpp`:
+## Step 1 — inspect (paste these back if the build fails)
 
 ```bash
-cd "$SHMEM_HOME/include"
-grep -rn "aclshmemx_init_attr_t\|ACLSHMEM_UNIQUEID_INITIALIZER\|aclshmemx_uniqueid_t" .
-grep -rn "aclshmemx_get_uniqueid\|aclshmemx_set_attr_uniqueid_args\|ACLSHMEMX_INIT_WITH_UNIQUEID" .
-grep -rn "aclshmem_malloc\|aclshmem_barrier_all\|aclshmem_free\|aclshmem_finalize" .
+# the example main.cpp shape + bootstrap helper
+sed -n '1,120p' "$SHMEM_SRC/examples/dispatch/dispatch_classic/main.cpp"
+cat "$SHMEM_SRC/examples/dispatch/dispatch_classic/dispatch_kernel.h"
+ls "$SHMEM_SRC/examples/utils/"
+sed -n '1,120p' "$SHMEM_SRC/examples/init/main.cpp" 2>/dev/null || true
+# the closest existing UDMA example (transport we expect on A5)
+ls "$SHMEM_SRC/examples/udma_demo/"; sed -n '1,120p' "$SHMEM_SRC/examples/udma_demo/main.cpp"
+# how the SOC / backend flag is passed
+sed -n '540,600p' "$SHMEM_SRC/scripts/build.sh"
+grep -n "SOC_TYPE\|-950\|backend" "$SHMEM_SRC/scripts/build.sh" | head -40
+```
+
+VERIFY the probe sources against the real headers and fix the `VERIFY` spots in
+`$AFD/tools/shmem_probe/{main.cpp,afd_probe_kernel.cpp}`:
+
+```bash
+cd "$SHMEM_HOME/include" 2>/dev/null || cd "$SHMEM_SRC/include"
+grep -rn "aclshmemx_init_attr_t\|ACLSHMEM_UNIQUEID_INITIALIZER\|aclshmemx_uniqueid_t\|aclshmemx_get_uniqueid\|aclshmemx_set_attr_uniqueid_args\|ACLSHMEMX_INIT_WITH_UNIQUEID" .
+grep -rn "aclshmem_malloc\|aclshmem_barrier_all\|aclshmem_free\|aclshmem_finalize\|aclshmem_putmem\|aclshmemx_signal_op\|aclshmem_signal_wait_until\|ACLSHMEM_SIGNAL_SET\|ACLSHMEM_CMP_EQ" .
 grep -rn "ACLSHMEM_TRANSPORT_MTE\|ACLSHMEM_TRANSPORT_UDMA\|TRANSPORT_SDMA\|TRANSPORT_ROCE" .
-grep -rn "aclshmem_putmem\|aclshmem_getmem\|aclshmemx_signal_op\|aclshmem_signal_wait_until\|ACLSHMEM_SIGNAL_SET\|ACLSHMEM_CMP_EQ" .
-grep -rn "aclshmemi_get_state\|aclshmem_device_host_state_t" .
-grep -rn "topo_list\|p2p_device_heap_base\|rdma_device_heap_base\|heap_base\|heap_size" host_device/
+grep -rn "aclshmemi_get_state\|topo_list\|p2p_device_heap_base\|rdma_device_heap_base" . ../src 2>/dev/null | head
 ```
 
-Fix-ups likely needed:
-- **`aclshmemx_set_attr_uniqueid_args` signature / name** — align the call in
-  `probe_host.cpp` (arg order `pe, pe_size, local_mem_size, &uid, &attr`).
-- **`aclshmemx_init_attr_t`** — if it needs explicit field init beyond `memset 0`.
-- **transport bit macros** — if the header already `#define`s
-  `ACLSHMEM_TRANSPORT_*`, delete the fallback block in `probe_kernel.cpp`.
-- **`dcci_cacheline`** helper name in `probe_kernel.cpp` (cache flush).
+Likely fix-ups: `aclshmemx_set_attr_uniqueid_args` exact name/args; whether the
+transport-bit macros already exist (delete the fallback block in
+`afd_probe_kernel.cpp`); `dcci_cacheline` helper name; if `main.cpp` should use
+an `examples/utils` bootstrap helper instead of the file-based UID exchange.
 
-Also grab the launch/build model from an example:
+---
+
+## Step 2 — add the probe as an in-tree example
 
 ```bash
-ls "$SHMEM_SRC/examples/"
-cat "$SHMEM_SRC/examples/dispatch/dispatch_classic/CMakeLists.txt"
-sed -n '1,80p' "$SHMEM_SRC/examples/dispatch/dispatch_classic/main.cpp"
-cat "$SHMEM_SRC/examples/init/main.cpp" 2>/dev/null | sed -n '1,80p'
+mkdir -p "$SHMEM_SRC/examples/afd_probe"
+cp "$AFD/tools/shmem_probe/afd_probe_kernel.cpp" "$SHMEM_SRC/examples/afd_probe/"
+cp "$AFD/tools/shmem_probe/main.cpp"             "$SHMEM_SRC/examples/afd_probe/"
+cp "$AFD/tools/shmem_probe/example_CMakeLists.txt" "$SHMEM_SRC/examples/afd_probe/CMakeLists.txt"
+# -> CMakeLists.txt is one line: aclshmem_add_collective_example(afd_probe)
+#    the macro compiles afd_probe_kernel.cpp -> libafd_probe_kernel.so and
+#    main.cpp -> executable `afd_probe` (linked against shmem + afd_probe_kernel).
+
+# register it: add `afd_probe` to the first foreach(EXAMPLE ...) list in
+#   $SHMEM_SRC/examples/CMakeLists.txt   (next to `dispatch`, `sdma`, `udma_demo`)
+sed -i 's/^\(\s*\)dispatch$/\1dispatch\n\1afd_probe/' "$SHMEM_SRC/examples/CMakeLists.txt"
+grep -n "afd_probe" "$SHMEM_SRC/examples/CMakeLists.txt"
 ```
 
 ---
 
-## Step 2 — build (graft onto dispatch_classic)
+## Step 3 — build with examples on (Ascend950)
 
 ```bash
-rm -rf /tmp/shmem_probe_build
-cp -r "$SHMEM_SRC/examples/dispatch/dispatch_classic" /tmp/shmem_probe_build
-cd /tmp/shmem_probe_build
+cd "$SHMEM_SRC"
+# match how P2 built it, plus -examples. Common form:
+bash scripts/build.sh -examples <the SOC/backend flag P2 used for 950>
+# (from build.sh: -examples => -DUSE_EXAMPLES=ON; 950 has XSCALE / HNS_1825
+#  RDMA-backend variants — reuse whatever P2 used.)
 
-# drop in the probe sources
-cp "$AFD"/tools/shmem_probe/probe_kernel.cpp  ./
-cp "$AFD"/tools/shmem_probe/probe_launch.cpp  ./
-cp "$AFD"/tools/shmem_probe/probe_host.cpp    ./
-
-# Edit CMakeLists.txt (or the example's build script):
-#  - kernel target sources -> probe_kernel.cpp + probe_launch.cpp
-#  - host executable source -> probe_host.cpp, target name -> shmem_probe
-#  - keep the example's ascendc/bisheng kernel compile rules and its
-#    -I$SHMEM_HOME/include / -L$SHMEM_HOME/lib -lshmem -lascendcl link
-#  - SOC / arch: ascend950  (__NPU_ARCH__==3510 / dav-c310)
-
-cmake -B build -DSOC_VERSION=ascend950 -DSHMEM_HOME="$SHMEM_HOME"
-cmake --build build -j
-ls -la build/shmem_probe        # or wherever the example puts its binary
+find "$SHMEM_SRC" -name 'afd_probe' -type f -perm -u+x     # the built binary
+find "$SHMEM_SRC" -name 'libafd_probe_kernel.so'
 ```
 
-If the example uses a plain `build.sh` instead of top-level CMake, adapt that
-instead — same three edits.
+If only the probe example fails to compile but the rest is fine, iterate on the
+`VERIFY` fixes from Step 1; the other examples building proves the toolchain +
+macro are OK.
 
 ---
 
-## Step 3 — run (2-rank, device 0/1)
+## Step 4 — run (2-rank, device 0/1)
 
 ```bash
-export SHMEM_INSTALL="$SHMEM_HOME"
-"$AFD"/tools/shmem_probe/run_probe.sh /tmp/shmem_probe_build/build/shmem_probe
+export SHMEM_INSTALL="$SHMEM_HOME"           # for LD_LIBRARY_PATH (libshmem_utils.so)
+# if 'make install' didn't run, point at the build tree lib dir instead:
+#   export LD_LIBRARY_PATH=$(dirname $(find $SHMEM_SRC -name libshmem.so | head -1)):$LD_LIBRARY_PATH
+"$AFD/tools/shmem_probe/run_probe.sh" <path to built afd_probe binary>
 ```
 
-P3 only (skip P4): prefix `PROBE_RUN_P4=0`.
-Bigger heap / other devices: `PROBE_HEAP_MB=512 PROBE_DEVICES="0 1"`.
+P3 only: `PROBE_RUN_P4=0 run_probe.sh ...`
 
 ---
 
-## Step 4 — report back
+## Step 5 — report back
 
-Paste the **full stdout/stderr**. The decisive lines:
+Full stdout, plus the decisive lines:
 
 ```
 [pe0] [shmem-probe P3] me=0 topo_list[1]=0x??  MTE=? ROCE=? SDMA=? UDMA=?
@@ -121,13 +126,13 @@ Paste the **full stdout/stderr**. The decisive lines:
 [pe1] [probe] ===== P4 RESULT: pass=?  first_bad_idx=? =====
 ```
 
-Gate:
 | result | verdict |
 | --- | --- |
 | `topo_list[peer]` has UDMA / ROCE / SDMA bit **and** P4 `pass=1` | ✅ GREEN — start the rewrite |
 | `topo_list[peer]` MTE-only (0x01) or 0x00 | ❌ RED — SHMEM = same root cause as a2e/e2a, fall back to B2 |
-| P4 `pass=0` / 507035 / hang | ❌ RED — note which primitive; report the driver log |
+| P4 `pass=0` / 507035 / hang | ❌ RED — which primitive? paste driver log |
 
-Also report: any 507035 in `dmesg` / driver logs, the `aclshmemx_init_attr`
-return code if it failed, and the final CMakeLists.txt diff you had to make
-(so the probe target can be upstreamed into `tools/shmem_probe/CMakeLists.txt`).
+Also report: any 507035 in `dmesg`, the `aclshmemx_init_attr` return code if it
+failed, the exact `build.sh` line that worked, and every diff you had to make to
+`main.cpp` / `afd_probe_kernel.cpp` / `examples/CMakeLists.txt` (so it can be
+upstreamed into `tools/shmem_probe/`).

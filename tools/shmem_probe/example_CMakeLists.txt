@@ -1,0 +1,2 @@
+# Copy this to $SHMEM_SRC/examples/afd_probe/CMakeLists.txt
+aclshmem_add_collective_example(afd_probe)
