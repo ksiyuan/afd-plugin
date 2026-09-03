@@ -1,6 +1,6 @@
 # A5 SHMEM 重写 —— 启动前置验证清单
 
-状态：**主线（SHMEM 重写）的可行性门禁 + 分工清单** · 最后更新：2026-09-03
+状态：**P0/P1/P2 ✅ 绿（SHMEM 1.7.0 built，UDMA 编入，transport 依赖就位）；P3/P4 待跑** · 最后更新：2026-09-03
 
 > 上游文档：[`A5_custom_op_investigation.md`](A5_custom_op_investigation.md)。
 > SHMEM 重写是当前主线（B2 降为备用）。本清单把启动前置拆成可在 A5 节点逐条
@@ -36,25 +36,38 @@ SHMEM 能不能救，取决于**在 A5 的这套混合拓扑上，SHMEM 的引�
 
 ---
 
-## P0 —— 准备完整 SHMEM 源码（Windows 侧即可做）
+## P0 —— 准备完整 SHMEM 源码 ✅ 完成（2026-09-03，同事在 A5 节点）
 
-本地 `shmem-src/` 快照缺 host init 头和构建系统，无法据此写 probe。
+- [x] A5 节点完整 clone + 构建 `gitcode.com/cann/shmem`。**版本 SHMEM 1.7.0
+      (master)**，aarch64 / Ascend950 / CANN 9.1.0。
+- [x] host init 头、构建系统、`.run` 安装包齐全。
 
-- [ ] 在 A5 节点上完整 clone `gitcode.com/cann/shmem`（master = v1.6.0）。
-      本机直连 gitcode 的 smart-http pack 传输会挂死（见 investigation 文档），
-      **在 A5 Linux 节点上 clone**，或用 gitcode v5 API 逐树拉平。
-- [ ] 记录实际 commit / tag。留意分支 `feat/ascend950-relay-barrier`（A5 relay/
-      barrier 仍在演进，未合 master）——先用 master，除非 P4 需要 relay。
-- [ ] 确认拿到：`include/host/init/shmem_host_init.h`、`scripts/`、
-      顶层 `CMakeLists.txt`、`docs/compilation_build_guide*.md`、
-      `docs/deployment/`、`docs/quickstart.md`、
-      `examples/dispatch_gmm_combine/`（完整含 host launch）。
-
-判据：完整仓在 A5 节点就位，能看到构建脚本和 host 头。
+判据：达成。
 
 ---
 
-## P1 —— CANN 9.1.0 是否随带 SHMEM 运行时与头文件？
+## P1 / P2 —— SHMEM 运行时 ✅ 绿（2026-09-03，同事在 A5 节点，从源码构建）
+
+CANN 9.1.0 不随带 → 走 P2 从源码构建，产物齐全：
+
+| 项 | 值 |
+| --- | --- |
+| 主库 | `/home/k00930897/shmem/install/shmem/lib/libshmem.so` |
+| 伴随库 | 同目录 `libshmem_utils.so` + 2 个 bootstrap so —— **运行时要 `LD_LIBRARY_PATH` 指到 `install/shmem/lib/`**，否则 `libshmem_utils.so => not found` |
+| 头文件 | `/home/k00930897/shmem/install/shmem/include/`（`shmem.h` / `shmem_host_init.h` / device+host 头齐全） |
+| `.run` 安装包 | `/home/k00930897/shmem/ci/release/aarch64/SHMEM_1.7.0_linux-aarch64.run` |
+| P3 需要的 host API 符号（`nm` 确认在 `libshmem.so` 里） | `aclshmemx_init_attr`、`aclshmemx_init_attr_with_buffers`、`aclshmemx_get_uniqueid`（UID bootstrap）、`aclshmem_malloc`、`aclshmem_my_pe`、`aclshmem_n_pes`、`aclshmem_finalize` |
+| `ACLSHMEM_UDMA_SUPPORTED` | ✅ 已编入（`nm` 符号确认） |
+| host transport 依赖 | ✅ `libhcomm.so`（CANN lib64）、`liburma.so.0` / `liburma_common.so.0`（`/usr/lib64/`）、`libdcmi.so` 全部 `ldd` 已解析 |
+
+判据：**达成**。`libshmem.so` 可链接、UDMA 编入、transport 依赖就位 —— 这正是 P3
+「跨端走 UDMA/RDMA 引擎」的依赖基础。
+
+> ⚠️ P3/P4 探针仍需在 **A5 NPU 节点**跑（2-rank device 0/1）。"给 Windows 侧" 指
+> 的是：把 `install/shmem/include/` 的 host 头拷给我，我照真实 API 写 probe 的
+> host+kernel 代码，同事在 A5 build+run。
+
+<details><summary>原 P1/P2 检查步骤（存档）</summary>
 
 在 A5 节点执行：
 
@@ -115,6 +128,8 @@ bash scripts/build.sh -DSHMEM_RDMA=ON        # 具体 flag 名以 build 脚本�
       (`hal.get_driver_install_path() + "/driver/topo/950/"`)。
 
 判据：产出可链接的 `libaclshmem*.so` + `ACLSHMEM_UDMA_SUPPORTED=1`。
+
+</details>
 
 ---
 
@@ -261,15 +276,17 @@ P3 绿之后做。验证「对称窗口 + 引擎搬运 + 旗标同步」这条�
 
 ## 门禁汇总
 
-| 步骤 | 在哪做 | 通过判据 | 失败动作 |
+| 步骤 | 在哪做 | 通过判据 | 状态 |
 | --- | --- | --- | --- |
-| P0 完整源码 | A5 clone | 完整仓 + 构建脚本就位 | —— |
-| P1 运行时自带？ | A5 | `shmem.h` + `*shmem*.so` + init 声明 | 转 P2 |
-| P2 源码构建 | A5 | `libaclshmem*.so` + `ACLSHMEM_UDMA_SUPPORTED=1` | 记录缺失依赖，回退备用方案 e |
-| **P3 引擎选择探针** | **A5 2-rank** | **`topo_list[peer]` 含 UDMA / ROCE / SDMA 位** | **只有 MTE 位或全 0 → 回退备用方案 e，写回读数** |
-| P4 put+signal 往返 | A5 2-rank | payload 校验通过，无 507035 | 记录崩溃原语 |
-| P5 官方示例 | A5 2-rank | （参考）失败点与 P4 一致 | —— |
-| P6 集成面盘点 | Windows | 替换点清单 + team 映射清楚 | —— |
+| P0 完整源码 | A5 clone | 完整仓 + 构建脚本就位 | ✅ SHMEM 1.7.0 master |
+| P1 运行时自带？ | A5 | `shmem.h` + `*shmem*.so` + init 声明 | ✅ 不随带 → P2 |
+| P2 源码构建 | A5 | `libshmem.so` + `ACLSHMEM_UDMA_SUPPORTED=1` + transport 依赖 | ✅ 绿（2026-09-03） |
+| **P3 引擎选择探针** | **A5 2-rank** | **`topo_list[peer]` 含 UDMA / ROCE / SDMA 位** | ⏳ 待跑（probe 代码待写） |
+| P4 put+signal 往返 | A5 2-rank | payload 校验通过，无 507035 | ⏳ 待跑 |
+| P5 官方示例 | A5 2-rank | （参考）失败点与 P4 一致 | ⏳ |
+| P6 集成面盘点 | Windows | 替换点清单 + team 映射清楚 | ✅ [`A5_shmem_integration_map.md`](A5_shmem_integration_map.md) |
+
+失败动作：P3 只有 MTE 位或全 0 / P4 崩 → 回退备用方案 e（B2 优化），写回读数。
 
 **P3 + P4 双绿 = 正式进入 SHMEM 重写实现。** 否则回退备用方案 e（B2 优化）
 + 并行 d（问 CANN/HCCL）。
