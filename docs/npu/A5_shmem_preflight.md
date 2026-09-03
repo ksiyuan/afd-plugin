@@ -232,8 +232,12 @@ P3 绿之后做。验证「对称窗口 + 引擎搬运 + 旗标同步」这条�
 
 ## P6 —— AFD 集成面盘点（Windows 侧，无需 NPU）
 
+**详细盘点见 [`A5_shmem_integration_map.md`](A5_shmem_integration_map.md)**（a2e/e2a
+数据流、逐原语替换表、host 侧改动、team 映射、开放问题）。以下是 checklist 摘要：
+
 与 P1–P5 并行，为重写实现做准备：
 
+- [x] 盘点文档 `A5_shmem_integration_map.md` 初稿完成（2026-09-03）
 - [ ] **init 时机 / bootstrap**：SHMEM `aclshmemx_init_attr` 需要 rank0 UID 广播。
       对上 [`afd_plugin/connectors/npu/camp2p.py`](../../afd_plugin/connectors/npu/camp2p.py)
       建 `afd` / `afd1` 组的地方 —— 复用同一个 torch PG 做 bootstrap。
