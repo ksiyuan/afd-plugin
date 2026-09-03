@@ -18,8 +18,8 @@
 
 using namespace AscendC;
 
-// topo_list transport bits (colleague-confirmed; the real header very likely
-// already #defines ACLSHMEM_TRANSPORT_*, in which case delete this block).
+// topo_list transport bits (colleague-confirmed; if the real header already
+// #defines ACLSHMEM_TRANSPORT_*, this #ifndef is a no-op).
 #ifndef ACLSHMEM_TRANSPORT_MTE
 #define ACLSHMEM_TRANSPORT_MTE  (1u << 0)   // red : AI core addresses peer heap -> 507035 on A5
 #define ACLSHMEM_TRANSPORT_ROCE (1u << 1)   // green (2nd choice)
@@ -62,16 +62,19 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemTopoPro
             (int)((t & ACLSHMEM_TRANSPORT_UDMA) != 0));
     }
 
+    // heap-base arrays are plain `void**` in aclshmem_device_host_state_t
+    // (no address-space qualifier) -> use plain `void*` here.
+    // AscendC::printf is limited — stick to %d / %u / %llx like the a2e dump.
     for (int pe = 0; pe < npes && pe < 16; ++pe) {
-        __gm__ void* p2p  = st->p2p_device_heap_base  ? st->p2p_device_heap_base[pe]  : (__gm__ void*)0;
-        __gm__ void* rdma = st->rdma_device_heap_base ? st->rdma_device_heap_base[pe] : (__gm__ void*)0;
-        __gm__ void* sdma = st->sdma_device_heap_base ? st->sdma_device_heap_base[pe] : (__gm__ void*)0;
+        unsigned long long p2p  = st->p2p_device_heap_base  ? (unsigned long long)st->p2p_device_heap_base[pe]  : 0ull;
+        unsigned long long rdma = st->rdma_device_heap_base ? (unsigned long long)st->rdma_device_heap_base[pe] : 0ull;
+        unsigned long long sdma = st->sdma_device_heap_base ? (unsigned long long)st->sdma_device_heap_base[pe] : 0ull;
         AscendC::printf(
-            "[shmem-probe P3] me=%d pe=%d p2p_heap=%p rdma_heap=%p sdma_heap=%p\n",
+            "[shmem-probe P3] me=%d pe=%d p2p_heap=%llx rdma_heap=%llx sdma_heap=%llx\n",
             me, pe, p2p, rdma, sdma);
     }
-    AscendC::printf("[shmem-probe P3] me=%d heap_base=%p heap_size=%lu\n",
-        me, st->heap_base, (unsigned long)st->heap_size);
+    AscendC::printf("[shmem-probe P3] me=%d heap_base=%llx heap_size=%llu\n",
+        me, (unsigned long long)st->heap_base, (unsigned long long)st->heap_size);
 }
 
 // ===========================================================================
@@ -94,7 +97,10 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemPutSign
         for (uint32_t i = 0; i < PROBE_PAYLOAD_ELEMS; ++i) {
             payload[i] = (int32_t)(i * 7u + 1u);
         }
-        AscendC::dcci_cacheline((__gm__ uint8_t*)payload);  // VERIFY: cache-flush helper name
+        // NOTE: no explicit cacheline flush here — aclshmem_quiet() after the put
+        // and the data-then-flag signal ordering are expected to cover
+        // visibility. If P4 shows stale data, add the shmem cache-flush helper
+        // (grep dcci / DataCacheCleanAndInvalid in src/device/).
 
         const int dst_pe = 1;
         // topo-aware high-level RMA: SHMEM picks the engine from topo_list[dst_pe].
@@ -109,7 +115,6 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemPutSign
     } else if (me == 1) {
         // VERIFY: aclshmem_signal_wait_until(sig_addr, ACLSHMEM_CMP_EQ, value)
         aclshmem_signal_wait_until(sig, ACLSHMEM_CMP_EQ, PROBE_SIGNAL_VALUE);
-        AscendC::dcci_cacheline((__gm__ uint8_t*)payload);
 
         int32_t bad_idx = -1;
         for (uint32_t i = 0; i < PROBE_PAYLOAD_ELEMS; ++i) {
@@ -117,7 +122,6 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemPutSign
         }
         result[0] = (bad_idx < 0) ? 1 : 0;
         result[1] = bad_idx;
-        AscendC::dcci_cacheline((__gm__ uint8_t*)result);
         AscendC::printf("[shmem-probe P4] me=1 verify pass=%d first_bad_idx=%d\n",
             (int)result[0], (int)bad_idx);
     }
@@ -125,14 +129,16 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemPutSign
 
 // ===========================================================================
 // Host-callable launch wrappers (compiled into libafd_probe_kernel.so).
+// main.cpp passes host-side device pointers (uint8_t*); the <<<>>> mechanism
+// forwards them to the GM_ADDR kernel params, same as examples/.../dispatch_demo.
 // ===========================================================================
 void launch_shmem_topo_probe(uint32_t block_dim, void* stream, uint8_t* shmem_window)
 {
-    ShmemTopoProbe<<<block_dim, nullptr, stream>>>((GM_ADDR)shmem_window);
+    ShmemTopoProbe<<<block_dim, nullptr, stream>>>(shmem_window);
 }
 
 void launch_shmem_put_signal_probe(
     uint32_t block_dim, void* stream, uint8_t* shmem_window, uint8_t* result_out)
 {
-    ShmemPutSignalProbe<<<block_dim, nullptr, stream>>>((GM_ADDR)shmem_window, (GM_ADDR)result_out);
+    ShmemPutSignalProbe<<<block_dim, nullptr, stream>>>(shmem_window, result_out);
 }
