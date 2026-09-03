@@ -73,10 +73,14 @@ public:
 
         pipe.InitBuffer(tBuf, UB_SINGLE_TOTAL_SIZE_MAX);
 
-#ifdef AFD_ARCH_A5
+#if defined(AFD_ARCH_A5) && !defined(AFD_A5_TREE_WINDOW_ABI)
         epWinContextA5_ = (__gm__ Moe::HcclCombinOpParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
 #else
         epWinContext_ = (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+#endif
+
+#if defined(AFD_ARCH_A5) && defined(AFD_A5_DUMP_WINDOWS)
+        dumpWindowAbi();
 #endif
 
         magicTensor_.SetGlobalBuffer((__gm__ int32_t*)(winBaseOf(rank) +
@@ -149,12 +153,13 @@ public:
     }
 
 private:
-    // Window base address of `rankId` as mapped on this device. On A5 HCCL hands
-    // out a flat cross-card window array; on A3 the local window and the
-    // remoteRes tree are separate.
+    // Window base address of `rankId` as mapped on this device. The A3 / default
+    // path takes the local window from HcclOpResParam and every remote window
+    // from the remoteRes tree. AFD_A5_FLAT_WINDOW_ABI switches A5 to the flat
+    // HcclCombinOpParam.windowsIn[] array instead (PR #276/#295 assumption).
     __aicore__ inline GM_ADDR winBaseOf(int rankId)
     {
-#ifdef AFD_ARCH_A5
+#if defined(AFD_ARCH_A5) && !defined(AFD_A5_TREE_WINDOW_ABI)
         return (GM_ADDR)(epWinContextA5_->windowsIn[rankId]);
 #else
         if (rankId == this->rank) {
@@ -163,6 +168,40 @@ private:
         return (GM_ADDR)(((HcclRankRelationResV2 *)(epWinContext_->remoteRes[rankId].nextDevicePtr))->windowsIn);
 #endif
     }
+
+#if defined(AFD_ARCH_A5) && defined(AFD_A5_DUMP_WINDOWS)
+    // Print both interpretations of the HCCL context so the A5 window ABI can be
+    // settled from one run. Enabled by -DAFD_A5_DUMP_WINDOWS (debug builds only).
+    __aicore__ inline void dumpWindowAbi()
+    {
+        if (AscendC::GetBlockIdx() != 0) {
+            return;
+        }
+        __gm__ HcclOpResParam *tree =
+            (__gm__ HcclOpResParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+        AscendC::printf("A5 a2e[rank=%d] tree: localUsrRankId=%u rankSize=%u winSize=%llu "
+            "localWindowsIn=%llx localWindowsOut=%llx remoteResNum=%u\n",
+            this->rank, tree->localUsrRankId, tree->rankSize,
+            (unsigned long long)tree->winSize,
+            (unsigned long long)tree->localWindowsIn,
+            (unsigned long long)tree->localWindowsOut,
+            tree->remoteResNum);
+        for (int i = 0; i < this->rankSize && i < 16; i++) {
+            __gm__ HcclRankRelationResV2 *rr =
+                (__gm__ HcclRankRelationResV2 *)(tree->remoteRes[i].nextDevicePtr);
+            AscendC::printf("A5 a2e[rank=%d] tree: remoteRes[%d].nextDevicePtr=%llx windowsIn=%llx\n",
+                this->rank, i, (unsigned long long)tree->remoteRes[i].nextDevicePtr,
+                (unsigned long long)(rr == nullptr ? 0 : rr->windowsIn));
+        }
+        __gm__ Moe::HcclCombinOpParam *flat =
+            (__gm__ Moe::HcclCombinOpParam *)AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+        for (int i = 0; i < this->rankSize && i < 16; i++) {
+            AscendC::printf("A5 a2e[rank=%d] flat: windowsIn[%d]=%llx windowsOut[%d]=%llx\n",
+                this->rank, i, (unsigned long long)flat->windowsIn[i],
+                i, (unsigned long long)flat->windowsOut[i]);
+        }
+    }
+#endif
 
     __aicore__ inline void waitFlagWithScalar(int addr, uint32_t magic) {
         GlobalTensor<uint32_t> flagGt;
@@ -372,7 +411,7 @@ private:
     __gm__ TQ *expandX;
     __gm__ float *dynamicScales;
     __gm__ HcclOpResParam *epWinContext_{nullptr};
-#ifdef AFD_ARCH_A5
+#if defined(AFD_ARCH_A5) && !defined(AFD_A5_TREE_WINDOW_ABI)
     __gm__ Moe::HcclCombinOpParam *epWinContextA5_{nullptr};
 #endif
     TPipe pipe;

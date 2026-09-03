@@ -5,16 +5,30 @@
 #define FORCE_INLINE_AICORE __attribute__((always_inline)) inline __aicore__
 #include "kernel_operator.h"
 
-// A5 (Ascend 950, __NPU_ARCH__ == 3510 / __DAV_C310__) exposes a flat per-rank
-// window array (HcclCombinOpParam) instead of the A3 HcclOpResParam + remoteRes tree.
+// A5 = Ascend 950, __NPU_ARCH__ == 3510 / __DAV_C310__.
 #if (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)) || defined(__DAV_C310__)
 #define AFD_ARCH_A5 1
+#endif
+
+// Window-address ABI on A5.
+//
+// PR #276/#295 assumed A5 HCCL hands the op a flat per-rank window array
+// (HcclCombinOpParam) instead of the A3 HcclOpResParam + remoteRes tree. That
+// path faults with 507035 (MTE out-of-range) on every *remote* window access
+// while local access works -- the exact fingerprint of reading windowsIn[k]
+// out of a struct that is actually the tree layout (windowsIn[0] aliases
+// localWindowsIn, windowsIn[>=1] aliases localWindowsOut / hcomId bytes).
+// vLLM-Ascend's own MC2 ops (dispatch_ffn_combine) use the tree on every arch
+// including arch35, so the tree is the default here too. Define
+// AFD_A5_FLAT_WINDOW_ABI to restore the flat interpretation.
+#if defined(AFD_ARCH_A5) && !defined(AFD_A5_FLAT_WINDOW_ABI)
+#define AFD_A5_TREE_WINDOW_ABI 1
 #endif
 
 namespace Moe {
 constexpr int CAM_MAX_RANK_SIZE = 384; // Maximum number of NPU cards supported by the communication library
 
-#ifdef AFD_ARCH_A5
+#if defined(AFD_ARCH_A5) && (!defined(AFD_A5_TREE_WINDOW_ABI) || defined(AFD_A5_DUMP_WINDOWS))
 constexpr uint32_t HCCL_MTE_MAX_RANK_NUM = 64;
 
 struct HcclCombinOpParam {
@@ -31,7 +45,7 @@ struct HcclCombinOpParam {
     uint64_t msAddr;
     uint64_t msSize;
 };
-#endif // AFD_ARCH_A5
+#endif // AFD_ARCH_A5 && (!AFD_A5_TREE_WINDOW_ABI || AFD_A5_DUMP_WINDOWS)
 
 constexpr int64_t IPC_BUFF_MAX_SIZE = 100 * 1024 * 1024;
 constexpr int64_t IPC_DATA_OFFSET = 2 * 1024 * 1024; // First 2MB as flag, then 100MB as data storage

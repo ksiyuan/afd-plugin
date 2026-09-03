@@ -7,11 +7,22 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ======================================================================================================================
 
+# A5 (Ascend 950) A2E/E2A kernel window ABI, forwarded from the environment to
+# the AscendC kernel compile. Default: the A3 remoteRes-tree path (see
+# csrc/npu/a2e/op_kernel/comm_args.h). AFD_A5_FLAT_WINDOW_ABI=1 restores the flat
+# HcclCombinOpParam.windowsIn[] interpretation (PR #276/#295). AFD_A5_DUMP_WINDOWS=1
+# prints both interpretations of the HCCL context on the first block.
+set(_a2e_kernel_options --cce-auto-sync=off -Wno-deprecated-declarations -Werror)
+if (DEFINED ENV{AFD_A5_FLAT_WINDOW_ABI} AND NOT "$ENV{AFD_A5_FLAT_WINDOW_ABI}" STREQUAL "0")
+    list(APPEND _a2e_kernel_options -DAFD_A5_FLAT_WINDOW_ABI=1)
+endif ()
+if (DEFINED ENV{AFD_A5_DUMP_WINDOWS} AND NOT "$ENV{AFD_A5_DUMP_WINDOWS}" STREQUAL "0")
+    list(APPEND _a2e_kernel_options -DAFD_A5_DUMP_WINDOWS=1)
+endif ()
+
 add_ops_compile_options(
         OP_NAME A2e
-        OPTIONS --cce-auto-sync=off
-                -Wno-deprecated-declarations
-                -Werror
+        OPTIONS ${_a2e_kernel_options}
 )
 
 target_sources(op_host_aclnnInner PRIVATE
