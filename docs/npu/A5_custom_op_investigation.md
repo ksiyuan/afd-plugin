@@ -112,7 +112,60 @@ Harness: extend `tests/e2e/runner.py` (`--device-backend npu`, an A5 2-rank
 scenario) with a decode-only timing loop, or a standalone script modelled on
 `tools/npu_a5_p2p_probe.py`.
 
-## Leading hypothesis: the flat window ABI is wrong, A5 uses the tree
+## RESULT (2026-09-03): the mixed group has NO remote resources on A5
+
+Ran the tree-ABI default + `AFD_A5_DUMP_WINDOWS=1`, 2-rank 1A+1F. Still 507035.
+Dump (both ranks):
+
+```
+a2e[rank=1] tree: localUsrRankId=1 rankSize=2 winSize=4296015872
+                  localWindowsIn=403440000000 localWindowsOut=1200c0000000 remoteResNum=0
+a2e[rank=1] tree: remoteRes[0].nextDevicePtr=0 windowsIn=0
+a2e[rank=1] tree: remoteRes[1].nextDevicePtr=0 windowsIn=0
+a2e[rank=1] flat: windowsIn[0]=403440000000  windowsOut[0]=4034c0080000
+a2e[rank=1] flat: windowsIn[1]=1200c0000000  windowsOut[1]=120140080000
+a2e[rank=0] tree: localUsrRankId=0 rankSize=2 winSize=4296015872
+                  localWindowsIn=120b00000000 localWindowsOut=124000000000 remoteResNum=0
+a2e[rank=0] tree: remoteRes[0..1].nextDevicePtr=0 windowsIn=0
+a2e[rank=0] flat: windowsIn[0]=120b00000000  windowsIn[1]=124000000000
+```
+
+Conclusions:
+
+1. **The struct is read correctly.** Prefix fields are all sane; vLLM-Ascend's
+   MC2 uses the identical `HcclOpResParam` layout on A5 and works. `remoteResNum
+   = 0` is a true read.
+2. **The flat ABI is bogus.** On each rank `flat.windowsIn[1]` == that rank's own
+   `localWindowsOut` (offset 40 aliases offset 40). It was never a peer address.
+3. **Root cause:** `HcclAllocComResourceByTiling` allocates **no** remote window
+   resources for the AFD **mixed attention+FFN** group on A5. `SetCommEngine(3)`
+   only turned the old `ret=5 (NOT_SUPPORT)` into "runs, allocates nothing".
+   Pure-EP groups *do* get resources on A5 (native MC2 dispatch works there, per
+   the earlier probe) and vLLM-Ascend's `dispatch_ffn_combine` uses the exact
+   same `Mc2CcTilingConfig(group, 8, "AlltoAll=...")` with **no** `SetCommEngine`
+   — so the blocker is specifically the non-uniform (mixed expert / non-expert)
+   group shape, not the op or the kernel.
+
+This is **not fixable in the kernel.** The A3 protocol needs a peer window that
+A5's HCCL will not hand out for this group.
+
+### What is left for the custom-op path
+
+| Option | Cost | Odds | Notes |
+| --- | --- | --- | --- |
+| **Comm-engine sweep** | ~1 h | low | `AFD_A5_COMM_ENGINE={0,1,2,4,5}` (env, no rebuild — reads `std::getenv` in tiling) + `AFD_A5_DUMP_WINDOWS=1`; look for `remoteResNum > 0`. |
+| **SHMEM / symmetric-memory rework** | weeks, needs NPU | medium | vLLM-Ascend's non-`HCCL_COMM` MC2 path addresses peers via `shmem_ptr(symmetricPtr, rank)` (CANN `shmem_api.h`), not the HCCL window tree. Host side allocates a cross-rank symmetric region and passes its pointer as an op input; kernel replaces `winBaseOf` with `shmem_ptr`. Independent of HCCL resource alloc. |
+| **Split into a group A5 accepts** | large | ? | Run a2e/e2a over a uniform sub-topology. Unclear it maps to AFD's A/F split. |
+| **Escalate to CANN/HCCL** | blocked | — | Precise ask now: "`HcclAllocComResourceByTiling` returns no `remoteRes` for a group mixing MC2-expert and non-expert ranks on ascend950; which comm engine / tiling config allocates cross-card windows for it?" Attach this dump. |
+| **Optimise B2 instead** | days, needs NPU | high | 2-ubatch overlap is the big lever. See B2 section. |
+
+Given CANN/HCCL is currently unreachable and the SHMEM rework is large, the
+pragmatic path is **B2 optimisation**, with the comm-engine sweep as a cheap
+side-bet first.
+
+---
+
+## (superseded) Earlier hypothesis: the flat window ABI is wrong, A5 uses the tree
 
 Offsets of the first three fields (`rankId`/`rankDim`/`winSize`) are byte-identical
 between the flat `HcclCombinOpParam` and the tree `HcclOpResParam`, so the

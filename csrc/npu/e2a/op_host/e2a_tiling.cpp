@@ -8,6 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <cstdlib>
+
 #include "../op_kernel/e2a_tiling.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -79,11 +81,18 @@ namespace optiling {
 
         AscendC::Mc2CcTilingConfig mc2CcTilingConfig(groupEp, opType1, algConfigAllToAllStr);
 #ifdef AFD_TILING_HAS_COMM_ENGINE
-        // On A5 (Ascend 950) HCCL allocates MC2 resources via comm engine 3;
-        // without this HcclAllocComResourceByTiling fails with HCCL_E_NOT_SUPPORT.
+        // On A5 (Ascend 950) HcclAllocComResourceByTiling fails with
+        // HCCL_E_NOT_SUPPORT unless a comm engine is set. Engine 3 lets the op
+        // run but leaves remoteResNum == 0 for the AFD mixed attention+FFN
+        // group. Override with AFD_A5_COMM_ENGINE to sweep other values.
         auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
         if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950) {
-            mc2CcTilingConfig.SetCommEngine(3);
+            int commEngine = 3;
+            const char *commEngineEnv = std::getenv("AFD_A5_COMM_ENGINE");
+            if (commEngineEnv != nullptr && commEngineEnv[0] != '\0') {
+                commEngine = std::atoi(commEngineEnv);
+            }
+            mc2CcTilingConfig.SetCommEngine(commEngine);
         }
 #endif
         mc2CcTilingConfig.GetTiling(tiling->mc2InitTiling);
