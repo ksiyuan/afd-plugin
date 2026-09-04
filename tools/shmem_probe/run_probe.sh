@@ -20,7 +20,9 @@ PROBE_HEAP_MB="${PROBE_HEAP_MB:-256}"
 PROBE_RUN_P4="${PROBE_RUN_P4:-1}"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-120}"
 LOGDIR="${PROBE_LOGDIR:-$(mktemp -d /tmp/shmem_probe.XXXXXX)}"
-UID_FILE="$LOGDIR/uid.bin"
+# TCP bootstrap address, same for every PE (rank0 binds, others connect).
+# Random-ish port so a stale/hung previous run does not collide.
+PROBE_IPPORT="${PROBE_IPPORT:-tcp://127.0.0.1:$((20000 + RANDOM % 20000))}"
 
 read -r -a DEVS <<< "$PROBE_DEVICES"
 PE_SIZE="${#DEVS[@]}"
@@ -35,6 +37,7 @@ echo "  bin       : $PROBE_BIN"
 echo "  shmem     : $SHMEM_INSTALL"
 echo "  pe_size   : $PE_SIZE   devices: ${DEVS[*]}"
 echo "  logdir    : $LOGDIR"
+echo "  ipport    : $PROBE_IPPORT"
 echo "  timeout   : ${PROBE_TIMEOUT}s/proc"
 echo
 
@@ -49,15 +52,13 @@ if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
   source /usr/local/Ascend/ascend-toolkit/set_env.sh
 fi
 
-rm -f "$UID_FILE" "$UID_FILE.tmp"
-
 pids=()
 for pe in $(seq 0 $((PE_SIZE - 1))); do
   log="$LOGDIR/pe$pe.log"
   ( SHMEM_PROBE_PE="$pe" \
     SHMEM_PROBE_PE_SIZE="$PE_SIZE" \
     SHMEM_PROBE_DEVICE="${DEVS[$pe]}" \
-    SHMEM_PROBE_UID_FILE="$UID_FILE" \
+    SHMEM_PROBE_IPPORT="$PROBE_IPPORT" \
     SHMEM_PROBE_HEAP_MB="$PROBE_HEAP_MB" \
     SHMEM_PROBE_RUN_P4="$PROBE_RUN_P4" \
     timeout -k 5 "$PROBE_TIMEOUT" stdbuf -oL -eL "$PROBE_BIN" ) > "$log" 2>&1 &
