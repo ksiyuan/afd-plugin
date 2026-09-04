@@ -1,6 +1,6 @@
 # A5（Ascend 950）自定义算子 507035 定位：混合组拿不到远端窗口资源
 
-状态：**HCCL 窗口路径已封死；主线 = SHMEM 对称内存重写（preflight P0–P6），B2 降为备用** · 最后更新：2026-09-03
+状态：**HCCL 窗口路径已封死；SHMEM 重写 preflight P0–P4 ✅ 绿（2026-09-04，显式 UDMA 数据面在 A5 0/1 干净可用）→ 进入重写实现。B2 备用。** · 最后更新：2026-09-04
 
 > 先读 [`A5_ADAPTATION.md`](A5_ADAPTATION.md)。那份文档记录了前一轮调查
 > （分支 tag `backup/a5-debug-507035`、`backup/a5-full-record`），结论是

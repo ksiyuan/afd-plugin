@@ -1,6 +1,6 @@
 # A5 SHMEM 重写 —— 启动前置验证清单
 
-状态：**P0/P1/P2 ✅；P3/P4 部分完成（2026-09-04）—— UDMA 数据面在 A5 0/1 验证通过，但 SHMEM AIV 异常上报 kernel 带出 507035，待解** · 最后更新：2026-09-04
+状态：**P0–P4 ✅ 绿（2026-09-04）—— 显式 UDMA 数据面（`aclshmemx_udma_put_signal_nbi` + `udma_quiet`）在 A5 0/1 干净可用（rc=0, pass=1）。唯一坑 `aclshmemx_sync_vec_all` 炸 507035 → 重写用 signal-based 同步绕开。正式进入重写实现。** · 最后更新：2026-09-04
 
 > 上游文档：[`A5_custom_op_investigation.md`](A5_custom_op_investigation.md)。
 > SHMEM 重写是当前主线（B2 降为备用）。本清单把启动前置拆成可在 A5 节点逐条
@@ -154,33 +154,42 @@ A5 device 0/1，`test_set_attr` + `ACLSHMEMX_INIT_WITH_DEFAULT` bootstrap）：
   `aclshmemi_udma_exception_report_read_entry_kernel`（SHMEM 注册的异常上报
   aux kernel）。demo 因此整体标 FAILED。
 
-### 修正后的判据
+### ✅ 判决：绿（2026-09-04，bisect 完成）
 
-| 结果 | 判定 |
-| --- | --- |
-| UDMA 显式 API 数据往返 + signal 校验 PASS，无 exception | ✅ 绿 —— 重写用显式 UDMA API |
-| UDMA 数据 PASS 但 AIV 异常上报 aux kernel 507035（当前状态） | 🟡 待解 —— 见下「507035 未决项」 |
-| UDMA 数据都过不了 / QP 建不起来 | ❌ 红 —— 回退 B2 |
+`ShmemUdmaPutSignalProbe` 3 个 mode（2-rank device 0/1，engine=UDMA，
+不调 `enable_exception_report` / `report_exception` / `aclshmem_barrier_all`）：
 
-### 507035（`0x701002d` AIV exception）未决项
+| mode | 组成 | stream sync rc | pass | 507035 |
+| --- | --- | --- | --- | --- |
+| **1** | `put_signal_nbi` + `udma_quiet` | **rc=0** | **pass=1** | **干净** |
+| 2 | + `aclshmemx_sync_vec_all` | rc=507035 | pass=1 | 507035 |
+| 3 | `put_signal_nbi` only | rc=0 | pass=1 | 干净 |
 
-`udma_demo` 数据过了但收尾 507035。要查清是 SHMEM 在 A5 的 aux kernel bug、还是
-真有 UDMA 异常：
+**`aclshmemx_sync_vec_all` 是唯一元凶**（A5 上 vector core exception，
+`InnerCode=0x715005e`）。数据面 `aclshmemx_udma_put_signal_nbi` +
+`aclshmemx_udma_quiet` 三个 mode 全 `pass=1`，干净可用。
 
-- [ ] `aclshmemi_udma_exception_report_read_entry_kernel` 在哪注册/launch，是不是
-      每次 `quiet` / `finalize` / stream callback 都跑；有没有 env 关掉。
-- [ ] `feat/ascend950-relay-barrier` 分支（未合 master）有没有修这个。
-- [ ] `error code 264` / `0x701002d` 的确切含义。
-- [ ] 我们自己的最小 probe（单次 `udma_put_signal_nbi`，无 allgather）也 507035
-      还是干净 —— 定位是系统性还是 udma_demo 特定模式。
+之前 udma_demo 的 507035 = `sync_vec_all`（udma_demo 里也调了）+ 后面
+`report_exception` 双重触发；aux exception-report kernel 是次要因素。
 
-### 重写方向修正
+### 重写落地方案（绿）
 
-a2e/e2a 数据面 **不用** topo-aware `aclshmem_putmem`（A5 上只会选到 MTE → 507035），
-改用 **显式 `aclshmemx_udma_put_nbi` / `aclshmemx_udma_put_signal_nbi` +
-`aclshmemx_udma_quiet` + UB WQE scratch**，蓝本 = `udma_demo` / `tp_allreduce_udma`
-（不是之前说的 doubleplane 例子）。FFTS：`aclshmem_barrier` 类同步的 kernel 需要
-`AscendC::SetSyncBaseAddr(util_get_ffts_config())`。
+| 项 | 用什么 | 不用什么 |
+| --- | --- | --- |
+| init | `test_set_attr` + `attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA` + `aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT)` | `INIT_WITH_UNIQUEID`（rc=-2） |
+| 数据搬运 | `aclshmemx_udma_put_nbi` / `aclshmemx_udma_put_signal_nbi` + `aclshmemx_udma_quiet` + UB WQE scratch（`ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE`，`init_udma_wqe_scratch` 全零） | topo-aware `aclshmem_putmem`（A5 只选 MTE → 507035） |
+| 跨 rank 同步 | **signal-based**：`put_signal_nbi` 发旗标 + 对端自旋等 signal 槽（= a2e/e2a 现有「数据→flag」协议，天然匹配） | `aclshmemx_sync_vec_all`（507035）、`aclshmem_barrier_all`（FFTS，507015） |
+| 异常上报 | 不调（数据路径不需要） | `aclshmemx_enable_exception_report` / `aclshmemx_report_exception`（拉起 aux kernel） |
+| 蓝本 example | `udma_demo` / `tp_allreduce_udma` | doubleplane 例子（硬编码 SDMA+MTE） |
+
+### 遗留（并行 d，不阻塞重写）
+
+- `aclshmemx_sync_vec_all` 在 Ascend950 / CANN 9.1.0 / SHMEM 1.7.0 上炸 507035
+  vector core exception，`InnerCode=0x715005e` —— 给 CANN/SHMEM 团队的 issue
+  （最小 repro：单 AIV kernel，`aclshmemx_udma_put_signal_nbi` + `udma_quiet` +
+  `sync_vec_all`，前两者干净、加第三个即炸）。
+- `topo_list[peer]` 位 mask 仍读不出准值（device `printf %02x` 渲染问题）——
+  不影响结论（走显式 UDMA API，不看 topo_list）。
 
 ---
 
@@ -314,12 +323,12 @@ P3 绿之后做。验证「对称窗口 + 引擎搬运 + 旗标同步」这条�
 | P0 完整源码 | A5 clone | 完整仓 + 构建脚本就位 | ✅ SHMEM 1.7.0 master |
 | P1 运行时自带？ | A5 | `shmem.h` + `*shmem*.so` + init 声明 | ✅ 不随带 → P2 |
 | P2 源码构建 | A5 | `libshmem.so` + `ACLSHMEM_UDMA_SUPPORTED=1` + transport 依赖 | ✅ 绿（2026-09-03） |
-| **P3 引擎选择探针** | **A5 2-rank** | **`topo_list[peer]` 含 UDMA / ROCE / SDMA 位** | ⏳ 待跑（probe 代码待写） |
-| P4 put+signal 往返 | A5 2-rank | payload 校验通过，无 507035 | ⏳ 待跑 |
-| P5 官方示例 | A5 2-rank | （参考）失败点与 P4 一致 | ⏳ |
-| P6 集成面盘点 | Windows | 替换点清单 + team 映射清楚 | ✅ [`A5_shmem_integration_map.md`](A5_shmem_integration_map.md) |
+| ~~P3 topo_list 门禁~~ | — | ~~含非 MTE 位~~ | ❌ 判据作废（A5 topo 自动选择只给 MTE；改走显式 UDMA API） |
+| **P4 显式 UDMA put+signal** | **A5 2-rank** | payload pass=1，无 5070xx | ✅ 绿（mode 1，2026-09-04） |
+| P5 官方示例 udma_demo | A5 2-rank | UDMA 数据面可用 | ✅ 校验 PASS（伴随 `sync_vec_all` 507035） |
+| P6 集成面盘点 | Windows | 替换点清单 + team 映射 | ✅ [`A5_shmem_integration_map.md`](A5_shmem_integration_map.md) |
 
-失败动作：P3 只有 MTE 位或全 0 / P4 崩 → 回退备用方案 e（B2 优化），写回读数。
+**P4 绿 = 正式进入 SHMEM 重写实现。** 落地方案见上「重写落地方案」表。
 
 **P3 + P4 双绿 = 正式进入 SHMEM 重写实现。** 否则回退备用方案 e（B2 优化）
 + 并行 d（问 CANN/HCCL）。

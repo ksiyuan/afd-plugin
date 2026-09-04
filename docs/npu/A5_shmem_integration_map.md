@@ -1,11 +1,21 @@
 # A5 SHMEM 重写 —— a2e/e2a 集成面盘点（preflight P6）
 
-状态：**设计输入，随 preflight 推进更新** · 最后更新：2026-09-03
+状态：**设计输入 —— preflight P4 已绿（2026-09-04），API 选型已定，可动手** · 最后更新：2026-09-04
 
-> 上游：[`A5_shmem_preflight.md`](A5_shmem_preflight.md) 的 P6。本文件把
-> a2e/e2a 现在「直接算对端 window 地址 + MTE 搬运 + 裸 flag」的每一处，逐个映射
-> 到 SHMEM「对称 offset + 引擎代劳 RMA + signal」。**不改代码，只盘点**，等
-> P3/P4 门禁绿了照这张表动手。所有行号针对分支 `a5-custom-op-research`。
+> 上游：[`A5_shmem_preflight.md`](A5_shmem_preflight.md)。本文件把 a2e/e2a 现在
+> 「直接算对端 window 地址 + MTE 搬运 + 裸 flag」的每一处，逐个映射到 SHMEM。
+> 所有行号针对分支 `a5-custom-op-research`。
+
+## 已验证的 API 选型（preflight P4，A5 device 0/1）
+
+| 用途 | API | 备注 |
+| --- | --- | --- |
+| init | `test_set_attr(pe, n_pes, mem, "tcp://ip:port", uid, &attr)` → `attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA` → `aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr)` | `test_set_attr` 默认 engine 是 MTE，**必须覆盖成 UDMA**。`INIT_WITH_UNIQUEID` 在 A5 返回 -2，不用。 |
+| 对称内存 | `aclshmem_malloc(bytes)`（每 PE 同步同尺寸） | 返回对称指针；`put` 的 dst/src 都是同一个对称 offset，对端在自己 heap 同 offset 收 |
+| 数据 + 旗标 | `aclshmemx_udma_put_signal_nbi(dst, src, elem_bytes, __gm__ uint64_t* sig, signal, pe, __ubuf__ uint8_t* wqe_buf, sync_id)` + `aclshmemx_udma_quiet(pe)` | 单请求 ≤256MB；`wqe_buf` = caller UB scratch，大小 `ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE`，用前 `init_udma_wqe_scratch`（全零）。**PASS，rc=0，无 exception。** |
+| 纯数据 | `aclshmemx_udma_put_nbi(dst, src, wqe_buf, elem_bytes, pe, sync_id)` + `aclshmemx_udma_quiet(pe)` | 同上 |
+| 跨 rank 同步 | **signal-based**：`put_signal_nbi` 发旗标，对端自旋 `while(sig != magic)` | ⚠️ **不要** `aclshmemx_sync_vec_all`（A5 炸 507035）、`aclshmem_barrier_all`（FFTS，507015） |
+| 异常上报 | 不调 | `aclshmemx_report_exception` / `enable_exception_report` 会拉起 aux kernel，A5 上 507035 |
 
 ---
 
@@ -16,7 +26,7 @@
 | host tiling | [`a2e_tiling.cpp`](../../csrc/npu/a2e/op_host/a2e_tiling.cpp) `Mc2CcTilingConfig(groupEp, ALL_TO_ALL, "AlltoAll=...")` → `GetTiling(mc2InitTiling/mc2CcTiling1)`；A5 上还 `SetCommEngine(3)` | **删掉整个 MC2 tiling**。不再要 HCCL comm resource。 |
 | host 建资源 | HCCL 运行时 `HcclAllocComResourceByTiling`（就是这步在 A5 混合组不给 `remoteRes`） | `aclshmemx_init_attr` + `aclshmem_malloc`（对称堆），一次性，连接器 init 时做 |
 | kernel 取 window | `AscendC::GetHcclContext<HCCL_GROUP_ID_0>()` → `HcclOpResParam*`（树）或 `HcclCombinOpParam*`（扁平），`winBaseOf(rankId)` 从 `remoteRes[rankId].nextDevicePtr->windowsIn` 取对端基址 | op 新增一个输入参数 `GM_ADDR shmem_window`（`aclshmem_malloc` 的返回值，host 传入）；对端地址用**对称 offset**（`shmem_window + peer_stride` 或直接把对称指针交给 `aclshmem_putmem` 的 `pe` 参数）。**`winBaseOf` / `epWinContext_` / `epWinContextA5_` 整个删掉。** |
-| 引擎选择 | 写死 MTE（`CpGM2GMPingPong` / `DataCopyPad` GM↔GM，AI core 直接寻址对端） | `aclshmem_putmem/getmem` 内部按 `state->topo_list[pe]` 选 SDMA→UDMA→MTE→ROCE。**A5 上期望走 UDMA/RDMA 引擎。** |
+| 引擎选择 | 写死 MTE（`CpGM2GMPingPong` / `DataCopyPad` GM↔GM，AI core 直接寻址对端） | **显式 UDMA**：`aclshmemx_udma_put(_signal)_nbi` + `aclshmemx_udma_quiet`。**不用** topo-aware `aclshmem_putmem`（A5 topo 自动只选 MTE → 507035）。 |
 
 现在的三区窗口布局（`comm_args.h:50-51`，两 op 共用）：
 
@@ -88,15 +98,14 @@ expertScales，其余发 x；`sendExpertIds` / `sendExpertScales` / `sendBatchSi
 | `winBaseOf(rankId)` + `epWinContext_` / `epWinContextA5_` | a2e.h:160 / e2a.h:120 | **删除**。对称堆基址 = `aclshmem_malloc` 返回值（host 传进来的 `shmem_window`）。 |
 | `shareAddrs[i] = winBaseOf(i) + i*OPT_RANK_OFFSET` | a2e.h:101-112 | **删除**。本地写 `shmem_window + local_off`；对端用 `pe` 参数寻址，不手工算地址。 |
 | `copyGmToGmWithBlocks(shareXGt_own, xGt, ...)` 写自己 data 区 | a2e.h `sendX` | 本地 `DataCopy` 到 `shmem_window` 的 payload 区（本地操作，不变） |
-| `copyGmToGmWithBlocks(out, shareXGt_remote, ...)` 读对端 data 区 | a2e.h `recvWithMte` | `aclshmem_getmem(local_dst, shmem_window + payload_off, bytes, src_pe)` + `aclshmemx_udma_quiet(src_pe)`（或让发送方 `aclshmem_putmem` 推过来，见下「推 vs 拉」） |
-| `copyGmToGmWithBlocks(shareXGt_remote, expandXGt, ...)` 写对端 data 区 | e2a.h `sendWithMte` | `aclshmem_putmem(shmem_window + payload_off, local_src, bytes, dst_pe)` + `aclshmemx_udma_quiet(dst_pe)` |
-| `camCpUB2GM(shareFlagGt_remote, flagLt=magic<<32, ...)` 写对端裸 flag | a2e.h:231 / e2a.h:198 | `aclshmemx_signal_op(sig_addr, magic, ACLSHMEM_SIGNAL_SET, dst_pe)` |
-| `waitFlagWithScalar` / `recvWithMte` 自旋读自己 flag | a2e.h:206 / e2a.h:203 | `aclshmem_signal_wait_until(sig_addr, ACLSHMEM_CMP_EQ, magic)` |
-| `DATA_FLUSH` / `DataCacheCleanAndInvalid` + `dsb` 手工 flush | a2e.h:20 | SHMEM signal/quiet 内部管一致性；大概率可删，P4 验证 |
-| `SyncAll()`（block 间） | 多处 | 保留（block 内同步，与 transport 无关）；跨 rank 用 `aclshmem_barrier(team)` |
-| `magicTensor_` 原子自增拿 magic | a2e.h:86-98 | 保留思路（每次调用换 magic 避免 ABA），或用 SHMEM signal 的 ADD 模式累计 |
+| `copyGmToGmWithBlocks(shareXGt_remote, expandXGt, ...)` 写对端 data 区 + `camCpUB2GM` 写对端 flag | e2a.h `sendWithMte`（a2e recv 侧改成推） | **一条 `aclshmemx_udma_put_signal_nbi(dst_off, local_src, bytes, sig_addr, magic, dst_pe, wqe_buf, sync_id)` + `aclshmemx_udma_quiet(dst_pe)`** —— 数据+旗标一条 WQE |
+| `waitFlagWithScalar` / `recvWithMte` 自旋读自己 flag | a2e.h:206 / e2a.h:203 | **保留自旋**：`while (sigGt.GetValue(0) != magic) {}` 读**本地** signal 槽（signal 是对端 `put_signal_nbi` 写过来的，本地读不崩） |
+| `DATA_FLUSH` / `DataCacheCleanAndInvalid` + `dsb` 手工 flush | a2e.h:20 | P4 里没用，`put_signal` 的 WRITE_WITH_NOTIFY 保证数据先于旗标；先删，坏了再加 |
+| `SyncAll()`（block 间） | 多处 | 保留（block 内跨核，与 transport 无关）。⚠️ 跨 rank **不用** `aclshmemx_sync_vec_all`（A5 507035）也不用 `aclshmem_barrier`（FFTS） |
+| `magicTensor_` 原子自增拿 magic | a2e.h:86-98 | 保留思路（每次调用换 magic 避免 ABA），signal 值用 magic |
+| WQE scratch | （新增） | kernel 里 `TBuf<VECOUT>` 开 `ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE`，`init_udma_wqe_scratch` 全零，传给每个 `udma_put*` |
 | `IPC_DATA_OFFSET` / `OPT_RANK_OFFSET` / `shareAddrs[]` 布局常量 | comm_args.h:50-76 | 重定义为对称窗口内的分区 offset（payload / signal 两区起点） |
-| 数据面「推」还是「拉」 | a2e 拉 / e2a 推 | **统一成推**（`put` + `put_signal`），对上官方 doubleplane 例子的 `put_signal_nbi`（数据+旗标一条 WQE），少一次 round-trip |
+| 数据面「推」还是「拉」 | a2e 拉 / e2a 推 | **统一成推**（`put_signal_nbi` 数据+旗标一条 WQE），少一次 round-trip；attention rank 要知道 FFN rank 的接收布局 |
 
 ---
 
