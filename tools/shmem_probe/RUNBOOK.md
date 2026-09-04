@@ -113,13 +113,37 @@ macro are OK.
 ## Step 4 — run (2-rank, device 0/1)
 
 ```bash
-export SHMEM_INSTALL="$SHMEM_HOME"           # for LD_LIBRARY_PATH (libshmem_utils.so)
-# if 'make install' didn't run, point at the build tree lib dir instead:
-#   export LD_LIBRARY_PATH=$(dirname $(find $SHMEM_SRC -name libshmem.so | head -1)):$LD_LIBRARY_PATH
-"$AFD/tools/shmem_probe/run_probe.sh" <path to built afd_probe binary>
+export SHMEM_INSTALL="$SHMEM_HOME"
+BIN=$(find "$SHMEM_SRC" -name afd_probe -type f -perm -u+x | head -1)
+
+# P3 topo + P4 UDMA bisect
+for m in 1 2 3; do
+  echo "== P4_MODE $m =="
+  PROBE_P4_MODE=$m "$AFD/tools/shmem_probe/run_probe.sh" "$BIN" 2>&1 \
+    | grep -E "P4 RESULT|stream sync rc|5070|topo_list"
+done
+
+# Slice 1a — a2e computeGate==0 data pattern (attn push + flag protocol)
+PROBE_TEST=a2e "$AFD/tools/shmem_probe/run_probe.sh" "$BIN" 2>&1 \
+  | grep -E "a2e-g0|5070|stream sync rc"
 ```
 
 P3 only: `PROBE_RUN_P4=0 run_probe.sh ...`
+
+### Slice 1a expected
+
+```
+[pe1] [probe] pe=1 a2e-g0: role=attn ers=1 ars=1 ratio=1 recv_batch=8 hidden=512 seg=16384B
+[pe1] [a2e-g0] pe=1 attn push 16384 B -> ffn 0 slot 0
+[pe0] [a2e-g0] pe=0 ffn flag slot 0 ok
+[pe0] [probe] pe=0 ===== a2e-g0 RESULT: pass=1 bad_k=-1 first_bad_idx=-1 =====
+[pe*] [probe] pe=* a2e-g0 kernel stream sync rc=0
+```
+
+`pass=1` + `rc=0` + no 5070xx → the a2e-gate0 kernel logic is validated and
+drops into `csrc/npu/a2e/op_kernel/a2e.h`. Any 5070xx → paste the fault line
+(likely the `DataCacheCleanAndInvalid` in the FFN-side spin — swap it for a
+plain volatile read or a different flush).
 
 ---
 

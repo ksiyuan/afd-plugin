@@ -137,3 +137,73 @@ void launch_shmem_udma_put_signal_probe(
     ShmemUdmaPutSignalProbe<<<block_dim, nullptr, stream>>>(
         gva, sig_addr, message_length, signal, mode);
 }
+
+// ===========================================================================
+// Slice 1a — a2e computeGate==0 data pattern (standalone, in the probe harness)
+// ===========================================================================
+// Mirrors afd-plugin/csrc/npu/a2e/op_kernel/a2e.h computeGate==0:
+//   attention rank (my_pe >= expert_rank_size) PUSHES its x segment + a flag to
+//   its FFN rank; FFN rank (my_pe < expert_rank_size) spins on the local flag,
+//   payload is already in the window (host validates it).
+//
+// Roles for a 2-rank run: expert_rank_size=1 -> pe0 = FFN, pe1 = attention,
+// attn_to_moe_ratio=1. The per-peer slot loop / offset math is still exercised.
+//
+// Window layout (symmetric aclshmem_malloc):
+//   [0, FLAG_REGION)               attn_to_moe_ratio x uint64 flag slots
+//   [FLAG_REGION, +ratio*seg_bytes) per-peer payload segments
+constexpr int A2E_FLAG_REGION = 512;   // >= ratio * 8, 512B aligned
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemA2eGate0Probe(
+    GM_ADDR win, GM_ADDR x, int recv_batch, int hidden, int attn_to_moe_ratio,
+    int expert_rank_size, uint64_t magic)
+{
+    if (GetBlockIdx() != 0) {
+        return;
+    }
+    const int64_t seg_bytes = (int64_t)recv_batch * hidden * (int64_t)sizeof(int32_t);
+    const int my_pe = aclshmem_my_pe();
+
+    if (my_pe >= expert_rank_size) {
+        // ---- attention rank: push x -> FFN rank, one WQE (data + flag) --------
+        AscendC::TPipe pipe;
+        AscendC::TBuf<AscendC::TPosition::VECOUT> buf;
+        pipe.InitBuffer(buf, UDMA_WQE_SCRATCH_BYTES);
+        AscendC::LocalTensor<uint8_t> ub = buf.GetWithOffset<uint8_t>(UDMA_WQE_SCRATCH_BYTES, 0);
+        __ubuf__ uint8_t* wqe = (__ubuf__ uint8_t*)ub.GetPhyAddr();
+        init_udma_wqe_scratch(wqe, UDMA_WQE_SCRATCH_BYTES);
+
+        const int ffn_pe = my_pe % expert_rank_size;
+        const int k = my_pe / expert_rank_size - 1;     // this rank's slot on ffn_pe
+        __gm__ uint64_t* sig = (__gm__ uint64_t*)(win + (int64_t)k * (int64_t)sizeof(uint64_t));
+        __gm__ uint8_t*  dst = win + A2E_FLAG_REGION + (int64_t)k * seg_bytes;
+
+        aclshmemx_udma_put_signal_nbi(
+            dst, (__gm__ uint8_t*)x, (uint32_t)seg_bytes, sig, magic, ffn_pe, wqe, 0);
+        aclshmemx_udma_quiet(ffn_pe);
+        AscendC::printf("[a2e-g0] pe=%d attn push %lld B -> ffn %d slot %d\n",
+            my_pe, (long long)seg_bytes, ffn_pe, k);
+    } else {
+        // ---- FFN rank: wait each attention peer's flag (local read) -----------
+        for (int k = 0; k < attn_to_moe_ratio; ++k) {
+            AscendC::GlobalTensor<uint64_t> sigGt;
+            sigGt.SetGlobalBuffer((__gm__ uint64_t*)(win + (int64_t)k * (int64_t)sizeof(uint64_t)));
+            for (;;) {
+                AscendC::DataCacheCleanAndInvalid<uint64_t,
+                    AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(sigGt);
+                if (sigGt.GetValue(0) == magic) {
+                    break;
+                }
+            }
+            AscendC::printf("[a2e-g0] pe=%d ffn flag slot %d ok\n", my_pe, k);
+        }
+    }
+}
+
+void launch_shmem_a2e_gate0_probe(
+    uint32_t block_dim, void* stream, uint8_t* win, uint8_t* x,
+    int recv_batch, int hidden, int attn_to_moe_ratio, int expert_rank_size, uint64_t magic)
+{
+    ShmemA2eGate0Probe<<<block_dim, nullptr, stream>>>(
+        win, x, recv_batch, hidden, attn_to_moe_ratio, expert_rank_size, magic);
+}

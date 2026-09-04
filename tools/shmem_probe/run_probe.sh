@@ -62,6 +62,10 @@ for pe in $(seq 0 $((PE_SIZE - 1))); do
     SHMEM_PROBE_HEAP_MB="$PROBE_HEAP_MB" \
     SHMEM_PROBE_RUN_P4="$PROBE_RUN_P4" \
     SHMEM_PROBE_P4_MODE="${PROBE_P4_MODE:-2}" \
+    SHMEM_PROBE_TEST="${PROBE_TEST:-p4}" \
+    SHMEM_PROBE_A2E_BATCH="${PROBE_A2E_BATCH:-8}" \
+    SHMEM_PROBE_A2E_HIDDEN="${PROBE_A2E_HIDDEN:-512}" \
+    SHMEM_PROBE_A2E_EXPERT_RANKS="${PROBE_A2E_EXPERT_RANKS:-1}" \
     timeout -k 5 "$PROBE_TIMEOUT" stdbuf -oL -eL "$PROBE_BIN" ) > "$log" 2>&1 &
   pids+=($!)
   echo "  pe$pe -> pid ${pids[-1]}, device ${DEVS[$pe]}, log $log"

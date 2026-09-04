@@ -38,11 +38,17 @@ static constexpr uint32_t PROBE_ELEMS       = 4096;
 static constexpr int      PROBE_SEG_BYTES   = (int)(PROBE_ELEMS * sizeof(int32_t)); // 16 KB
 static constexpr uint64_t PROBE_SIGNAL      = 1000;
 
+static constexpr int      A2E_FLAG_REGION = 512;
+static constexpr uint64_t A2E_MAGIC       = 0xA2E0;
+
 // Launch wrappers exported from libafd_probe_kernel.so (afd_probe_kernel.cpp).
 extern void launch_shmem_topo_probe(uint32_t block_dim, void* stream, uint8_t* shmem_window);
 extern void launch_shmem_udma_put_signal_probe(
     uint32_t block_dim, void* stream, uint8_t* gva, uint8_t* sig_addr,
     int message_length, uint64_t signal, int mode);
+extern void launch_shmem_a2e_gate0_probe(
+    uint32_t block_dim, void* stream, uint8_t* win, uint8_t* x,
+    int recv_batch, int hidden, int attn_to_moe_ratio, int expert_rank_size, uint64_t magic);
 
 namespace {
 
@@ -69,6 +75,10 @@ int main(int argc, char** argv)
     const int device_id = env_int("SHMEM_PROBE_DEVICE", pe);
     const int run_p4    = env_int("SHMEM_PROBE_RUN_P4", 1);
     const int p4_mode   = env_int("SHMEM_PROBE_P4_MODE", 2);  // 1=quiet 2=+sync_vec_all 3=bare
+    const char* test    = env_str("SHMEM_PROBE_TEST", "p4"); // "p4" | "a2e"
+    const int a2e_batch = env_int("SHMEM_PROBE_A2E_BATCH", 8);
+    const int a2e_hidden = env_int("SHMEM_PROBE_A2E_HIDDEN", 512);
+    const int a2e_expert_rank_size = env_int("SHMEM_PROBE_A2E_EXPERT_RANKS", 1);
     const char* ip_port = env_str("SHMEM_PROBE_IPPORT", "tcp://127.0.0.1:8998");
     const uint64_t local_mem_size =
         (uint64_t)env_int("SHMEM_PROBE_HEAP_MB", 256) * 1024ull * 1024ull;
@@ -116,8 +126,68 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "[probe] pe=%d P3 stream sync FAILED\n", pe);
     aclshmem_free(p3win);
 
+    // ================= Slice 1a: a2e computeGate==0 pattern ============
+    if (run_p4 && std::strcmp(test, "a2e") == 0) {
+        const int ers = a2e_expert_rank_size;
+        const int ars = pe_size - ers;                        // attention ranks
+        const int ratio = (ars > ers) ? ((ars + ers - 1) / ers) : 1;
+        const int recv_batch = a2e_batch / ratio;
+        const int elems = recv_batch * a2e_hidden;
+        const int seg_bytes = (int)(elems * sizeof(int32_t));
+        const uint64_t win_bytes = (uint64_t)A2E_FLAG_REGION + (uint64_t)ratio * seg_bytes;
+
+        void* win = aclshmem_malloc(win_bytes);
+        if (!win) { std::fprintf(stderr, "[probe] pe=%d a2e malloc failed\n", pe); return 1; }
+        aclrtMemset(win, win_bytes, 0, win_bytes);
+
+        const bool is_attn = (pe >= ers);
+        void* x = nullptr;
+        std::vector<int32_t> seg(elems);
+        for (int i = 0; i < elems; ++i) seg[i] = pat((uint32_t)i);
+        if (is_attn) {
+            aclrtMalloc(&x, seg_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+            aclrtMemcpy(x, seg_bytes, seg.data(), seg_bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+        }
+        aclrtSynchronizeStream(stream);
+
+        std::printf("[probe] pe=%d a2e-g0: role=%s ers=%d ars=%d ratio=%d recv_batch=%d hidden=%d seg=%dB\n",
+            pe, is_attn ? "attn" : "ffn", ers, ars, ratio, recv_batch, a2e_hidden, seg_bytes);
+        launch_shmem_a2e_gate0_probe(1, stream, reinterpret_cast<uint8_t*>(win),
+            reinterpret_cast<uint8_t*>(x), recv_batch, a2e_hidden, ratio, ers, A2E_MAGIC);
+        int rc_sync = aclrtSynchronizeStream(stream);
+        std::printf("[probe] pe=%d a2e-g0 kernel stream sync rc=%d\n", pe, rc_sync);
+
+        int pass = 1, first_bad = -1, bad_k = -1;
+        if (!is_attn) {
+            std::vector<int32_t> got(elems);
+            for (int k = 0; k < ratio; ++k) {
+                // wait this peer's flag slot
+                uint64_t fv = 0; int tries = 0;
+                for (; tries < 30000; ++tries) {
+                    aclrtMemcpy(&fv, 8, reinterpret_cast<uint8_t*>(win) + (uint64_t)k * 8, 8,
+                                ACL_MEMCPY_DEVICE_TO_HOST);
+                    if (fv == A2E_MAGIC) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                std::printf("[probe] pe=%d a2e-g0 flag[%d]=0x%llx after %d tries\n",
+                    pe, k, (unsigned long long)fv, tries);
+                if (fv != A2E_MAGIC) { pass = 0; bad_k = k; first_bad = -2; continue; }
+                aclrtMemcpy(got.data(), seg_bytes,
+                            reinterpret_cast<uint8_t*>(win) + A2E_FLAG_REGION + (uint64_t)k * seg_bytes,
+                            seg_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+                for (int i = 0; i < elems; ++i) {
+                    if (got[i] != pat((uint32_t)i)) { pass = 0; first_bad = i; bad_k = k; break; }
+                }
+            }
+            std::printf("[probe] pe=%d ===== a2e-g0 RESULT: pass=%d bad_k=%d first_bad_idx=%d =====\n",
+                pe, pass, bad_k, first_bad);
+        }
+
+        if (x) aclrtFree(x);
+        aclshmem_free(win);
+    }
     // ================= P4: explicit-UDMA put + signal ==================
-    if (run_p4) {
+    else if (run_p4) {
         const uint64_t win_bytes = (uint64_t)PROBE_SEG_BYTES * pe_size;
         void* gva = aclshmem_malloc(win_bytes);
         void* sig = aclshmem_malloc((uint64_t)pe_size * sizeof(uint64_t));
