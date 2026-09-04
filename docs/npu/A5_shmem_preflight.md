@@ -1,6 +1,6 @@
 # A5 SHMEM 重写 —— 启动前置验证清单
 
-状态：**P0/P1/P2 ✅ 绿（SHMEM 1.7.0 built，UDMA 编入，transport 依赖就位）；P3/P4 待跑** · 最后更新：2026-09-03
+状态：**P0/P1/P2 ✅；P3/P4 部分完成（2026-09-04）—— UDMA 数据面在 A5 0/1 验证通过，但 SHMEM AIV 异常上报 kernel 带出 507035，待解** · 最后更新：2026-09-04
 
 > 上游文档：[`A5_custom_op_investigation.md`](A5_custom_op_investigation.md)。
 > SHMEM 重写是当前主线（B2 降为备用）。本清单把启动前置拆成可在 A5 节点逐条
@@ -133,7 +133,58 @@ bash scripts/build.sh -DSHMEM_RDMA=ON        # 具体 flag 名以 build 脚本�
 
 ---
 
-## P3 —— 混合拓扑的引擎选择探针（决定性测试）
+## ⚠️ P3/P4 判据已修正（2026-09-04）
+
+原设计「读 `topo_list[peer]` 是否有非 MTE 引擎位」**是错的**。实测（2026-09-04，
+A5 device 0/1，`test_set_attr` + `ACLSHMEMX_INIT_WITH_DEFAULT` bootstrap）：
+
+- `aclshmemx_init_attr rc=0` ✅（原来 UNIQUEID 模式 rc=-2 `ACC_NEW_OBJECT_FAIL`，
+  是 TCP bootstrap 自动挑网卡的问题；显式 `tcp://ip:port` 解决）
+- **`topo_list[peer] = 0x1` = 只有 MTE 位**。`rdma_heap=0 sdma_heap=0`，只有
+  `p2p_heap`。SHMEM 的 topo 引擎自动选择在这两张 A5 卡上只建 MTE p2p 链路，
+  哪怕 `shmem_init.cpp:225` 编译期 `supported_engines = MTE | UDMA`。
+- **但 `udma_demo` / `tp_allreduce_udma` 证明 UDMA 可用** —— 走
+  `attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA`（0x08）+ kernel
+  **直接调 `aclshmemx_udma_put_nbi` / `aclshmemx_udma_put_signal_nbi` /
+  `aclshmemx_udma_quiet`**，完全不看 `topo_list`。
+- 实测 `udma_demo`（2-rank device 0/1）：**`check transport result success`
+  —— UDMA 数据面 + allgather 校验 PASS**，但伴随 `status=507035`
+  （`0x701002d`，AIV vector-core exception）在 `aclshmemx_report_exception()` /
+  `aclrtSynchronizeStream` 环节，fault kernel =
+  `aclshmemi_udma_exception_report_read_entry_kernel`（SHMEM 注册的异常上报
+  aux kernel）。demo 因此整体标 FAILED。
+
+### 修正后的判据
+
+| 结果 | 判定 |
+| --- | --- |
+| UDMA 显式 API 数据往返 + signal 校验 PASS，无 exception | ✅ 绿 —— 重写用显式 UDMA API |
+| UDMA 数据 PASS 但 AIV 异常上报 aux kernel 507035（当前状态） | 🟡 待解 —— 见下「507035 未决项」 |
+| UDMA 数据都过不了 / QP 建不起来 | ❌ 红 —— 回退 B2 |
+
+### 507035（`0x701002d` AIV exception）未决项
+
+`udma_demo` 数据过了但收尾 507035。要查清是 SHMEM 在 A5 的 aux kernel bug、还是
+真有 UDMA 异常：
+
+- [ ] `aclshmemi_udma_exception_report_read_entry_kernel` 在哪注册/launch，是不是
+      每次 `quiet` / `finalize` / stream callback 都跑；有没有 env 关掉。
+- [ ] `feat/ascend950-relay-barrier` 分支（未合 master）有没有修这个。
+- [ ] `error code 264` / `0x701002d` 的确切含义。
+- [ ] 我们自己的最小 probe（单次 `udma_put_signal_nbi`，无 allgather）也 507035
+      还是干净 —— 定位是系统性还是 udma_demo 特定模式。
+
+### 重写方向修正
+
+a2e/e2a 数据面 **不用** topo-aware `aclshmem_putmem`（A5 上只会选到 MTE → 507035），
+改用 **显式 `aclshmemx_udma_put_nbi` / `aclshmemx_udma_put_signal_nbi` +
+`aclshmemx_udma_quiet` + UB WQE scratch**，蓝本 = `udma_demo` / `tp_allreduce_udma`
+（不是之前说的 doubleplane 例子）。FFTS：`aclshmem_barrier` 类同步的 kernel 需要
+`AscendC::SetSyncBaseAddr(util_get_ffts_config())`。
+
+---
+
+## P3 —— 混合拓扑的引擎选择探针（原设计，判据见上）
 
 **这是可行性门禁的核心。** 2-rank，device 只用 0/1，1 Attention + 1 FFN，
 复现 AFD 的混合组形状。
