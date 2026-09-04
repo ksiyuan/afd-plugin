@@ -83,17 +83,25 @@ grep -n "afd_probe" "$SHMEM_SRC/examples/CMakeLists.txt"
 
 ---
 
-## Step 3 — build with examples on (Ascend950)
+## Step 3 — build
 
 ```bash
-cd "$SHMEM_SRC"
-# match how P2 built it, plus -examples. Common form:
-bash scripts/build.sh -examples <the SOC/backend flag P2 used for 950>
-# (from build.sh: -examples => -DUSE_EXAMPLES=ON; 950 has XSCALE / HNS_1825
-#  RDMA-backend variants — reuse whatever P2 used.)
+# after cmake has picked up examples/afd_probe once (Step 2), incremental rebuilds
+# of just the probe are fast:
+cd "$SHMEM_SRC/build" && make afd_probe -j
+strings bin/afd_probe | grep -E 'ShmemUdmaPutSignalProbe|init_attr rc='   # confirm new binary
 
-find "$SHMEM_SRC" -name 'afd_probe' -type f -perm -u+x     # the built binary
+# first time / after editing examples/CMakeLists.txt — full example configure:
+cd "$SHMEM_SRC" && bash scripts/build.sh -examples <the SOC/backend flag P2 used for 950>
+
+find "$SHMEM_SRC" -name 'afd_probe' -type f -perm -u+x
 find "$SHMEM_SRC" -name 'libafd_probe_kernel.so'
+```
+
+**Re-copy the sources into `examples/afd_probe/` after every `git pull`** — the
+probe is iterated often:
+```bash
+cp "$AFD"/tools/shmem_probe/{afd_probe_kernel.cpp,main.cpp} "$SHMEM_SRC/examples/afd_probe/"
 ```
 
 If only the probe example fails to compile but the rest is fine, iterate on the
