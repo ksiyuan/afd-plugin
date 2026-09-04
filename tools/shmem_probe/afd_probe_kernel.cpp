@@ -93,8 +93,12 @@ __aicore__ inline void init_udma_wqe_scratch(__ubuf__ uint8_t* scratch, uint32_t
 //                [message_length * pe, message_length * (pe+1)).
 // sig_addr     : symmetric signal window, one uint64 slot per PE.
 // message_length : segment size in BYTES.
+// mode         : bisect switch —
+//                1 = put_signal_nbi + udma_quiet         (NO sync_vec_all)
+//                2 = put_signal_nbi + udma_quiet + sync_vec_all   (== udma_demo)
+//                3 = put_signal_nbi only                 (no quiet, no sync)
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemUdmaPutSignalProbe(
-    GM_ADDR gva, GM_ADDR sig_addr, int message_length, uint64_t signal)
+    GM_ADDR gva, GM_ADDR sig_addr, int message_length, uint64_t signal, int mode)
 {
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECOUT> buf;
@@ -117,14 +121,19 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ShmemUdmaPut
             (__gm__ uint8_t*)(gva + message_length * my_pe),
             (__gm__ uint8_t*)(gva + message_length * my_pe),
             (uint32_t)message_length, dst_sig, signal, i, wqe_scratch, SYNC_ID);
-        aclshmemx_udma_quiet(i);
+        if (mode == 1 || mode == 2) {
+            aclshmemx_udma_quiet(i);
+        }
     }
-    aclshmemx_sync_vec_all();
+    if (mode == 2) {
+        aclshmemx_sync_vec_all();
+    }
 }
 
 void launch_shmem_udma_put_signal_probe(
     uint32_t block_dim, void* stream, uint8_t* gva, uint8_t* sig_addr,
-    int message_length, uint64_t signal)
+    int message_length, uint64_t signal, int mode)
 {
-    ShmemUdmaPutSignalProbe<<<block_dim, nullptr, stream>>>(gva, sig_addr, message_length, signal);
+    ShmemUdmaPutSignalProbe<<<block_dim, nullptr, stream>>>(
+        gva, sig_addr, message_length, signal, mode);
 }

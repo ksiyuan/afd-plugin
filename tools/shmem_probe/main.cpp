@@ -42,7 +42,7 @@ static constexpr uint64_t PROBE_SIGNAL      = 1000;
 extern void launch_shmem_topo_probe(uint32_t block_dim, void* stream, uint8_t* shmem_window);
 extern void launch_shmem_udma_put_signal_probe(
     uint32_t block_dim, void* stream, uint8_t* gva, uint8_t* sig_addr,
-    int message_length, uint64_t signal);
+    int message_length, uint64_t signal, int mode);
 
 namespace {
 
@@ -68,6 +68,7 @@ int main(int argc, char** argv)
     const int pe_size   = env_int("SHMEM_PROBE_PE_SIZE", 2);
     const int device_id = env_int("SHMEM_PROBE_DEVICE", pe);
     const int run_p4    = env_int("SHMEM_PROBE_RUN_P4", 1);
+    const int p4_mode   = env_int("SHMEM_PROBE_P4_MODE", 2);  // 1=quiet 2=+sync_vec_all 3=bare
     const char* ip_port = env_str("SHMEM_PROBE_IPPORT", "tcp://127.0.0.1:8998");
     const uint64_t local_mem_size =
         (uint64_t)env_int("SHMEM_PROBE_HEAP_MB", 256) * 1024ull * 1024ull;
@@ -131,11 +132,11 @@ int main(int argc, char** argv)
                     PROBE_SEG_BYTES, seg.data(), PROBE_SEG_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
         aclrtSynchronizeStream(stream);
 
-        std::printf("[probe] pe=%d launching ShmemUdmaPutSignalProbe (seg=%dB signal=%llu)\n",
-            pe, PROBE_SEG_BYTES, (unsigned long long)PROBE_SIGNAL);
+        std::printf("[probe] pe=%d launching ShmemUdmaPutSignalProbe (seg=%dB signal=%llu mode=%d)\n",
+            pe, PROBE_SEG_BYTES, (unsigned long long)PROBE_SIGNAL, p4_mode);
         launch_shmem_udma_put_signal_probe(1, stream,
             reinterpret_cast<uint8_t*>(gva), reinterpret_cast<uint8_t*>(sig),
-            PROBE_SEG_BYTES, PROBE_SIGNAL);
+            PROBE_SEG_BYTES, PROBE_SIGNAL, p4_mode);
         int rc_sync = aclrtSynchronizeStream(stream);
         std::printf("[probe] pe=%d P4 kernel stream sync rc=%d\n", pe, rc_sync);
 
