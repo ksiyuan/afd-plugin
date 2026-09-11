@@ -103,6 +103,32 @@ def _iter_role_weights(
             yield name, loaded_weight
 
 
+class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
+    """DSV4 gate-on-FFN shell that sends Hash ids alongside the activations.
+
+    The FFN role owns the gate for this configuration. Its Hash layers route by
+    token identity, and only Attention holds ``input_ids``, so Attention sends
+    the rank-local ids that the FFN rank's tokens correspond to. Connectors that
+    do not transport ids ignore the extra argument, which keeps this shell valid
+    for gate-on-FFN configurations in general.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm.forward_context import get_forward_context
+
+        from afd_plugin.model_executor.models.npu.deepseek_v4_attention_gate import (
+            local_hash_input_ids_or_none,
+        )
+
+        input_ids = local_hash_input_ids_or_none(
+            forward_context=get_forward_context(),
+            router_tokens=int(hidden_states.shape[0]),
+        )
+        if input_ids is None:
+            return self._send_and_receive(hidden_states)
+        return self._send_and_receive(hidden_states, input_ids=input_ids)
+
+
 class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
     """DSV4 gate shell that routes local Attention tokens through Async CAM."""
 
@@ -234,7 +260,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                     prefix=f"{prefix}.mlp",
                 )
             else:
-                self.mlp = RemoteFFNProxy(layer_idx=layer_idx)
+                self.mlp = AFDDeepseekV4RemoteMoE(layer_idx=layer_idx)
         elif afd_config.role == _FFN_ROLE:
             self.self_attn = native.PPMissingLayer()
             _refresh_ascend_fused_moe()
@@ -275,6 +301,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         dynamic_scales_shared: torch.Tensor | None = None,
         topk_scales: torch.Tensor | None = None,
         group_list_type: int = 1,
+        input_ids: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | AFDF2ATransferPayload:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -303,7 +330,14 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 # topk_weights, which CAM applies during combine-recv.
                 routed_scale_applied_in_topk=True,
             )
-        return self.mlp(hidden_states)
+        # ### PATCH START: FFN-side Hash routing needs the transported ids.
+        # The native MoE runs the gate internally when the gate is not on
+        # Attention, and its Hash layers route by token identity: vLLM-Ascend's
+        # FusedMoE reads `forward_context.input_ids`, which AFD installs from the
+        # transfer. Pass them on to the native MoE as well so the ids travel with
+        # the call rather than only through ambient context.
+        return self.mlp(hidden_states, input_ids=input_ids)
+        # ### PATCH END: FFN-side Hash routing needs the transported ids.
 
 
 @native.support_torch_compile
@@ -532,6 +566,11 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
     """Ascend DSV4 causal LM wrapper for AFD."""
 
     model_cls = AFDDeepseekV4Model
+
+    # DSV4 Hash layers route by token identity. The FFN role does not hold
+    # input_ids, so the connector must transport them and the FFN runner
+    # installs them in the forward context before the FFN compute.
+    afd_requires_input_ids = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         self.afd_config = parse_afd_config(vllm_config, validate=False)
