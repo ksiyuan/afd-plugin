@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers import fused_moe
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
@@ -45,6 +46,8 @@ except ImportError as exc:  # pragma: no cover - only reachable off Ascend.
 _ATTENTION_ROLE = "attention"
 _FFN_ROLE = "ffn"
 _BOTH_ROLES = frozenset((_ATTENTION_ROLE, _FFN_ROLE))
+
+logger = init_logger(__name__)
 
 # Set to 1 to move DSV4 token ids across the AFD boundary alongside the
 # activations. Needed for Hash routing, and it is the only thing that puts the
@@ -179,6 +182,35 @@ def transport_input_ids_enabled() -> bool:
     """
 
     return _env_enabled(AFD_DSV4_TRANSPORT_INPUT_IDS_ENV)
+
+
+def _disable_ffn_hash_routing(model: object) -> int:
+    """Route FFN-side Hash layers with the standard router instead of by id.
+
+    The upstream FFN selector reads ``forward_context.input_ids`` whenever a
+    Hash layer exposes a ``tid2eid`` table, without checking that the ids exist:
+    on the FFN rank they only exist when the Attention side transported them, so
+    leaving the table in place turns a missing-ids run into an ``AttributeError``
+    inside the MoE.
+
+    Clearing the table makes those layers take the standard router, which is what
+    ``select_experts`` already does when the table is absent. Routing then differs
+    from the checkpoint's intent, so this is a boundary-proving aid, not a
+    correctness feature: outputs will not match a native run.
+
+    Returns:
+        The number of layers whose table was cleared, for logging.
+    """
+
+    cleared = 0
+    layers = getattr(model, "layers", None) or []
+    for layer in layers:
+        gate = getattr(getattr(layer, "mlp", None), "gate", None)
+        if gate is None or getattr(gate, "tid2eid", None) is None:
+            continue
+        gate.tid2eid = None
+        cleared += 1
+    return cleared
 
 
 def _log_param_layout(
@@ -507,6 +539,16 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
             self.norm = native.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = native.PPMissingLayer()
+
+        if afd_config.role == _FFN_ROLE and not transport_input_ids_enabled():
+            cleared = _disable_ffn_hash_routing(self)
+            logger.warning(
+                "AFD DSV4 FFN is running with %d Hash layers on the standard "
+                "router because %s is not enabled; routing and outputs will "
+                "differ from a native run",
+                cleared,
+                AFD_DSV4_TRANSPORT_INPUT_IDS_ENV,
+            )
 
         hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(

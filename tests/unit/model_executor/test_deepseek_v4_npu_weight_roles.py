@@ -27,6 +27,7 @@ real file without importing it.
 from __future__ import annotations
 
 import ast
+import types
 from pathlib import Path
 from types import ModuleType
 
@@ -47,6 +48,7 @@ _HELPER_NAMES = (
     "_attn_role_owns_gate",
     "_env_enabled",
     "transport_input_ids_enabled",
+    "_disable_ffn_hash_routing",
 )
 
 
@@ -100,6 +102,7 @@ _helpers = _load_helpers()
 _checkpoint_weight_roles = _helpers._checkpoint_weight_roles  # type: ignore[attr-defined]
 _attn_role_owns_gate = _helpers._attn_role_owns_gate  # type: ignore[attr-defined]
 _transport_input_ids_enabled = _helpers.transport_input_ids_enabled  # type: ignore[attr-defined]
+_disable_ffn_hash_routing = _helpers._disable_ffn_hash_routing  # type: ignore[attr-defined]
 
 
 def test_module_and_helpers_are_present() -> None:
@@ -127,6 +130,48 @@ def test_id_transport_switch_defaults_to_off(monkeypatch, value: str) -> None:
 def test_id_transport_switch_is_off_when_unset(monkeypatch) -> None:
     monkeypatch.delenv("AFD_DSV4_TRANSPORT_INPUT_IDS", raising=False)
     assert _transport_input_ids_enabled() is False
+
+
+def _fake_layer(*, tid2eid: object, has_gate: bool = True) -> object:
+    gate = types.SimpleNamespace(tid2eid=tid2eid) if has_gate else None
+    mlp = types.SimpleNamespace(gate=gate) if has_gate else types.SimpleNamespace()
+    return types.SimpleNamespace(mlp=mlp)
+
+
+def test_disabling_hash_routing_clears_only_hash_layers() -> None:
+    """Layers without a table must be left alone.
+
+    Clearing the table is what makes the upstream selector take the standard
+    router, so touching a non-Hash layer would silently change its routing.
+    """
+
+    model = types.SimpleNamespace(
+        layers=[
+            _fake_layer(tid2eid=object()),
+            _fake_layer(tid2eid=None),
+            _fake_layer(tid2eid=object()),
+            types.SimpleNamespace(mlp=None),
+        ],
+    )
+
+    cleared = _disable_ffn_hash_routing(model)
+
+    assert cleared == 2
+    assert model.layers[0].mlp.gate.tid2eid is None
+    assert model.layers[2].mlp.gate.tid2eid is None
+    assert model.layers[1].mlp.gate.tid2eid is None
+
+
+def test_disabling_hash_routing_tolerates_a_layer_without_a_gate() -> None:
+    model = types.SimpleNamespace(
+        layers=[_fake_layer(tid2eid=object(), has_gate=False)],
+    )
+
+    assert _disable_ffn_hash_routing(model) == 0
+
+
+def test_disabling_hash_routing_tolerates_a_model_without_layers() -> None:
+    assert _disable_ffn_hash_routing(types.SimpleNamespace()) == 0
 
 
 def test_gate_ownership_follows_the_configured_placement() -> None:
