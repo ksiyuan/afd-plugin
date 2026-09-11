@@ -34,6 +34,9 @@ from types import ModuleType
 
 import pytest
 
+torch = pytest.importorskip("torch")
+import torch.nn as nn  # noqa: E402
+
 _MODULE_PATH = (
     Path(__file__).resolve().parents[3]
     / "afd_plugin"
@@ -76,11 +79,27 @@ def _load_helpers() -> ModuleType:
         "str": str,
         "None": None,
         "logger": logging.getLogger("test"),
+        # The real ``nn.Module`` matters: the tree walk identifies children with
+        # an isinstance check, which a stand-in would silently defeat.
+        "nn": nn,
         "_ATTENTION_ROLE": "attention",
         "_FFN_ROLE": "ffn",
         "_BOTH_ROLES": frozenset(("attention", "ffn")),
         "AFD_DSV4_TRANSPORT_INPUT_IDS_ENV": "AFD_DSV4_TRANSPORT_INPUT_IDS",
     }
+
+    # Module-level constants the helpers read. Evaluating them from the source
+    # keeps the tests from drifting when a constant changes.
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            name = getattr(target, "id", None)
+            if name and name.startswith("_HASH_"):
+                namespace[name] = eval(  # noqa: S307 - this repository's own source
+                    compile(ast.Expression(body=node.value), "<const>", "eval"),
+                    namespace,
+                )
 
     found: set[str] = set()
     for node in tree.body:
@@ -222,20 +241,31 @@ def test_hash_table_survives_until_the_weights_are_loaded() -> None:
     assert "layers.0.mlp.gate.tid2eid" not in dict(model.named_parameters())
 
 
-def _hash_model() -> types.SimpleNamespace:
+class _Holder(nn.Module):
+    """Minimal module that accepts attributes as keyword arguments."""
+
+    def __init__(self, **attributes: object) -> None:
+        super().__init__()
+        for name, value in attributes.items():
+            setattr(self, name, value)
+
+
+def _hash_model() -> _Holder:
     """Build the smallest model shape the routing helper walks.
 
-    A Hash layer holds the id table twice: the gate owns the parameter and the
-    fused-expert module keeps its own copy, which is the one its selector reads.
+    A Hash layer holds the id table more than once: the gate owns the parameter,
+    the fused-expert module keeps the copy its selector reads, and a
+    quantization method keeps another for the selector call it makes itself.
     """
 
-    layer = types.SimpleNamespace(
-        mlp=types.SimpleNamespace(
-            gate=types.SimpleNamespace(tid2eid=object()),
-            experts=types.SimpleNamespace(tid2eid=object()),
+    layer = _Holder(
+        mlp=_Holder(
+            gate=_Holder(tid2eid=object()),
+            experts=_Holder(tid2eid=object()),
+            quant_method=_Holder(tid2eid=object()),
         ),
     )
-    return types.SimpleNamespace(layers=[layer])
+    return _Holder(layers=[layer])
 
 
 def test_hash_routing_is_kept_when_ids_were_delivered() -> None:
@@ -254,14 +284,18 @@ def test_hash_routing_is_kept_when_ids_were_delivered() -> None:
 def test_hash_routing_is_cleared_when_ids_are_missing() -> None:
     """Missing ids must not leave a table that nothing can fill.
 
-    This is the mismatch the upstream selector cannot handle, so the runner
-    aligns the two before the compute rather than letting the MoE fail.
+    Every holder has to be cleared: the quantization method routes through its
+    own copy, so leaving that one behind keeps Hash routing active and the crash
+    survives.
     """
 
     model = _hash_model()
 
     assert _disable_ffn_hash_routing(model) == 1
-    assert model.layers[0].mlp.gate.tid2eid is None
+    mlp = model.layers[0].mlp
+    assert mlp.gate.tid2eid is None
+    assert mlp.experts.tid2eid is None
+    assert mlp.quant_method.tid2eid is None
 
 
 def _fake_mlp(*, tid2eid: object, layer_idx: int = 0) -> types.SimpleNamespace:

@@ -215,21 +215,59 @@ def _disable_ffn_hash_routing(model: object) -> int:
 
 
 def _clear_hash_table_holders(mlp: object) -> bool:
-    """Clear every copy of the id table on one MoE module.
+    """Clear every copy of the id table reachable from one MoE module.
+
+    The table is handed on at construction time to each component that routes
+    with it, and those components each keep their own reference: the gate owns
+    the parameter, the fused-expert module keeps the copy its selector reads,
+    and a quantization method keeps another for its own selector call. Which of
+    them runs depends on the checkpoint's quantization, so naming holders
+    individually is a guess that a different checkpoint invalidates.
+
+    Walk the module tree instead and clear the attribute wherever it appears.
 
     Returns:
-        Whether the module held a table at all.
+        Whether any copy was cleared.
     """
 
-    held = False
-    for holder in (getattr(mlp, "gate", None), getattr(mlp, "experts", None)):
-        if holder is None:
+    cleared = False
+    pending: list[object] = [mlp]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
             continue
-        if getattr(holder, "tid2eid", None) is None:
-            continue
-        holder.tid2eid = None
-        held = True
-    return held
+        seen.add(id(current))
+        if getattr(current, _HASH_TABLE_ATTR, None) is not None:
+            setattr(current, _HASH_TABLE_ATTR, None)
+            cleared = True
+        # An ``nn.Module`` keeps its submodules in ``_modules`` rather than as
+        # instance attributes, so that mapping is the tree to walk. Objects such
+        # as a quantization method are held as plain attributes instead, so those
+        # names are followed too, along with containers a layer list may use.
+        children = list((getattr(current, "_modules", None) or {}).values())
+        for name, child in vars(current).items():
+            if name in (_HASH_TABLE_ATTR, "_modules") or child is None:
+                continue
+            if name in _HASH_HOLDER_ATTRS:
+                children.append(child)
+            elif isinstance(child, (list, tuple)):
+                children.extend(child)
+        pending.extend(child for child in children if child is not None)
+    return cleared
+
+
+_HASH_TABLE_ATTR = "tid2eid"
+
+# Attribute names that hold a routing helper but are not registered submodules.
+_HASH_HOLDER_ATTRS = frozenset(
+    {
+        "quant_method",
+        "experts",
+        "gate",
+        "moe_comm_method",
+    },
+)
 
 
 def _log_param_layout(
