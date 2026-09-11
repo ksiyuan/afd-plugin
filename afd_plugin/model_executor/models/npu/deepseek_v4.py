@@ -69,12 +69,32 @@ def _weight_layer_path(name: str) -> tuple[int, str, tuple[str, ...]] | None:
     return None
 
 
-def _checkpoint_weight_roles(name: str) -> frozenset[str]:
+def _attn_role_owns_gate(compute_gate_on_attention: bool) -> bool:
+    """Return whether the Attention role carries a router for this config.
+
+    Only the gate-on-Attention configuration gives Attention a router; with the
+    gate on FFN its MoE slot is a parameter-free transfer shell.
+    """
+
+    return bool(compute_gate_on_attention)
+
+
+def _checkpoint_weight_roles(
+    name: str,
+    *,
+    attn_owns_gate: bool = True,
+) -> frozenset[str]:
     """Return the AFD owner for a DSV4 checkpoint path.
 
     DSV4 checkpoints use ``attn``/``ffn`` names while the Ascend runtime
     model exposes ``self_attn``/``mlp``.  The native loader performs that name
     conversion later, so filtering must understand both spellings here.
+
+    ``attn_owns_gate`` describes whether the Attention role built a router for
+    the current configuration. Handing a role a path it never registered is not
+    a harmless no-op: the upstream Ascend loader indexes its parameter dict by
+    name without a membership check, so it raises ``KeyError`` instead of
+    skipping.
     """
 
     layer_path = _weight_layer_path(name)
@@ -86,16 +106,18 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
         return frozenset((_ATTENTION_ROLE,))
     if stage in ("ffn", "mlp"):
         if remainder and remainder[0] == "gate":
-            # The Hash id table exists only where the Hash MoE is built. With
-            # the gate on FFN, Attention carries no gate at all; with the gate
-            # on Attention, the Hash path routes from the table instead of a
-            # gate weight. Either way the table belongs to the FFN role alone.
-            # Handing it to a role that never registered it makes the upstream
-            # loader raise KeyError, because it indexes its parameter dict by
-            # name without a membership check.
+            # The Hash id table is a parameter only where the Hash MoE is
+            # built, which is the FFN role, whatever the gate placement: with
+            # the gate on FFN the table lives on the FFN router, and with the
+            # gate on Attention the Hash path routes from the table instead of
+            # from a gate weight.
             if "tid2eid" in remainder:
                 return frozenset((_FFN_ROLE,))
-            return _BOTH_ROLES
+            # The remaining gate parameters belong to every role that built a
+            # router. With the gate on FFN, Attention has none.
+            if attn_owns_gate:
+                return _BOTH_ROLES
+            return frozenset((_FFN_ROLE,))
         return frozenset((_FFN_ROLE,))
     # HC parameters and any future shared layer parameters are required by
     # both role-local model instances.
@@ -106,9 +128,10 @@ def _iter_role_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     role: str,
+    attn_owns_gate: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     for name, loaded_weight in weights:
-        if role in _checkpoint_weight_roles(name):
+        if role in _checkpoint_weight_roles(name, attn_owns_gate=attn_owns_gate):
             yield name, loaded_weight
 
 
@@ -648,7 +671,13 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        role_weights = _iter_role_weights(weights, role=self.afd_role)
+        role_weights = _iter_role_weights(
+            weights,
+            role=self.afd_role,
+            attn_owns_gate=_attn_role_owns_gate(
+                bool(self.afd_config.compute_gate_on_attention),
+            ),
+        )
         if _param_dump_requested():
             # Diagnostic only, and deliberately inert otherwise: materialise the
             # generator so the layout can be printed, then load from the same

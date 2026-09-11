@@ -41,7 +41,11 @@ _MODULE_PATH = (
     / "deepseek_v4.py"
 )
 
-_HELPER_NAMES = ("_weight_layer_path", "_checkpoint_weight_roles")
+_HELPER_NAMES = (
+    "_weight_layer_path",
+    "_checkpoint_weight_roles",
+    "_attn_role_owns_gate",
+)
 
 
 def _load_helpers() -> ModuleType:
@@ -91,10 +95,18 @@ def _load_helpers() -> ModuleType:
 
 _helpers = _load_helpers()
 _checkpoint_weight_roles = _helpers._checkpoint_weight_roles  # type: ignore[attr-defined]
+_attn_role_owns_gate = _helpers._attn_role_owns_gate  # type: ignore[attr-defined]
 
 
 def test_module_and_helpers_are_present() -> None:
     assert _MODULE_PATH.is_file()
+
+
+def test_gate_ownership_follows_the_configured_placement() -> None:
+    """Only gate-on-Attention gives the Attention role a router."""
+
+    assert _attn_role_owns_gate(True) is True
+    assert _attn_role_owns_gate(False) is False
 
 
 @pytest.mark.parametrize(
@@ -108,23 +120,53 @@ def test_hash_id_table_is_ffn_owned(name: str) -> None:
     """Only the Hash MoE registers this parameter, so Attention must not see it.
 
     Handing it to Attention is exactly the mismatch that raises
-    ``KeyError: 'model.layers.0.mlp.gate.tid2eid'`` while loading that rank.
+    ``KeyError: 'model.layers.0.mlp.gate.tid2eid'`` while loading that rank,
+    under either gate placement.
     """
 
-    assert _checkpoint_weight_roles(name) == frozenset({"ffn"})
+    for attn_owns_gate in (True, False):
+        assert _checkpoint_weight_roles(
+            name,
+            attn_owns_gate=attn_owns_gate,
+        ) == frozenset({"ffn"})
 
 
 @pytest.mark.parametrize(
     "name",
     [
-        "model.layers.3.mlp.gate.weight",
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.3.ffn.gate.weight",
         "model.layers.3.mlp.gate.e_score_correction_bias",
     ],
 )
-def test_other_gate_parameters_stay_shared(name: str) -> None:
-    """Non-Hash routing needs the gate weight on both roles."""
+def test_gate_paths_skip_attention_when_the_gate_is_on_ffn(name: str) -> None:
+    """With the gate on FFN the Attention MoE slot is parameter-free.
 
-    assert _checkpoint_weight_roles(name) == frozenset({"attention", "ffn"})
+    This is the supported CAMP2P configuration, and handing Attention these paths
+    raises ``KeyError: 'model.layers.0.mlp.gate.weight'`` because it registered
+    no gate at all.
+    """
+
+    assert _checkpoint_weight_roles(
+        name,
+        attn_owns_gate=False,
+    ) == frozenset({"ffn"})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.3.mlp.gate.e_score_correction_bias",
+    ],
+)
+def test_gate_paths_stay_shared_when_attention_owns_the_gate(name: str) -> None:
+    """Gate-on-Attention builds a router there, so both roles load it."""
+
+    assert _checkpoint_weight_roles(
+        name,
+        attn_owns_gate=True,
+    ) == frozenset({"attention", "ffn"})
 
 
 @pytest.mark.parametrize(
@@ -146,7 +188,11 @@ def test_attention_paths_are_attention_owned(name: str) -> None:
     ],
 )
 def test_expert_paths_are_ffn_owned(name: str) -> None:
-    assert _checkpoint_weight_roles(name) == frozenset({"ffn"})
+    for attn_owns_gate in (True, False):
+        assert _checkpoint_weight_roles(
+            name,
+            attn_owns_gate=attn_owns_gate,
+        ) == frozenset({"ffn"})
 
 
 @pytest.mark.parametrize(
@@ -158,4 +204,8 @@ def test_expert_paths_are_ffn_owned(name: str) -> None:
     ],
 )
 def test_shared_and_non_layer_paths_are_shared(name: str) -> None:
-    assert _checkpoint_weight_roles(name) == frozenset({"attention", "ffn"})
+    for attn_owns_gate in (True, False):
+        assert _checkpoint_weight_roles(
+            name,
+            attn_owns_gate=attn_owns_gate,
+        ) == frozenset({"attention", "ffn"})
