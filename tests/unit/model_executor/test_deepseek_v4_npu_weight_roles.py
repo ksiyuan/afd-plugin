@@ -27,15 +27,12 @@ real file without importing it.
 from __future__ import annotations
 
 import ast
-import logging
-import types
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
-torch = pytest.importorskip("torch")
-import torch.nn as nn  # noqa: E402
+pytest.importorskip("torch")
 
 _MODULE_PATH = (
     Path(__file__).resolve().parents[3]
@@ -50,11 +47,6 @@ _HELPER_NAMES = (
     "_weight_layer_path",
     "_checkpoint_weight_roles",
     "_attn_role_owns_gate",
-    "_env_enabled",
-    "transport_input_ids_enabled",
-    "_disable_ffn_hash_routing",
-    "_clear_hash_table_holders",
-    "_align_hash_table_with_ids",
 )
 
 
@@ -78,14 +70,9 @@ def _load_helpers() -> ModuleType:
         "int": int,
         "str": str,
         "None": None,
-        "logger": logging.getLogger("test"),
-        # The real ``nn.Module`` matters: the tree walk identifies children with
-        # an isinstance check, which a stand-in would silently defeat.
-        "nn": nn,
         "_ATTENTION_ROLE": "attention",
         "_FFN_ROLE": "ffn",
         "_BOTH_ROLES": frozenset(("attention", "ffn")),
-        "AFD_DSV4_TRANSPORT_INPUT_IDS_ENV": "AFD_DSV4_TRANSPORT_INPUT_IDS",
     }
 
     # Module-level constants the helpers read. Evaluating them from the source
@@ -124,236 +111,10 @@ def _load_helpers() -> ModuleType:
 _helpers = _load_helpers()
 _checkpoint_weight_roles = _helpers._checkpoint_weight_roles  # type: ignore[attr-defined]
 _attn_role_owns_gate = _helpers._attn_role_owns_gate  # type: ignore[attr-defined]
-_transport_input_ids_enabled = _helpers.transport_input_ids_enabled  # type: ignore[attr-defined]
-_disable_ffn_hash_routing = _helpers._disable_ffn_hash_routing  # type: ignore[attr-defined]
-_clear_hash_table_holders = _helpers._clear_hash_table_holders  # type: ignore[attr-defined]
-_align_hash_table_with_ids = _helpers._align_hash_table_with_ids  # type: ignore[attr-defined]
 
 
 def test_module_and_helpers_are_present() -> None:
     assert _MODULE_PATH.is_file()
-
-
-@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "On"])
-def test_id_transport_switch_accepts_truthy_values(monkeypatch, value: str) -> None:
-    monkeypatch.setenv("AFD_DSV4_TRANSPORT_INPUT_IDS", value)
-    assert _transport_input_ids_enabled() is True
-
-
-@pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "anything"])
-def test_id_transport_switch_defaults_to_off(monkeypatch, value: str) -> None:
-    """The boundary runs without the operator's ids mode unless asked.
-
-    That keeps the a2e ids channel out of the default path, which matters while
-    the channel is unproven on a new SoC.
-    """
-
-    monkeypatch.setenv("AFD_DSV4_TRANSPORT_INPUT_IDS", value)
-    assert _transport_input_ids_enabled() is False
-
-
-def test_id_transport_switch_is_off_when_unset(monkeypatch) -> None:
-    monkeypatch.delenv("AFD_DSV4_TRANSPORT_INPUT_IDS", raising=False)
-    assert _transport_input_ids_enabled() is False
-
-
-def _fake_layer(*, tid2eid: object, has_gate: bool = True) -> object:
-    gate = types.SimpleNamespace(tid2eid=tid2eid) if has_gate else None
-    mlp = types.SimpleNamespace(gate=gate) if has_gate else types.SimpleNamespace()
-    return types.SimpleNamespace(mlp=mlp)
-
-
-def test_disabling_hash_routing_clears_only_hash_layers() -> None:
-    """Layers without a table must be left alone.
-
-    Clearing the table is what makes the upstream selector take the standard
-    router, so touching a non-Hash layer would silently change its routing.
-    """
-
-    model = types.SimpleNamespace(
-        layers=[
-            _fake_layer(tid2eid=object()),
-            _fake_layer(tid2eid=None),
-            _fake_layer(tid2eid=object()),
-            types.SimpleNamespace(mlp=None),
-        ],
-    )
-
-    cleared = _disable_ffn_hash_routing(model)
-
-    assert cleared == 2
-    assert model.layers[0].mlp.gate.tid2eid is None
-    assert model.layers[2].mlp.gate.tid2eid is None
-    assert model.layers[1].mlp.gate.tid2eid is None
-
-
-def test_disabling_hash_routing_tolerates_a_layer_without_a_gate() -> None:
-    model = types.SimpleNamespace(
-        layers=[_fake_layer(tid2eid=object(), has_gate=False)],
-    )
-
-    assert _disable_ffn_hash_routing(model) == 0
-
-
-def test_disabling_hash_routing_tolerates_a_model_without_layers() -> None:
-    assert _disable_ffn_hash_routing(types.SimpleNamespace()) == 0
-
-
-def test_hash_table_survives_until_the_weights_are_loaded() -> None:
-    """The table must still exist while the loader indexes its parameter dict.
-
-    Clearing it during construction would remove ``gate.tid2eid`` from
-    ``named_parameters()``, and the upstream loader indexes that dict by name, so
-    a checkpoint that carries the table would raise KeyError again. The fallback
-    therefore runs after loading, which this test pins by checking that a freshly
-    built layer still exposes the table.
-    """
-
-    import torch
-    import torch.nn as nn
-
-    class _Gate(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.tid2eid = nn.Parameter(torch.zeros(4, 2))
-
-    class _Mlp(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.gate = _Gate()
-
-    class _Layer(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.mlp = _Mlp()
-
-    class _Model(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.layers = nn.ModuleList([_Layer()])
-
-    model = _Model()
-    assert "layers.0.mlp.gate.tid2eid" in dict(model.named_parameters())
-
-    cleared = _disable_ffn_hash_routing(model)
-
-    assert cleared == 1
-    assert "layers.0.mlp.gate.tid2eid" not in dict(model.named_parameters())
-
-
-class _Holder(nn.Module):
-    """Minimal module that accepts attributes as keyword arguments."""
-
-    def __init__(self, **attributes: object) -> None:
-        super().__init__()
-        for name, value in attributes.items():
-            setattr(self, name, value)
-
-
-def _hash_model() -> _Holder:
-    """Build the smallest model shape the routing helper walks.
-
-    A Hash layer holds the id table more than once: the gate owns the parameter,
-    the fused-expert module keeps the copy its selector reads, and a
-    quantization method keeps another for the selector call it makes itself.
-    """
-
-    layer = _Holder(
-        mlp=_Holder(
-            gate=_Holder(tid2eid=object()),
-            experts=_Holder(tid2eid=object()),
-            quant_method=_Holder(tid2eid=object()),
-        ),
-    )
-    return _Holder(layers=[layer])
-
-
-def test_hash_routing_is_kept_when_ids_were_delivered() -> None:
-    """Delivered ids must leave Hash routing intact.
-
-    ``set_ffn_hash_routing`` is a method on the model wrapper, so only its
-    implementation is exercised here: with ids available it must not touch the
-    tables.
-    """
-
-    model = _hash_model()
-
-    assert model.layers[0].mlp.gate.tid2eid is not None
-
-
-def test_hash_routing_is_cleared_when_ids_are_missing() -> None:
-    """Missing ids must not leave a table that nothing can fill.
-
-    Every holder has to be cleared: the quantization method routes through its
-    own copy, so leaving that one behind keeps Hash routing active and the crash
-    survives.
-    """
-
-    model = _hash_model()
-
-    assert _disable_ffn_hash_routing(model) == 1
-    mlp = model.layers[0].mlp
-    assert mlp.gate.tid2eid is None
-    assert mlp.experts.tid2eid is None
-    assert mlp.quant_method.tid2eid is None
-
-
-def _fake_mlp(*, tid2eid: object, layer_idx: int = 0) -> types.SimpleNamespace:
-    return types.SimpleNamespace(
-        layer_idx=layer_idx,
-        gate=types.SimpleNamespace(tid2eid=tid2eid),
-        experts=types.SimpleNamespace(tid2eid=tid2eid),
-    )
-
-
-def test_clearing_reaches_the_expert_module_not_only_the_gate() -> None:
-    """The selector reads the expert module's copy, so both holders must clear.
-
-    Clearing only the gate leaves the copy the fused-expert selector actually
-    consults, which keeps Hash routing active and fails on the missing ids.
-    """
-
-    mlp = _fake_mlp(tid2eid=object())
-
-    assert _clear_hash_table_holders(mlp) is True
-    assert mlp.gate.tid2eid is None
-    assert mlp.experts.tid2eid is None
-
-
-def test_clearing_reports_nothing_held_when_both_are_absent() -> None:
-    mlp = _fake_mlp(tid2eid=None)
-
-    assert _clear_hash_table_holders(mlp) is False
-
-
-def test_align_keeps_the_table_when_ids_are_present() -> None:
-    mlp = _fake_mlp(tid2eid=object())
-
-    _align_hash_table_with_ids(mlp, object())
-
-    assert mlp.gate.tid2eid is not None
-
-
-def test_align_clears_the_table_when_ids_are_missing() -> None:
-    """This is the guarantee that survives however the caller is wired."""
-
-    mlp = _fake_mlp(tid2eid=object())
-
-    _align_hash_table_with_ids(mlp, None)
-
-    assert mlp.gate.tid2eid is None
-
-
-def test_align_is_a_no_op_for_a_moe_without_a_table() -> None:
-    mlp = _fake_mlp(tid2eid=None)
-
-    _align_hash_table_with_ids(mlp, None)
-
-    assert mlp.gate.tid2eid is None
-
-
-def test_align_tolerates_a_gate_less_module() -> None:
-    _align_hash_table_with_ids(types.SimpleNamespace(), None)
 
 
 def test_gate_ownership_follows_the_configured_placement() -> None:

@@ -280,11 +280,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 states = context.states
                 hidden_states = payload.hidden_states
                 received_input_ids = getattr(states, "input_ids", None)
-                # Decide Hash routing from what actually arrived rather than from
-                # configuration. A Hash layer whose table is present but whose
-                # ids are not fails inside the MoE selector, so the two must not
-                # be allowed to disagree.
-                _sync_ffn_hash_routing(self.model, ids_available=received_input_ids)
                 with ascend_forward_context(
                     vllm_config=self.vllm_config,
                     afd_metadata=afd_metadata,
@@ -503,41 +498,13 @@ def _send_ffn_output(
     )
 
 
-def _sync_ffn_hash_routing(model: object, *, ids_available: object) -> None:
-    """Align the model's Hash routing with the ids that actually arrived.
-
-    The upstream FFN selector reads ``forward_context.input_ids`` whenever a Hash
-    layer exposes a ``tid2eid`` table, without checking that the ids exist. A
-    table that outlives its ids therefore fails inside the MoE rather than at the
-    point where the two disagree, so this closes that gap before the compute.
-
-    Models that route without token identity have nothing to align.
-    """
-
-    sync = getattr(model, "set_ffn_hash_routing", None)
-    if sync is None:
-        logger.error(
-            "AFD FFN model %s exposes no set_ffn_hash_routing hook; Hash layers "
-            "keep their routing tables and will fail if ids are missing",
-            type(model).__name__,
-        )
-        return
-    cleared = sync(ids_available=ids_available is not None)
-    if ids_available is None and cleared:
-        logger.warning(
-            "AFD FFN received no token ids; %d Hash layers now use the standard "
-            "router, so routing differs from a native run",
-            cleared,
-        )
-
-
 def _model_requires_input_ids(model: object) -> bool:
     """Return whether this FFN rank should ask for token ids.
 
     The model declares ``afd_requires_input_ids`` when it routes on token
-    identity, and the transport switch decides whether ids actually cross the
-    boundary. Both must hold: asking for ids the Attention side is not sending
-    would fail the connector's alignment check.
+    identity. The transport switch is read per forward through the model module
+    so a run that opted out of ids does not ask for them, which would fail the
+    connector's alignment check.
     """
 
     if not getattr(model, "afd_requires_input_ids", False):

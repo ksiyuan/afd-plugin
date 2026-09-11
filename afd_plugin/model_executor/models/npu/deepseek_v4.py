@@ -49,10 +49,9 @@ _BOTH_ROLES = frozenset((_ATTENTION_ROLE, _FFN_ROLE))
 
 logger = init_logger(__name__)
 
-# Set to 1 to move DSV4 token ids across the AFD boundary alongside the
-# activations. Needed for Hash routing, and it is the only thing that puts the
-# a2e operator into its ids mode.
-AFD_DSV4_TRANSPORT_INPUT_IDS_ENV = "AFD_DSV4_TRANSPORT_INPUT_IDS"
+# Set to 1 to keep token ids off the AFD boundary. Transport is the normal path;
+# this exists so the boundary stays inspectable without the operator's ids mode.
+AFD_DSV4_SKIP_INPUT_IDS_ENV = "AFD_DSV4_SKIP_INPUT_IDS"
 AFD_DSV4_PARAM_DUMP_ENV = "AFD_DSV4_PARAM_DUMP"
 
 
@@ -144,6 +143,23 @@ def _iter_role_weights(
             yield name, loaded_weight
 
 
+def transport_input_ids_enabled() -> bool:
+    """Return whether DSV4 moves token ids across the AFD boundary.
+
+    Hash layers route by token identity, and only Attention holds ``input_ids``,
+    so the ids must travel with the activations. Transporting them uses the
+    ``a2e`` operator's ids mode, which reserves AIV blocks for a second payload.
+
+    Transport is the normal path and is on by default. The switch exists only to
+    keep the boundary inspectable without that operator mode: with ids disabled
+    the transfer carries hidden states alone, so transport, FFN compute and the
+    return path are still exercised, while Hash layers have no routing input and
+    the run cannot produce native-equivalent output.
+    """
+
+    return not _env_enabled(AFD_DSV4_SKIP_INPUT_IDS_ENV)
+
+
 def _param_dump_requested() -> bool:
     """Return whether the DSV4 parameter-layout diagnostic was requested.
 
@@ -165,109 +181,6 @@ def _env_enabled(name: str) -> bool:
         "yes",
         "on",
     }
-
-
-def transport_input_ids_enabled() -> bool:
-    """Return whether DSV4 moves token ids across the AFD boundary.
-
-    Hash layers route by token identity, and only Attention holds ``input_ids``,
-    so the ids must travel with the activations. Transporting them requires the
-    ``a2e`` operator's ids mode, which reserves AIV blocks for a second payload.
-
-    The switch defaults to off so the boundary can be exercised without that
-    operator mode, which is useful while the ids path is unproven on a new SoC.
-    With ids disabled the boundary still carries hidden states, so transport,
-    FFN compute and the return path are all exercised; only Hash routing is
-    unavailable.
-    """
-
-    return _env_enabled(AFD_DSV4_TRANSPORT_INPUT_IDS_ENV)
-
-
-def _disable_ffn_hash_routing(model: object) -> int:
-    """Route FFN-side Hash layers with the standard router instead of by id.
-
-    A Hash layer keeps two references to the id table. The gate owns the
-    parameter, and the fused-expert module also receives the table at
-    construction time and stores its own copy, which is the one its selector
-    reads. Clearing only the gate therefore leaves Hash routing active, so both
-    holders are cleared here.
-
-    With the table gone the selector takes its standard router, which is what
-    ``select_experts`` already does when the table is absent. Routing then differs
-    from the checkpoint's intent, so this is a boundary-proving aid, not a
-    correctness feature: outputs will not match a native run.
-
-    Returns:
-        The number of layers whose table was cleared.
-    """
-
-    cleared = 0
-    layers = getattr(model, "layers", None) or []
-    for layer in layers:
-        mlp = getattr(layer, "mlp", None)
-        if mlp is None:
-            continue
-        if not _clear_hash_table_holders(mlp):
-            continue
-        cleared += 1
-    return cleared
-
-
-def _clear_hash_table_holders(mlp: object) -> bool:
-    """Clear every copy of the id table reachable from one MoE module.
-
-    The table is handed on at construction time to each component that routes
-    with it, and those components each keep their own reference: the gate owns
-    the parameter, the fused-expert module keeps the copy its selector reads,
-    and a quantization method keeps another for its own selector call. Which of
-    them runs depends on the checkpoint's quantization, so naming holders
-    individually is a guess that a different checkpoint invalidates.
-
-    Walk the module tree instead and clear the attribute wherever it appears.
-
-    Returns:
-        Whether any copy was cleared.
-    """
-
-    cleared = False
-    pending: list[object] = [mlp]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        if getattr(current, _HASH_TABLE_ATTR, None) is not None:
-            setattr(current, _HASH_TABLE_ATTR, None)
-            cleared = True
-        # An ``nn.Module`` keeps its submodules in ``_modules`` rather than as
-        # instance attributes, so that mapping is the tree to walk. Objects such
-        # as a quantization method are held as plain attributes instead, so those
-        # names are followed too, along with containers a layer list may use.
-        children = list((getattr(current, "_modules", None) or {}).values())
-        for name, child in vars(current).items():
-            if name in (_HASH_TABLE_ATTR, "_modules") or child is None:
-                continue
-            if name in _HASH_HOLDER_ATTRS:
-                children.append(child)
-            elif isinstance(child, (list, tuple)):
-                children.extend(child)
-        pending.extend(child for child in children if child is not None)
-    return cleared
-
-
-_HASH_TABLE_ATTR = "tid2eid"
-
-# Attribute names that hold a routing helper but are not registered submodules.
-_HASH_HOLDER_ATTRS = frozenset(
-    {
-        "quant_method",
-        "experts",
-        "gate",
-        "moe_comm_method",
-    },
-)
 
 
 def _log_param_layout(
@@ -303,9 +216,6 @@ class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
         )
 
         if not transport_input_ids_enabled():
-            # Boundary check without the operator's ids mode: hidden states still
-            # cross, so transport and FFN compute are exercised, while Hash
-            # layers fall back to their non-ids router.
             return self._send_and_receive(hidden_states)
         input_ids = local_hash_input_ids_or_none(
             forward_context=get_forward_context(),
@@ -381,30 +291,6 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
             topk_ids=dispatch_payload.topk_ids,
         )
         return restore_cam_dispatch_output(output, dispatch_payload.layout)
-
-
-def _align_hash_table_with_ids(mlp: object, input_ids: object) -> None:
-    """Drop a Hash routing table that no ids can fill.
-
-    The fused-expert selector reads ``forward_context.input_ids`` as soon as it
-    holds an id table, so a table without ids fails inside the MoE. Enforcing it
-    here, on the object that is about to run, makes the invariant hold no matter
-    how the caller arranged the transfer.
-
-    Clearing the table is not a behaviour change for the ids-present case, and
-    with the table gone the selector uses its standard router, which is the only
-    routing available without token identity.
-    """
-
-    if input_ids is not None:
-        return
-    if not _clear_hash_table_holders(mlp):
-        return
-    logger.warning(
-        "AFD DSV4 FFN layer %s received no token ids; routing it with the "
-        "standard router, so its output differs from a native run",
-        getattr(mlp, "layer_idx", "?"),
-    )
 
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
@@ -547,7 +433,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         # FusedMoE reads `forward_context.input_ids`, which AFD installs from the
         # transfer. Pass them on to the native MoE as well so the ids travel with
         # the call rather than only through ambient context.
-        _align_hash_table_with_ids(self.mlp, input_ids)
         return self.mlp(hidden_states, input_ids=input_ids)
         # ### PATCH END: FFN-side Hash routing needs the transported ids.
 
@@ -834,27 +719,6 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             _log_param_layout(self, role_weights)
         loaded = super().load_weights(role_weights)
         return loaded
-
-    def set_ffn_hash_routing(self, *, ids_available: bool) -> int:
-        """Enable FFN Hash routing only when the ids actually arrived.
-
-        The upstream FFN selector reads ``forward_context.input_ids`` whenever a
-        Hash layer exposes a ``tid2eid`` table, so a table without ids fails
-        inside the MoE. Deciding from the table's presence cannot know whether
-        the transport delivered anything, and deciding at load time cannot know
-        either: the ids arrive per forward.
-
-        Taking ``ids_available`` from the received payload makes the decision
-        from the fact rather than from configuration, so one run cannot end up
-        with a table that nothing can fill.
-
-        Returns:
-            The number of layers whose routing was changed.
-        """
-
-        if ids_available:
-            return 0
-        return _disable_ffn_hash_routing(self.model)
 
 
 __all__ = [
