@@ -86,6 +86,15 @@ def _checkpoint_weight_roles(name: str) -> frozenset[str]:
         return frozenset((_ATTENTION_ROLE,))
     if stage in ("ffn", "mlp"):
         if remainder and remainder[0] == "gate":
+            # The Hash id table exists only where the Hash MoE is built. With
+            # the gate on FFN, Attention carries no gate at all; with the gate
+            # on Attention, the Hash path routes from the table instead of a
+            # gate weight. Either way the table belongs to the FFN role alone.
+            # Handing it to a role that never registered it makes the upstream
+            # loader raise KeyError, because it indexes its parameter dict by
+            # name without a membership check.
+            if "tid2eid" in remainder:
+                return frozenset((_FFN_ROLE,))
             return _BOTH_ROLES
         return frozenset((_FFN_ROLE,))
     # HC parameters and any future shared layer parameters are required by
