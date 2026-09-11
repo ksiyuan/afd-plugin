@@ -187,30 +187,49 @@ def transport_input_ids_enabled() -> bool:
 def _disable_ffn_hash_routing(model: object) -> int:
     """Route FFN-side Hash layers with the standard router instead of by id.
 
-    The upstream FFN selector reads ``forward_context.input_ids`` whenever a
-    Hash layer exposes a ``tid2eid`` table, without checking that the ids exist:
-    on the FFN rank they only exist when the Attention side transported them, so
-    leaving the table in place turns a missing-ids run into an ``AttributeError``
-    inside the MoE.
+    A Hash layer keeps two references to the id table. The gate owns the
+    parameter, and the fused-expert module also receives the table at
+    construction time and stores its own copy, which is the one its selector
+    reads. Clearing only the gate therefore leaves Hash routing active, so both
+    holders are cleared here.
 
-    Clearing the table makes those layers take the standard router, which is what
+    With the table gone the selector takes its standard router, which is what
     ``select_experts`` already does when the table is absent. Routing then differs
     from the checkpoint's intent, so this is a boundary-proving aid, not a
     correctness feature: outputs will not match a native run.
 
     Returns:
-        The number of layers whose table was cleared, for logging.
+        The number of layers whose table was cleared.
     """
 
     cleared = 0
     layers = getattr(model, "layers", None) or []
     for layer in layers:
-        gate = getattr(getattr(layer, "mlp", None), "gate", None)
-        if gate is None or getattr(gate, "tid2eid", None) is None:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
             continue
-        gate.tid2eid = None
+        if not _clear_hash_table_holders(mlp):
+            continue
         cleared += 1
     return cleared
+
+
+def _clear_hash_table_holders(mlp: object) -> bool:
+    """Clear every copy of the id table on one MoE module.
+
+    Returns:
+        Whether the module held a table at all.
+    """
+
+    held = False
+    for holder in (getattr(mlp, "gate", None), getattr(mlp, "experts", None)):
+        if holder is None:
+            continue
+        if getattr(holder, "tid2eid", None) is None:
+            continue
+        holder.tid2eid = None
+        held = True
+    return held
 
 
 def _log_param_layout(
@@ -329,10 +348,10 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
 def _align_hash_table_with_ids(mlp: object, input_ids: object) -> None:
     """Drop a Hash routing table that no ids can fill.
 
-    The upstream FFN selector reads ``forward_context.input_ids`` as soon as a
-    Hash layer exposes a ``tid2eid`` table, so a table without ids fails inside
-    the MoE. Enforcing it here, on the object that is about to run, makes the
-    invariant hold no matter how the caller arranged the transfer.
+    The fused-expert selector reads ``forward_context.input_ids`` as soon as it
+    holds an id table, so a table without ids fails inside the MoE. Enforcing it
+    here, on the object that is about to run, makes the invariant hold no matter
+    how the caller arranged the transfer.
 
     Clearing the table is not a behaviour change for the ids-present case, and
     with the table gone the selector uses its standard router, which is the only
@@ -341,10 +360,8 @@ def _align_hash_table_with_ids(mlp: object, input_ids: object) -> None:
 
     if input_ids is not None:
         return
-    gate = getattr(mlp, "gate", None)
-    if gate is None or getattr(gate, "tid2eid", None) is None:
+    if not _clear_hash_table_holders(mlp):
         return
-    gate.tid2eid = None
     logger.warning(
         "AFD DSV4 FFN layer %s received no token ids; routing it with the "
         "standard router, so its output differs from a native run",

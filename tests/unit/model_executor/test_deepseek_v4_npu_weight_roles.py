@@ -50,6 +50,7 @@ _HELPER_NAMES = (
     "_env_enabled",
     "transport_input_ids_enabled",
     "_disable_ffn_hash_routing",
+    "_clear_hash_table_holders",
     "_align_hash_table_with_ids",
 )
 
@@ -106,6 +107,7 @@ _checkpoint_weight_roles = _helpers._checkpoint_weight_roles  # type: ignore[att
 _attn_role_owns_gate = _helpers._attn_role_owns_gate  # type: ignore[attr-defined]
 _transport_input_ids_enabled = _helpers.transport_input_ids_enabled  # type: ignore[attr-defined]
 _disable_ffn_hash_routing = _helpers._disable_ffn_hash_routing  # type: ignore[attr-defined]
+_clear_hash_table_holders = _helpers._clear_hash_table_holders  # type: ignore[attr-defined]
 _align_hash_table_with_ids = _helpers._align_hash_table_with_ids  # type: ignore[attr-defined]
 
 
@@ -221,11 +223,16 @@ def test_hash_table_survives_until_the_weights_are_loaded() -> None:
 
 
 def _hash_model() -> types.SimpleNamespace:
-    """Build the smallest model shape the routing helper walks."""
+    """Build the smallest model shape the routing helper walks.
+
+    A Hash layer holds the id table twice: the gate owns the parameter and the
+    fused-expert module keeps its own copy, which is the one its selector reads.
+    """
 
     layer = types.SimpleNamespace(
         mlp=types.SimpleNamespace(
             gate=types.SimpleNamespace(tid2eid=object()),
+            experts=types.SimpleNamespace(tid2eid=object()),
         ),
     )
     return types.SimpleNamespace(layers=[layer])
@@ -261,7 +268,28 @@ def _fake_mlp(*, tid2eid: object, layer_idx: int = 0) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         layer_idx=layer_idx,
         gate=types.SimpleNamespace(tid2eid=tid2eid),
+        experts=types.SimpleNamespace(tid2eid=tid2eid),
     )
+
+
+def test_clearing_reaches_the_expert_module_not_only_the_gate() -> None:
+    """The selector reads the expert module's copy, so both holders must clear.
+
+    Clearing only the gate leaves the copy the fused-expert selector actually
+    consults, which keeps Hash routing active and fails on the missing ids.
+    """
+
+    mlp = _fake_mlp(tid2eid=object())
+
+    assert _clear_hash_table_holders(mlp) is True
+    assert mlp.gate.tid2eid is None
+    assert mlp.experts.tid2eid is None
+
+
+def test_clearing_reports_nothing_held_when_both_are_absent() -> None:
+    mlp = _fake_mlp(tid2eid=None)
+
+    assert _clear_hash_table_holders(mlp) is False
 
 
 def test_align_keeps_the_table_when_ids_are_present() -> None:
