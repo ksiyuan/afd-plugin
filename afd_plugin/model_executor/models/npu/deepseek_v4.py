@@ -540,16 +540,6 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         else:
             self.norm = native.PPMissingLayer()
 
-        if afd_config.role == _FFN_ROLE and not transport_input_ids_enabled():
-            cleared = _disable_ffn_hash_routing(self)
-            logger.warning(
-                "AFD DSV4 FFN is running with %d Hash layers on the standard "
-                "router because %s is not enabled; routing and outputs will "
-                "differ from a native run",
-                cleared,
-                AFD_DSV4_TRANSPORT_INPUT_IDS_ENV,
-            )
-
         hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
             torch.empty(self.hc_mult, hc_dim, dtype=torch.float32)
@@ -760,7 +750,26 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             # content.
             role_weights = list(role_weights)
             _log_param_layout(self, role_weights)
-        return super().load_weights(role_weights)
+        loaded = super().load_weights(role_weights)
+        # The Hash id table has to survive loading: the checkpoint carries it and
+        # the upstream loader indexes its parameter dict by name, so clearing the
+        # table before loading would raise KeyError. Drop it once the weights are
+        # in, so the FFN selector takes its standard-router branch.
+        if self.afd_role == _FFN_ROLE and not transport_input_ids_enabled():
+            self._disable_hash_routing_after_load()
+        return loaded
+
+    def _disable_hash_routing_after_load(self) -> None:
+        """Send FFN Hash layers through the standard router for this run."""
+
+        cleared = _disable_ffn_hash_routing(self.model)
+        logger.warning(
+            "AFD DSV4 FFN is running with %d Hash layers on the standard router "
+            "because %s is not enabled; routing and outputs will differ from a "
+            "native run",
+            cleared,
+            AFD_DSV4_TRANSPORT_INPUT_IDS_ENV,
+        )
 
 
 __all__ = [

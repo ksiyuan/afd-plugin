@@ -174,6 +174,48 @@ def test_disabling_hash_routing_tolerates_a_model_without_layers() -> None:
     assert _disable_ffn_hash_routing(types.SimpleNamespace()) == 0
 
 
+def test_hash_table_survives_until_the_weights_are_loaded() -> None:
+    """The table must still exist while the loader indexes its parameter dict.
+
+    Clearing it during construction would remove ``gate.tid2eid`` from
+    ``named_parameters()``, and the upstream loader indexes that dict by name, so
+    a checkpoint that carries the table would raise KeyError again. The fallback
+    therefore runs after loading, which this test pins by checking that a freshly
+    built layer still exposes the table.
+    """
+
+    import torch
+    import torch.nn as nn
+
+    class _Gate(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tid2eid = nn.Parameter(torch.zeros(4, 2))
+
+    class _Mlp(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate = _Gate()
+
+    class _Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = _Mlp()
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([_Layer()])
+
+    model = _Model()
+    assert "layers.0.mlp.gate.tid2eid" in dict(model.named_parameters())
+
+    cleared = _disable_ffn_hash_routing(model)
+
+    assert cleared == 1
+    assert "layers.0.mlp.gate.tid2eid" not in dict(model.named_parameters())
+
+
 def test_gate_ownership_follows_the_configured_placement() -> None:
     """Only gate-on-Attention gives the Attention role a router."""
 
