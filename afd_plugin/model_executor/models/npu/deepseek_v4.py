@@ -751,25 +751,28 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
             role_weights = list(role_weights)
             _log_param_layout(self, role_weights)
         loaded = super().load_weights(role_weights)
-        # The Hash id table has to survive loading: the checkpoint carries it and
-        # the upstream loader indexes its parameter dict by name, so clearing the
-        # table before loading would raise KeyError. Drop it once the weights are
-        # in, so the FFN selector takes its standard-router branch.
-        if self.afd_role == _FFN_ROLE and not transport_input_ids_enabled():
-            self._disable_hash_routing_after_load()
         return loaded
 
-    def _disable_hash_routing_after_load(self) -> None:
-        """Send FFN Hash layers through the standard router for this run."""
+    def set_ffn_hash_routing(self, *, ids_available: bool) -> int:
+        """Enable FFN Hash routing only when the ids actually arrived.
 
-        cleared = _disable_ffn_hash_routing(self.model)
-        logger.warning(
-            "AFD DSV4 FFN is running with %d Hash layers on the standard router "
-            "because %s is not enabled; routing and outputs will differ from a "
-            "native run",
-            cleared,
-            AFD_DSV4_TRANSPORT_INPUT_IDS_ENV,
-        )
+        The upstream FFN selector reads ``forward_context.input_ids`` whenever a
+        Hash layer exposes a ``tid2eid`` table, so a table without ids fails
+        inside the MoE. Deciding from the table's presence cannot know whether
+        the transport delivered anything, and deciding at load time cannot know
+        either: the ids arrive per forward.
+
+        Taking ``ids_available`` from the received payload makes the decision
+        from the fact rather than from configuration, so one run cannot end up
+        with a table that nothing can fill.
+
+        Returns:
+            The number of layers whose routing was changed.
+        """
+
+        if ids_available:
+            return 0
+        return _disable_ffn_hash_routing(self.model)
 
 
 __all__ = [

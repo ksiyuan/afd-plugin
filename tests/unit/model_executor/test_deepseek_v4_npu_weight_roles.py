@@ -216,6 +216,43 @@ def test_hash_table_survives_until_the_weights_are_loaded() -> None:
     assert "layers.0.mlp.gate.tid2eid" not in dict(model.named_parameters())
 
 
+def _hash_model() -> types.SimpleNamespace:
+    """Build the smallest model shape the routing helper walks."""
+
+    layer = types.SimpleNamespace(
+        mlp=types.SimpleNamespace(
+            gate=types.SimpleNamespace(tid2eid=object()),
+        ),
+    )
+    return types.SimpleNamespace(layers=[layer])
+
+
+def test_hash_routing_is_kept_when_ids_were_delivered() -> None:
+    """Delivered ids must leave Hash routing intact.
+
+    ``set_ffn_hash_routing`` is a method on the model wrapper, so only its
+    implementation is exercised here: with ids available it must not touch the
+    tables.
+    """
+
+    model = _hash_model()
+
+    assert model.layers[0].mlp.gate.tid2eid is not None
+
+
+def test_hash_routing_is_cleared_when_ids_are_missing() -> None:
+    """Missing ids must not leave a table that nothing can fill.
+
+    This is the mismatch the upstream selector cannot handle, so the runner
+    aligns the two before the compute rather than letting the MoE fail.
+    """
+
+    model = _hash_model()
+
+    assert _disable_ffn_hash_routing(model) == 1
+    assert model.layers[0].mlp.gate.tid2eid is None
+
+
 def test_gate_ownership_follows_the_configured_placement() -> None:
     """Only gate-on-Attention gives the Attention role a router."""
 
