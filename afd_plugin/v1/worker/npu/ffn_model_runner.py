@@ -499,14 +499,22 @@ def _send_ffn_output(
 
 
 def _model_requires_input_ids(model: object) -> bool:
-    """Return whether this FFN model routes on token identity.
+    """Return whether this FFN rank should ask for token ids.
 
-    Such a model declares ``afd_requires_input_ids`` on its outer module, which
-    the role-aware wrapper owns. The flag is read per forward rather than cached
-    because the wrapper is replaced during model load.
+    The model declares ``afd_requires_input_ids`` when it routes on token
+    identity, and the transport switch decides whether ids actually cross the
+    boundary. Both must hold: asking for ids the Attention side is not sending
+    would fail the connector's alignment check.
     """
 
-    return bool(getattr(model, "afd_requires_input_ids", False))
+    if not getattr(model, "afd_requires_input_ids", False):
+        return False
+
+    from afd_plugin.model_executor.models.npu.deepseek_v4 import (
+        transport_input_ids_enabled,
+    )
+
+    return transport_input_ids_enabled()
 
 
 def _ffn_layer_indices(runner: AFDNPUFFNModelRunner) -> range | list[int]:

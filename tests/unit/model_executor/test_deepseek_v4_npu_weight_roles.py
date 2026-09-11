@@ -45,6 +45,8 @@ _HELPER_NAMES = (
     "_weight_layer_path",
     "_checkpoint_weight_roles",
     "_attn_role_owns_gate",
+    "_env_enabled",
+    "transport_input_ids_enabled",
 )
 
 
@@ -71,6 +73,7 @@ def _load_helpers() -> ModuleType:
         "_ATTENTION_ROLE": "attention",
         "_FFN_ROLE": "ffn",
         "_BOTH_ROLES": frozenset(("attention", "ffn")),
+        "AFD_DSV4_TRANSPORT_INPUT_IDS_ENV": "AFD_DSV4_TRANSPORT_INPUT_IDS",
     }
 
     found: set[str] = set()
@@ -96,10 +99,34 @@ def _load_helpers() -> ModuleType:
 _helpers = _load_helpers()
 _checkpoint_weight_roles = _helpers._checkpoint_weight_roles  # type: ignore[attr-defined]
 _attn_role_owns_gate = _helpers._attn_role_owns_gate  # type: ignore[attr-defined]
+_transport_input_ids_enabled = _helpers.transport_input_ids_enabled  # type: ignore[attr-defined]
 
 
 def test_module_and_helpers_are_present() -> None:
     assert _MODULE_PATH.is_file()
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "On"])
+def test_id_transport_switch_accepts_truthy_values(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("AFD_DSV4_TRANSPORT_INPUT_IDS", value)
+    assert _transport_input_ids_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "anything"])
+def test_id_transport_switch_defaults_to_off(monkeypatch, value: str) -> None:
+    """The boundary runs without the operator's ids mode unless asked.
+
+    That keeps the a2e ids channel out of the default path, which matters while
+    the channel is unproven on a new SoC.
+    """
+
+    monkeypatch.setenv("AFD_DSV4_TRANSPORT_INPUT_IDS", value)
+    assert _transport_input_ids_enabled() is False
+
+
+def test_id_transport_switch_is_off_when_unset(monkeypatch) -> None:
+    monkeypatch.delenv("AFD_DSV4_TRANSPORT_INPUT_IDS", raising=False)
+    assert _transport_input_ids_enabled() is False
 
 
 def test_gate_ownership_follows_the_configured_placement() -> None:

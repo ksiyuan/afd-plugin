@@ -46,6 +46,12 @@ _ATTENTION_ROLE = "attention"
 _FFN_ROLE = "ffn"
 _BOTH_ROLES = frozenset((_ATTENTION_ROLE, _FFN_ROLE))
 
+# Set to 1 to move DSV4 token ids across the AFD boundary alongside the
+# activations. Needed for Hash routing, and it is the only thing that puts the
+# a2e operator into its ids mode.
+AFD_DSV4_TRANSPORT_INPUT_IDS_ENV = "AFD_DSV4_TRANSPORT_INPUT_IDS"
+AFD_DSV4_PARAM_DUMP_ENV = "AFD_DSV4_PARAM_DUMP"
+
 
 def _refresh_ascend_fused_moe() -> None:
     """Bind native DSV4 MoE construction to the Ascend implementation."""
@@ -142,14 +148,37 @@ def _param_dump_requested() -> bool:
     an env lookup. See ``tools/dump_dsv4_param_layout.py`` for what it reports.
     """
 
+    return _env_enabled(AFD_DSV4_PARAM_DUMP_ENV)
+
+
+def _env_enabled(name: str) -> bool:
+    """Return whether a boolean AFD environment switch is set."""
+
     import os
 
-    return os.environ.get("AFD_DSV4_PARAM_DUMP", "").lower() in {
+    return os.environ.get(name, "").lower() in {
         "1",
         "true",
         "yes",
         "on",
     }
+
+
+def transport_input_ids_enabled() -> bool:
+    """Return whether DSV4 moves token ids across the AFD boundary.
+
+    Hash layers route by token identity, and only Attention holds ``input_ids``,
+    so the ids must travel with the activations. Transporting them requires the
+    ``a2e`` operator's ids mode, which reserves AIV blocks for a second payload.
+
+    The switch defaults to off so the boundary can be exercised without that
+    operator mode, which is useful while the ids path is unproven on a new SoC.
+    With ids disabled the boundary still carries hidden states, so transport,
+    FFN compute and the return path are all exercised; only Hash routing is
+    unavailable.
+    """
+
+    return _env_enabled(AFD_DSV4_TRANSPORT_INPUT_IDS_ENV)
 
 
 def _log_param_layout(
@@ -184,6 +213,11 @@ class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
             local_hash_input_ids_or_none,
         )
 
+        if not transport_input_ids_enabled():
+            # Boundary check without the operator's ids mode: hidden states still
+            # cross, so transport and FFN compute are exercised, while Hash
+            # layers fall back to their non-ids router.
+            return self._send_and_receive(hidden_states)
         input_ids = local_hash_input_ids_or_none(
             forward_context=get_forward_context(),
             router_tokens=int(hidden_states.shape[0]),
