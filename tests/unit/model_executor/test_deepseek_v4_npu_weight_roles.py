@@ -27,6 +27,7 @@ real file without importing it.
 from __future__ import annotations
 
 import ast
+import logging
 import types
 from pathlib import Path
 from types import ModuleType
@@ -49,6 +50,7 @@ _HELPER_NAMES = (
     "_env_enabled",
     "transport_input_ids_enabled",
     "_disable_ffn_hash_routing",
+    "_align_hash_table_with_ids",
 )
 
 
@@ -72,6 +74,7 @@ def _load_helpers() -> ModuleType:
         "int": int,
         "str": str,
         "None": None,
+        "logger": logging.getLogger("test"),
         "_ATTENTION_ROLE": "attention",
         "_FFN_ROLE": "ffn",
         "_BOTH_ROLES": frozenset(("attention", "ffn")),
@@ -103,6 +106,7 @@ _checkpoint_weight_roles = _helpers._checkpoint_weight_roles  # type: ignore[att
 _attn_role_owns_gate = _helpers._attn_role_owns_gate  # type: ignore[attr-defined]
 _transport_input_ids_enabled = _helpers.transport_input_ids_enabled  # type: ignore[attr-defined]
 _disable_ffn_hash_routing = _helpers._disable_ffn_hash_routing  # type: ignore[attr-defined]
+_align_hash_table_with_ids = _helpers._align_hash_table_with_ids  # type: ignore[attr-defined]
 
 
 def test_module_and_helpers_are_present() -> None:
@@ -251,6 +255,43 @@ def test_hash_routing_is_cleared_when_ids_are_missing() -> None:
 
     assert _disable_ffn_hash_routing(model) == 1
     assert model.layers[0].mlp.gate.tid2eid is None
+
+
+def _fake_mlp(*, tid2eid: object, layer_idx: int = 0) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        layer_idx=layer_idx,
+        gate=types.SimpleNamespace(tid2eid=tid2eid),
+    )
+
+
+def test_align_keeps_the_table_when_ids_are_present() -> None:
+    mlp = _fake_mlp(tid2eid=object())
+
+    _align_hash_table_with_ids(mlp, object())
+
+    assert mlp.gate.tid2eid is not None
+
+
+def test_align_clears_the_table_when_ids_are_missing() -> None:
+    """This is the guarantee that survives however the caller is wired."""
+
+    mlp = _fake_mlp(tid2eid=object())
+
+    _align_hash_table_with_ids(mlp, None)
+
+    assert mlp.gate.tid2eid is None
+
+
+def test_align_is_a_no_op_for_a_moe_without_a_table() -> None:
+    mlp = _fake_mlp(tid2eid=None)
+
+    _align_hash_table_with_ids(mlp, None)
+
+    assert mlp.gate.tid2eid is None
+
+
+def test_align_tolerates_a_gate_less_module() -> None:
+    _align_hash_table_with_ids(types.SimpleNamespace(), None)
 
 
 def test_gate_ownership_follows_the_configured_placement() -> None:

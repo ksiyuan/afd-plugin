@@ -516,6 +516,11 @@ def _sync_ffn_hash_routing(model: object, *, ids_available: object) -> None:
 
     sync = getattr(model, "set_ffn_hash_routing", None)
     if sync is None:
+        logger.error(
+            "AFD FFN model %s exposes no set_ffn_hash_routing hook; Hash layers "
+            "keep their routing tables and will fail if ids are missing",
+            type(model).__name__,
+        )
         return
     cleared = sync(ids_available=ids_available is not None)
     if ids_available is None and cleared:

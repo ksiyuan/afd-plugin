@@ -326,6 +326,32 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         return restore_cam_dispatch_output(output, dispatch_payload.layout)
 
 
+def _align_hash_table_with_ids(mlp: object, input_ids: object) -> None:
+    """Drop a Hash routing table that no ids can fill.
+
+    The upstream FFN selector reads ``forward_context.input_ids`` as soon as a
+    Hash layer exposes a ``tid2eid`` table, so a table without ids fails inside
+    the MoE. Enforcing it here, on the object that is about to run, makes the
+    invariant hold no matter how the caller arranged the transfer.
+
+    Clearing the table is not a behaviour change for the ids-present case, and
+    with the table gone the selector uses its standard router, which is the only
+    routing available without token identity.
+    """
+
+    if input_ids is not None:
+        return
+    gate = getattr(mlp, "gate", None)
+    if gate is None or getattr(gate, "tid2eid", None) is None:
+        return
+    gate.tid2eid = None
+    logger.warning(
+        "AFD DSV4 FFN layer %s received no token ids; routing it with the "
+        "standard router, so its output differs from a native run",
+        getattr(mlp, "layer_idx", "?"),
+    )
+
+
 class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
     """Role-local DSV4 decoder layer.
 
@@ -466,6 +492,7 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         # FusedMoE reads `forward_context.input_ids`, which AFD installs from the
         # transfer. Pass them on to the native MoE as well so the ids travel with
         # the call rather than only through ambient context.
+        _align_hash_table_with_ids(self.mlp, input_ids)
         return self.mlp(hidden_states, input_ids=input_ids)
         # ### PATCH END: FFN-side Hash routing needs the transported ids.
 
