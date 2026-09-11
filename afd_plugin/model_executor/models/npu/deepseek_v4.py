@@ -103,6 +103,38 @@ def _iter_role_weights(
             yield name, loaded_weight
 
 
+def _param_dump_requested() -> bool:
+    """Return whether the DSV4 parameter-layout diagnostic was requested.
+
+    The check lives behind an environment variable so a production run pays only
+    an env lookup. See ``tools/dump_dsv4_param_layout.py`` for what it reports.
+    """
+
+    import os
+
+    return os.environ.get("AFD_DSV4_PARAM_DUMP", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_param_layout(
+    model: object,
+    role_weights: list[tuple[str, torch.Tensor]],
+) -> None:
+    """Print the registered layout and the surviving checkpoint names once."""
+
+    from tools.dump_dsv4_param_layout import (
+        log_dsv4_parameter_layout,
+        log_role_filtered_names,
+    )
+
+    print(log_dsv4_parameter_layout(model, role=model.afd_role), flush=True)
+    log_role_filtered_names(role_weights, role=model.afd_role)
+
+
 class AFDDeepseekV4RemoteMoE(RemoteFFNProxy):
     """DSV4 gate-on-FFN shell that sends Hash ids alongside the activations.
 
@@ -607,7 +639,14 @@ class AFDDeepseekV4ForCausalLM(native.AscendDeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(_iter_role_weights(weights, role=self.afd_role))
+        role_weights = _iter_role_weights(weights, role=self.afd_role)
+        if _param_dump_requested():
+            # Diagnostic only, and deliberately inert otherwise: materialise the
+            # generator so the layout can be printed, then load from the same
+            # content.
+            role_weights = list(role_weights)
+            _log_param_layout(self, role_weights)
+        return super().load_weights(role_weights)
 
 
 __all__ = [
