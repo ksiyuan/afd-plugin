@@ -180,11 +180,16 @@ private:
         }
     }
 
-    __aicore__ inline void sendExpertIds(int sendOffset, int expertIdsOffset) {
+    // The ids and scales payloads are published by a block that also carries an
+    // activation share, so their copies and flags stay separate from the
+    // activation copy's block-wide barrier. Callers reach exactly one barrier.
+    __aicore__ inline void copyExpertIds(int expertIdsOffset) {
         GlobalTensor<int32_t> shareExpertIdsGt;
         shareExpertIdsGt.SetGlobalBuffer((__gm__ int32_t *)(shareAddrs[rank] + IPC_DATA_OFFSET + expertIdsOffset));
         CpGM2GMPingPong(batchSize * topk * sizeof(int32_t), expertIdsGt, shareExpertIdsGt, COPYONLY);
+    }
 
+    __aicore__ inline void sendExpertIdsFlag(int sendOffset) {
         LocalTensor<uint64_t> flagLt = tBuf.GetWithOffset<uint64_t>(1, 0);
         flagLt.SetValue(0, mergeMagicWithValue(magic, 0));
 
@@ -195,19 +200,16 @@ private:
         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
         AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         camCpUB2GM(shareFlagGt, flagLt, 1, sizeof(uint64_t));
-
-        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-
-        SyncAll();
     }
 
-    __aicore__ inline void sendExpertScales(int sendOffset, int expertScalesOffset) {
+    __aicore__ inline void copyExpertScales(int expertScalesOffset) {
         GlobalTensor<float> shareExpertScalesGt;
         shareExpertScalesGt.SetGlobalBuffer((__gm__ float *)(shareAddrs[rank] + IPC_DATA_OFFSET +
             expertScalesOffset));
         CpGM2GMPingPong(batchSize * topk * sizeof(float), expertScalesGt, shareExpertScalesGt, COPYONLY);
+    }
 
+    __aicore__ inline void sendExpertScalesFlag(int sendOffset) {
         LocalTensor<uint64_t> flagLt = tBuf.GetWithOffset<uint64_t>(1, 0);
         flagLt.SetValue(0, mergeMagicWithValue(magic, 0));
 
@@ -218,11 +220,6 @@ private:
         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
         AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         camCpUB2GM(shareFlagGt, flagLt, 1, sizeof(uint64_t));
-
-        AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-
-        SyncAll();
     }
 
     __aicore__ inline void sendBatchSize(int sendOffset) {
@@ -252,19 +249,24 @@ private:
         SyncAll();
     }
 
-    __aicore__ inline void sendX(int sendOffset, int xOffset) {
+    // Copy this block's share of the activations. The copy ends in a block-wide
+    // barrier, so every block has to call it, including the blocks that carry
+    // the ids and scales payloads.
+    __aicore__ inline void copyX(int xOffset, int numXBlocks) {
         GlobalTensor<T> shareXGt;
         shareXGt.SetGlobalBuffer((__gm__ T *)(shareAddrs[rank] + IPC_DATA_OFFSET + xOffset));
 
-        int actualBlockNum = (computeGate == 0) ? blockNum : (blockNum - BLOCK_IDX_USED_2);
-
-        copyGmToGmWithBlocks(shareXGt, xGt, batchSize * hiddenSize, actualBlockNum, blockIdx);
+        copyGmToGmWithBlocks(shareXGt, xGt, batchSize * hiddenSize, numXBlocks, blockIdx);
 
         AscendC::SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
 
         SyncAll();
+    }
 
+    // Publish the flag telling the receive side this rank's activations are in
+    // place. Only the blocks that carried activations send it.
+    __aicore__ inline void sendXFlag(int sendOffset) {
         LocalTensor<uint64_t> flagLt = tBuf.GetWithOffset<uint64_t>(1, 0);
         flagLt.SetValue(0, mergeMagicWithValue(magic, 0));
 
@@ -275,6 +277,11 @@ private:
         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
         AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         camCpUB2GM(shareFlagGt, flagLt, 1, sizeof(uint64_t));
+    }
+
+    __aicore__ inline void sendX(int sendOffset, int xOffset) {
+        copyX(xOffset, blockNum);
+        sendXFlag(sendOffset);
     }
 
     __aicore__ inline void sendWithMte() {
@@ -289,12 +296,25 @@ private:
         if (computeGate == 0) {
             sendX(sendOffset, xOffset);
         } else {
+            // The receive side partitions the activations across blockNum - 1
+            // blocks, so the same count has to publish them here. The blocks
+            // holding ids and scales therefore take part in the activation copy
+            // and the last one carries both its share and the ids.
+            //
+            // Each branch below reaches exactly one block-wide barrier: the
+            // activation copy owns one, so the ids and scales payloads are
+            // copied and flagged separately rather than through helpers that
+            // would add a second barrier for those blocks only.
+            const int numXBlocks = blockNum - 1;
+            copyX(xOffset, numXBlocks);
             if (blockIdx == blockNum - 1) {
-                sendExpertIds(sendOffset, expertIdsOffset);
+                copyExpertIds(expertIdsOffset);
+                sendExpertIdsFlag(sendOffset);
             } else if (blockIdx == blockNum - BLOCK_IDX_USED_2) {
-                sendExpertScales(sendOffset, expertScalesOffset);
+                copyExpertScales(expertScalesOffset);
+                sendExpertScalesFlag(sendOffset);
             } else {
-                sendX(sendOffset, xOffset);
+                sendXFlag(sendOffset);
             }
         }
     }
