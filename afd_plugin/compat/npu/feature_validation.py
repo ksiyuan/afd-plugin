@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    CAMP2P_CONNECTOR,
     AFDConfig,
     is_afd_async_dp,
     parse_afd_config,
@@ -130,8 +131,18 @@ def _fail_if_unsupported_dsv4_async_features(
 
 
 def _fail_if_unsupported_dsv4_connector(afd_config: AFDConfig) -> None:
-    if afd_config.connector != AFD_ASYNC_CONNECTOR:
-        raise RuntimeError("DSV4 NPU AFD supports only CAMAsyncAFDConnector")
+    """Reject DSV4 on connectors that cannot carry token ids.
+
+    A DSV4 Hash layer routes by token identity, so whichever role owns the gate
+    needs the tokens' ids. CAM async reads them from its dispatch metadata;
+    CAMP2P moves them over the A2E ids channel with the gate left on FFN.
+    """
+
+    if afd_config.connector not in (AFD_ASYNC_CONNECTOR, CAMP2P_CONNECTOR):
+        raise RuntimeError(
+            "DSV4 NPU AFD supports only CAMAsyncAFDConnector and "
+            f"CAMP2pAFDConnector; got {afd_config.connector!r}",
+        )
 
 
 def _fail_if_unsupported_npu_afd_async_features(
