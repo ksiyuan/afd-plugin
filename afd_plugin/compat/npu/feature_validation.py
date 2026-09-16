@@ -53,7 +53,7 @@ def fail_if_unsupported_npu_afd_features(
         raise RuntimeError(
             "AFD NPU runtime does not support compute_gate_on_attention=true yet",
         )
-    if afd_config.connector == "CAMP2pAFDConnector":
+    if afd_config.connector == CAMP2P_CONNECTOR:
         from afd_plugin.connectors.npu.camp2p import CAMP2PExtraInfo
 
         if not isinstance(extra_info, CAMP2PExtraInfo):

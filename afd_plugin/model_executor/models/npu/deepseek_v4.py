@@ -96,15 +96,12 @@ def _checkpoint_weight_roles(
         return frozenset((_ATTENTION_ROLE,))
     if stage in ("ffn", "mlp"):
         if remainder and remainder[0] == "gate":
-            # The Hash id table is a parameter only where the Hash MoE is
-            # built, which is the FFN role, whatever the gate placement: with
-            # the gate on FFN the table lives on the FFN router, and with the
-            # gate on Attention the Hash path routes from the table instead of
-            # from a gate weight.
-            if "tid2eid" in remainder:
-                return frozenset((_FFN_ROLE,))
-            # The remaining gate parameters belong to every role that built a
-            # router. With the gate on FFN, Attention has none.
+            # Every router parameter, including the Hash id table, belongs to
+            # each role that built a router: with the gate on Attention, the
+            # Attention gate shell registers ``tid2eid`` for Hash layers and
+            # routes from it, and the native FFN MoE registers its own copy.
+            # With the gate on FFN the Attention MoE slot is parameter-free, so
+            # Attention must not receive any of them.
             if attn_owns_gate:
                 return _BOTH_ROLES
             return frozenset((_FFN_ROLE,))
@@ -331,7 +328,6 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         dynamic_scales_shared: torch.Tensor | None = None,
         topk_scales: torch.Tensor | None = None,
         group_list_type: int = 1,
-        input_ids: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | AFDF2ATransferPayload:
         if not isinstance(self.mlp, native.DeepseekV4MoE):
@@ -360,14 +356,12 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
                 # topk_weights, which CAM applies during combine-recv.
                 routed_scale_applied_in_topk=True,
             )
-        # ### PATCH START: FFN-side Hash routing needs the transported ids.
         # The native MoE runs the gate internally when the gate is not on
-        # Attention, and its Hash layers route by token identity: vLLM-Ascend's
-        # FusedMoE reads `forward_context.input_ids`, which AFD installs from the
-        # transfer. Pass them on to the native MoE as well so the ids travel with
-        # the call rather than only through ambient context.
-        return self.mlp(hidden_states, input_ids=input_ids)
-        # ### PATCH END: FFN-side Hash routing needs the transported ids.
+        # Attention. Its Hash layers route by token identity, and vLLM-Ascend's
+        # fused-expert selector reads ``forward_context.input_ids``, which the
+        # FFN runner installs from the transfer. The native forward takes no
+        # ``input_ids`` argument, so the ambient context is the whole channel.
+        return self.mlp(hidden_states)
 
 
 @native.support_torch_compile
