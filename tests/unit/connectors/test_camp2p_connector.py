@@ -155,7 +155,9 @@ def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):
     The ``a2e`` operator only writes its ids slot in the ids mode, and the
     sending rank selects that mode independently. A receiving rank that reads the
     slot in the other mode would install uninitialised device memory as token
-    ids, which a token-keyed router turns into an out-of-range table read.
+    ids, which a token-keyed router turns into an out-of-range table read. The
+    ids that arrive are model-specific tensors, so they travel on the payload
+    rather than in the backend transfer state.
     """
 
     torch = pytest.importorskip("torch")
@@ -183,9 +185,9 @@ def test_camp2p_recv_attn_output_drives_the_operator_ids_mode(monkeypatch):
     )
 
     assert calls[0][-1] == 1
-    assert with_ids.context.states.input_ids.tolist() == [0, 2, 4, 6, 8]
+    assert with_ids.input_ids.tolist() == [0, 2, 4, 6, 8]
     assert calls[1][-1] == 0
-    assert without_ids.context.states.input_ids is None
+    assert without_ids.input_ids is None
 
 
 def test_camp2p_extra_info_rejects_unknown_mix_placement():

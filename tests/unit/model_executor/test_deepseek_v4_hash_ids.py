@@ -11,11 +11,14 @@ testing without an Ascend device.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import logging
 import sys
 import types
 from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -155,17 +158,20 @@ def test_applies_flash_comm_padding_and_tp_split(monkeypatch):
     """FlashComm v1 must slice ids exactly like the router logits it mirrors."""
     captured: dict[str, object] = {}
 
-    def fake_split(tensor: torch.Tensor, *, num_partitions: int, **kwargs: object):
+    def fake_split(tensor: Any, *, num_partitions: int, **kwargs: object):
         captured["num_partitions"] = num_partitions
         captured["kwargs"] = kwargs
         return list(torch.chunk(tensor, num_partitions))
 
     distributed = types.ModuleType("vllm.distributed")
-    distributed.get_tp_group = lambda: _make_model(world_size=2, rank_in_group=1)
+    distributed.get_tp_group = lambda: _make_model(  # type: ignore[attr-defined]
+        world_size=2,
+        rank_in_group=1,
+    )
     ascend_distributed = types.ModuleType("vllm_ascend.distributed")
     ascend_utils = types.ModuleType("vllm_ascend.distributed.utils")
-    ascend_utils.split_tensor_along_first_dim = fake_split
-    ascend_distributed.utils = ascend_utils
+    ascend_utils.split_tensor_along_first_dim = fake_split  # type: ignore[attr-defined]
+    ascend_distributed.utils = ascend_utils  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
     monkeypatch.setitem(sys.modules, "vllm_ascend.distributed", ascend_distributed)
@@ -220,3 +226,85 @@ def test_context_ids_are_still_validated_against_the_local_token_count():
             ),
             router_tokens=3,
         )
+
+
+_DSV4_MODULE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "afd_plugin"
+    / "model_executor"
+    / "models"
+    / "npu"
+    / "deepseek_v4.py"
+)
+_REMOTE_MOE_CLASS = "AFDDeepseekV4RemoteMoE"
+
+
+class _RecordingProxy:
+    """Stand-in base class recording the transfer the shell requests."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def _send_and_receive(self, hidden_states: Any, **send_kwargs: Any) -> str:
+        self.sent.append({"hidden_states": hidden_states, **send_kwargs})
+        return "ffn-output"
+
+
+def _load_remote_moe_class(forward_context: Any) -> Any:
+    """Execute the real ``AFDDeepseekV4RemoteMoE`` from the module source.
+
+    Importing the DSV4 NPU module pulls in the whole ``vllm``/``vllm_ascend``
+    model surface, so the class body is executed against a parameter-free base
+    class instead. The body under test is read from the file unchanged.
+
+    Raises:
+        AssertionError: If the module no longer defines the class, which means
+            this test needs to be repointed rather than silently pass.
+    """
+
+    tree = ast.parse(_DSV4_MODULE_PATH.read_text(encoding="utf-8"))
+    node = next(
+        (
+            item
+            for item in tree.body
+            if isinstance(item, ast.ClassDef) and item.name == _REMOTE_MOE_CLASS
+        ),
+        None,
+    )
+    assert node is not None, (
+        f"{_DSV4_MODULE_PATH} no longer defines {_REMOTE_MOE_CLASS}"
+    )
+
+    namespace: dict[str, Any] = {
+        "RemoteFFNProxy": _RecordingProxy,
+        "torch": torch,
+        "get_forward_context": lambda: forward_context,
+    }
+    code = compile(ast.Module(body=[node], type_ignores=[]), "<remote-moe>", "exec")
+    exec(code, namespace)  # noqa: S102 - source is this repository's own file
+    return namespace[_REMOTE_MOE_CLASS]
+
+
+def test_remote_moe_sends_the_context_ids_alongside_the_activations():
+    """The gate-on-FFN shell must transport ids, since FFN cannot route without them."""
+
+    forward_context = _forward_context(
+        input_ids=torch.tensor([5, 6, 7], dtype=torch.int32),
+    )
+    layer = _load_remote_moe_class(forward_context)()
+
+    output = layer.forward(torch.zeros(3, 8))
+
+    assert output == "ffn-output"
+    assert layer.sent[0]["input_ids"].tolist() == [5, 6, 7]
+
+
+def test_remote_moe_without_context_ids_raises_instead_of_sending_activations_only():
+    """A quiet activations-only fallback would leave FFN reading an unwritten slot."""
+
+    layer = _load_remote_moe_class(_forward_context(input_ids=None))()
+
+    with pytest.raises(RuntimeError, match="requires input_ids to send"):
+        layer.forward(torch.zeros(3, 8))
+
+    assert layer.sent == []

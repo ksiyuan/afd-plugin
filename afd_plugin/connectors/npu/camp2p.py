@@ -178,13 +178,6 @@ class CAMP2PTransferState(AFDTransferState):
     A2E-returned Attention token count that the FFN-to-Attention send requires.
     ``x_active_mask`` and ``cam_p2p_ep_name`` are the A2E-returned active-token
     mask and HCCL endpoint name captured on the receive path.
-
-    ``input_ids`` holds the token-aligned ids that Attention sent alongside the
-    hidden states, as received by the FFN rank. It is populated only when the
-    receiving rank declared ``recv_input_ids``, which ``compute_gate_mode``
-    records. ``compute_gate_mode`` is the operator's ids mode for this transfer
-    and has to equal the mode the sending rank selected, because the operator
-    only writes the ids slot in that mode.
     """
 
     aiv_num: int = 8
@@ -194,8 +187,6 @@ class CAMP2PTransferState(AFDTransferState):
     atten_batch_size: torch.Tensor | None = None
     x_active_mask: torch.Tensor | None = None
     cam_p2p_ep_name: str | None = None
-    input_ids: torch.Tensor | None = None
-    compute_gate_mode: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,7 +516,8 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             **kwargs: An optional token-aligned ``input_ids`` tensor. When it is
                 supplied, the transfer runs with ``compute_gate=1`` so the ids
                 reach the FFN rank through the operator's ids channel, and the
-                local FFN-side receive exposes them on ``CAMP2PTransferState``.
+                matching ``recv_attn_output(recv_input_ids=True)`` returns them
+                on the payload's ``input_ids`` field.
 
         Raises:
             RuntimeError: If the communication groups are not ready.
@@ -639,13 +631,14 @@ class CAMP2pAFDConnector(AFDConnectorBase):
                 number needed to create it. ``recv_input_ids`` states that this
                 FFN rank expects token ids on the transfer, which selects the
                 operator's ids mode and makes the connector validate and expose
-                the operator's ids slot. The sending rank has to select the same
-                mode, so only request ids for a run whose Attention role
-                transports them.
+                the operator's ids slot on the payload. The sending rank has to
+                select the same mode, so only request ids for a run whose
+                Attention role transports them.
 
         Returns:
-            The received hidden states and the information FFN needs to process
-            them and send the result back.
+            The received hidden states, the information FFN needs to process them
+            and send the result back, and the transported ``input_ids`` when the
+            ids mode was selected.
 
         Raises:
             RuntimeError: If communication is not ready, transfer information
@@ -658,6 +651,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         layer_idx: int = kwargs.get("layer_idx", 0)
         max_num_tokens: int = kwargs.get("max_num_tokens", 0)
         recv_input_ids: bool = bool(kwargs.get("recv_input_ids", False))
+        compute_gate_mode = 1 if recv_input_ids else 0
         batch_size = _num_tokens_for_ffn_rank(
             self.dp_metadata_list,
             ubatch_idx,
@@ -676,7 +670,6 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             batch_size=batch_size,
             h=self.hidden_size,
             k=self.num_experts_per_tok,
-            compute_gate_mode=1 if recv_input_ids else 0,
         )
         context = AFDTransferContext(
             metadata=metadata,
@@ -701,7 +694,7 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             self.world_rank,
             group_ep,
             custom_states.aiv_num,
-            custom_states.compute_gate_mode,
+            compute_gate_mode,
         )
         custom_states.atten_batch_size = outputs[3]
         custom_states.x_active_mask = outputs[4]
@@ -713,14 +706,16 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # indistinguishable from the operator's placeholder. Reading the slot in
         # the other mode would hand the model uninitialised device memory as token
         # ids, which a token-keyed router turns into an out-of-range table read.
-        if custom_states.compute_gate_mode == 1:
-            custom_states.input_ids = received_token_ids(
+        received_ids: torch.Tensor | None = None
+        if compute_gate_mode == 1:
+            received_ids = received_token_ids(
                 outputs[1],
                 expected_tokens=batch_size,
             )
         return AFDA2FTransferPayload(
             hidden_states=outputs[0],
             context=context,
+            input_ids=received_ids,
         )
 
     def send_ffn_output(

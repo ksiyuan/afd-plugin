@@ -8,8 +8,9 @@ parameter dict by name without a membership check, so a path handed to a role
 that never registered it raises ``KeyError`` during weight loading instead of
 being skipped.
 
-The Hash id table is the case that matters. It is a parameter only where the
-Hash MoE is built, which is the FFN role, so it must not be handed to Attention.
+The Hash id table is the case that matters. Both roles register their own copy
+whenever they build a router, so the table follows the same ownership rule as
+the other gate paths rather than being pinned to FFN.
 
 How the functions are loaded
 ----------------------------
@@ -74,19 +75,6 @@ def _load_helpers() -> ModuleType:
         "_BOTH_ROLES": frozenset(("attention", "ffn")),
     }
 
-    # Module-level constants the helpers read. Evaluating them from the source
-    # keeps the tests from drifting when a constant changes.
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            name = getattr(target, "id", None)
-            if name and name.startswith("_HASH_"):
-                namespace[name] = eval(  # noqa: S307 - this repository's own source
-                    compile(ast.Expression(body=node.value), "<const>", "eval"),
-                    namespace,
-                )
-
     found: set[str] = set()
     for node in tree.body:
         if not isinstance(node, ast.FunctionDef) or node.name not in _HELPER_NAMES:
@@ -122,19 +110,23 @@ def test_module_and_helpers_are_present() -> None:
         "model.layers.7.ffn.gate.tid2eid",
     ],
 )
-def test_hash_id_table_is_ffn_owned(name: str) -> None:
-    """Only the Hash MoE registers this parameter, so Attention must not see it.
+def test_hash_id_table_follows_the_gate_ownership(name: str) -> None:
+    """The Hash table belongs to every role that built a router.
 
-    Handing it to Attention is exactly the mismatch that raises
-    ``KeyError: 'model.layers.0.mlp.gate.tid2eid'`` while loading that rank,
-    under either gate placement.
+    With the gate on Attention, the Attention gate shell registers ``tid2eid``
+    for its Hash layers and routes from it, so the table is shared. With the gate
+    on FFN the Attention MoE slot is parameter-free, so the path is FFN-only;
+    handing it to Attention raises ``KeyError`` from the upstream loader.
     """
 
-    for attn_owns_gate in (True, False):
-        assert _checkpoint_weight_roles(
-            name,
-            attn_owns_gate=attn_owns_gate,
-        ) == frozenset({"ffn"})
+    assert _checkpoint_weight_roles(
+        name,
+        attn_owns_gate=True,
+    ) == frozenset({"attention", "ffn"})
+    assert _checkpoint_weight_roles(
+        name,
+        attn_owns_gate=False,
+    ) == frozenset({"ffn"})
 
 
 @pytest.mark.parametrize(

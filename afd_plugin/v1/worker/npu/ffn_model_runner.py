@@ -270,9 +270,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 )
                 # A model whose router is keyed by token identity needs the ids
                 # of the tokens this rank computes on installed in the forward
-                # context before the FFN compute runs. They arrive with the
-                # transfer, so the receive must happen before the context is
-                # built rather than inside it.
+                # context before the FFN compute runs. They arrive on the
+                # transfer payload, so the receive must happen before the
+                # context is built rather than inside it.
                 payload = self.connector.recv_attn_output(
                     ubatch_idx=stage_idx,
                     layer_idx=layer_idx,
@@ -283,7 +283,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 metadata = context.metadata
                 states = context.states
                 hidden_states = payload.hidden_states
-                received_input_ids = getattr(states, "input_ids", None)
+                received_input_ids = payload.input_ids
                 with ascend_forward_context(
                     vllm_config=self.vllm_config,
                     afd_metadata=afd_metadata,
@@ -304,7 +304,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     rank_ffn_output = self.model.compute_ffn_output(
                         hidden_states=hidden_states,
                         layer_idx=layer_idx,
-                        input_ids=received_input_ids,
                     )
                     _send_ffn_output(
                         self.connector,
