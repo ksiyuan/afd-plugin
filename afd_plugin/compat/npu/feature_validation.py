@@ -69,16 +69,19 @@ def fail_if_unsupported_npu_afd_features(
             "AFD NPU runtime supports exactly two ubatches when DBO is enabled",
         )
     model_config = vllm_config.model_config
-    # Match the pinned NPUModelRunner's sparse-attention backend selection.
-    uses_sparse_mla = hasattr(
-        model_config.hf_text_config,
-        "index_topk",
-    )
+    # Mirror the pinned NPUModelRunner's attention backend selection: a sparse
+    # (SFA) or compressor (DSA) configuration selects a backend whose
+    # graph-params update is a no-op, so only plain MLA takes the MLA DBO full
+    # graph path that owns the merged registry.
+    hf_text_config = model_config.hf_text_config
+    uses_sparse_mla = hasattr(hf_text_config, "index_topk")
+    uses_mla_compressor = hasattr(hf_text_config, "compress_ratios")
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     uses_mla_dbo_full_graph = (
         uses_ubatching
         and model_config.use_mla
         and not uses_sparse_mla
+        and not uses_mla_compressor
         and cudagraph_mode.has_full_cudagraphs()
     )
     if uses_mla_dbo_full_graph and vllm_config.speculative_config is not None:
