@@ -68,11 +68,15 @@ def build_environment() -> dict[str, str]:
     interface = required_env("HCCL_SOCKET_IFNAME")
     required_env("HCCL_IF_IP")
     # No CAM vendor package is installed for this path, and CAMP2P sizes its
-    # own AFD HCCL domains through connector_extra_config, so HCCL_BUFFSIZE
-    # stays untouched here.
+    # own AFD HCCL domains through connector_extra_config. Drop any inherited
+    # HCCL_BUFFSIZE (the async CAM recipes export one) so the run does not
+    # depend on the caller's shell, the same way the NPU async CAM entrypoint
+    # drops it.
+    env.pop("HCCL_BUFFSIZE", None)
+    env.setdefault("VLLM_USE_V1", "1")
+    env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
     env.update(
         {
-            "VLLM_USE_V1": "1",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "AFD_FORCE_SPAWN_MULTIPROCESSING": "1",
             "HCCL_CONNECT_TIMEOUT": "1800",
@@ -81,7 +85,6 @@ def build_environment() -> dict[str, str]:
             "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "30000",
             "OMP_PROC_BIND": "false",
             "OMP_NUM_THREADS": "10",
-            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
             "AFD_FORCE_BALANCED_TOPK_IDS": "0",
             "GLOO_SOCKET_IFNAME": interface,
             "TP_SOCKET_IFNAME": interface,
