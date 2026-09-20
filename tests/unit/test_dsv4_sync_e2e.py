@@ -195,7 +195,9 @@ def test_dsv4_sync_environment_needs_no_cam_package(monkeypatch):
     monkeypatch.setenv("HCCL_IF_IP", "192.0.2.1")
     monkeypatch.setenv("HCCL_SOCKET_IFNAME", "eth-test")
     monkeypatch.delenv("CAM_CUST_OPAPI_LIB_PATH", raising=False)
-    monkeypatch.delenv("HCCL_BUFFSIZE", raising=False)
+    # A caller shell that exported the async CAM recipe's buffer size must not
+    # change this case, which sizes its CAMP2P domains itself.
+    monkeypatch.setenv("HCCL_BUFFSIZE", "4096")
     env = entrypoint.build_environment()
     assert env["GLOO_SOCKET_IFNAME"] == "eth-test"
     assert env["TP_SOCKET_IFNAME"] == "eth-test"
