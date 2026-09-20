@@ -9,12 +9,19 @@ Local workaround, not an upstream artifact. The CAM operator package ships
 link ``libpython``; its CPython footprint is 118 symbols that all exist in
 3.11 as well (``PyFrame_GetBack``, ``PyCMethod_New``, ``PyThread_tss_*``,
 ``_PyObject_GetDictPtr``, ...). Everything else it resolves comes from their
-torch stack (``libtorch.so``, ``libtorch_npu.so``, ``libascendcl.so``), so
-the wheel tag is the only Python-version coupling.
+torch stack (``libtorch.so``, ``libtorch_npu.so``, ``libascendcl.so``).
 
-This rewrites the wheel tag and the extension file name, and regenerates
-``RECORD``, so ``pip install`` accepts it on Python 3.11. Verify the import
-afterwards: the four ops must be registered under ``torch.ops.umdk_cam_op_lib``.
+Two things pin it to 3.12 and both are rewritten here:
+
+1. the wheel tag and the extension file name, for ``pip`` and the import
+   system;
+2. the runtime version guard in ``comm_operator/pybind/pybind.cpp``, which
+   refuses to load unless ``Py_GetVersion()`` starts with the version the
+   module was built with. The same rodata literal feeds the error message, so
+   the rewrite keeps the diagnostic truthful.
+
+Verify the import afterwards: the four ops must be registered under
+``torch.ops.umdk_cam_op_lib``.
 
 Usage:
     python3 tools/itask/retag_cam_wheel_py311.py --output-dir /tmp/cam311
@@ -43,6 +50,39 @@ def record_line(name: str, data: bytes | None) -> str:
     return f"{name},sha256={digest.decode()},{len(data)}"
 
 
+GUARD_MESSAGE = b"Python version mismatch: module was compiled for Python"
+GUARD_SEARCH_WINDOW = 64
+
+
+def clear_python_guard(
+    data: bytes, build_version: bytes, target_version: bytes
+) -> bytes:
+    """Point the extension's built-in version guard at the target interpreter.
+
+    ``comm_operator/pybind/pybind.cpp`` refuses to load unless the running
+    interpreter's ``Py_GetVersion()`` starts with the version the module was
+    built with, and passes that same literal to the error message. Both uses
+    share one rodata string, so rewriting the literal keeps the code and the
+    diagnostic consistent. The replacement has the same length, so no ELF
+    offset moves.
+    """
+    message = data.find(GUARD_MESSAGE)
+    if message < 0:
+        raise RuntimeError("version-guard message not found in the module")
+    window_start = max(0, message - GUARD_SEARCH_WINDOW)
+    literal = data.rfind(build_version + b"\0", window_start, message)
+    if literal < 0:
+        raise RuntimeError(
+            f"no {build_version.decode()!r} literal next to the version guard",
+        )
+    patched = data[:literal] + target_version + data[literal + len(build_version) :]
+    print(
+        f"  guard literal at file offset {literal}: "
+        f"{build_version.decode()} -> {target_version.decode()}",
+    )
+    return patched
+
+
 def retag(source: Path, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / source.name.replace("cp312-cp312", NEW_ABI)
@@ -52,6 +92,8 @@ def retag(source: Path, output_dir: Path) -> Path:
         for item in archive.infolist():
             name = item.filename.replace("cpython-312", "cpython-311")
             data = archive.read(item.filename)
+            if name.endswith(".so"):
+                data = clear_python_guard(data, b"3.12", b"3.11")
             if name.endswith(".dist-info/WHEEL"):
                 data = data.replace(b"cp312-cp312", NEW_TAG.encode())
             if name.endswith(".dist-info/RECORD"):
