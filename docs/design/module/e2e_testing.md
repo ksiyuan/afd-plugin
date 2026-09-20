@@ -128,17 +128,18 @@ reporting survivors. Marker-scan signal-delivery and survivor failures, plus
 normal process-reaping failures, remain fatal. This test-scoped exception
 should be removed when the runtime supports graceful cancellation.
 
-`afd-dsv4-flash-async-cam-dp2tp4-ep8` is a separate local-only DSV4 Flash
-W8A8 case using 16 Ascend NPUs: Attention DP2/TP4 and FFN DP8/TP1/EP8.
-It uses eager async CAM with two token-split MoE ubatches, MBT=8192, and
-`enable_dsv4_shared_compressor_workspace=false` on both roles. It validates
-ten simultaneous chat requests, records their outputs and overlapping
-request intervals, and checks service liveness and cleanup. Its cancellable
+`afd-dsv4-flash-async-cam-dp2tp4-ep8` uses 16 Ascend NPUs (Attention DP2/TP4
+and FFN DP8/TP1/EP8) and `afd-dsv4-flash-async-cam-dp2tp2-ep4` uses eight
+(Attention DP2/TP2 and FFN DP4/TP1/EP4). Both are separate local-only DSV4
+Flash W8A8 cases: eager async CAM with two token-split MoE ubatches, MBT=8192,
+and `enable_dsv4_shared_compressor_workspace=false` on both roles. They
+validate ten simultaneous chat requests, record their outputs and overlapping
+request intervals, and check service liveness and cleanup. Their cancellable
 async HTTP client saves per-request responses/errors even on failure or
 interruption, before the runner tears down services. Model-specific fixed
-settings live alongside the model entrypoint. It does not run
-GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
-FFN cleanup exception above and is not selected by the four-device PR gate.
+settings live alongside the model entrypoint. Neither runs GSM8K or claims
+general accuracy coverage. They use the same scoped async NPU FFN cleanup
+exception above and are not selected by the four-device PR gate.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,

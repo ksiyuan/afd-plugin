@@ -11,6 +11,25 @@ DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_ATTENTION_RANKS = 8
 DSV4_FFN_RANKS = 8
 DSV4_ATTENTION_TP_SIZE = 4
+DSV4_SMALL_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp2-ep4"
+DSV4_SMALL_ATTENTION_RANKS = 4
+DSV4_SMALL_FFN_RANKS = 4
+DSV4_SMALL_ATTENTION_TP_SIZE = 2
+# Scenario -> (Attention ranks, FFN ranks, Attention TP size). Each entry is one
+# fixed deployment, so a case ID always denotes the same topology.
+DSV4_TOPOLOGY_BY_SCENARIO = {
+    DSV4_ASYNC_CAM_SCENARIO: (
+        DSV4_ATTENTION_RANKS,
+        DSV4_FFN_RANKS,
+        DSV4_ATTENTION_TP_SIZE,
+    ),
+    DSV4_SMALL_ASYNC_CAM_SCENARIO: (
+        DSV4_SMALL_ATTENTION_RANKS,
+        DSV4_SMALL_FFN_RANKS,
+        DSV4_SMALL_ATTENTION_TP_SIZE,
+    ),
+}
+DSV4_SCENARIOS = tuple(DSV4_TOPOLOGY_BY_SCENARIO)
 DSV4_CONCURRENT_REQUESTS = 10
 DSV4_REQUEST_TIMEOUT_S = 300
 DSV4_COMPLETION_MAX_TOKENS = 256
@@ -24,6 +43,7 @@ DSV4_PROCESS_TERMINATION_TIMEOUT_S = 60
 def configure_scenario(args: argparse.Namespace) -> None:
     if args.completion_output_path is None:
         raise ValueError("--completion-output-path is required for DSV4")
+    attention_tp_size = DSV4_TOPOLOGY_BY_SCENARIO[args.scenario][2]
     args.afd_connector = "CAMAsyncAFDConnector"
     args.afd_async = True
     args.compute_gate_on_attention = True
@@ -31,7 +51,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "dynamicQuant": 1,
-                "attn_ranks_per_dp": DSV4_ATTENTION_TP_SIZE,
+                "attn_ranks_per_dp": attention_tp_size,
                 "async_moe_ubatching": True,
                 "async_moe_num_ubatches": 2,
                 "async_moe_split": "token",

@@ -20,20 +20,34 @@ import pytest
 from tests.e2e import runner
 from tests.e2e.models.deepseek_v4_flash import completions
 from tests.e2e.models.deepseek_v4_flash import test_async_cam_npu as entrypoint
+from tests.e2e.models.deepseek_v4_flash.config import (
+    DSV4_ASYNC_CAM_SCENARIO,
+    DSV4_SCENARIOS,
+    DSV4_TOPOLOGY_BY_SCENARIO,
+)
 
 
-def _arguments(monkeypatch, tmp_path):
+def _arguments(monkeypatch, tmp_path, scenario=DSV4_ASYNC_CAM_SCENARIO):
+    attention_ranks, ffn_ranks, _ = DSV4_TOPOLOGY_BY_SCENARIO[scenario]
     monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", ",".join(map(str, range(16))))
+    monkeypatch.setenv(
+        "AFD_E2E_DEVICES",
+        ",".join(map(str, range(attention_ranks + ffn_ranks))),
+    )
     monkeypatch.setenv("AFD_NPU_E2E_MODEL", "/models/dsv4")
     monkeypatch.setenv("HCCL_IF_IP", "192.0.2.1")
-    command = entrypoint.build_runner_command(tmp_path / "responses.json")
+    command = entrypoint.build_runner_command(
+        tmp_path / "responses.json",
+        scenario,
+    )
     monkeypatch.setattr(sys, "argv", ["runner", *command[3:]])
     return runner.parse_args()
 
 
-def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path):
-    args = _arguments(monkeypatch, tmp_path)
+@pytest.mark.parametrize("scenario", DSV4_SCENARIOS)
+def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path, scenario):
+    attention_ranks, ffn_ranks, attention_tp = DSV4_TOPOLOGY_BY_SCENARIO[scenario]
+    args = _arguments(monkeypatch, tmp_path, scenario)
     runner.configure_scenario(args)
     runner.validate_topology(
         args,
@@ -42,7 +56,10 @@ def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path):
     )
     assert runner.uses_npu_async_process_cleanup(args)
     assert args.gsm8k_output_path is None
-    for role, dp, tp in (("attention", "2", "4"), ("ffn", "8", "1")):
+    for role, dp, tp in (
+        ("attention", str(attention_ranks // attention_tp), str(attention_tp)),
+        ("ffn", str(ffn_ranks), "1"),
+    ):
         command = runner.build_vllm_command(args, role=role)
         assert command[command.index("--data-parallel-size") + 1] == dp
         assert command[command.index("--tensor-parallel-size") + 1] == tp
@@ -60,13 +77,13 @@ def test_dsv4_fixed_deployment_and_cleanup(monkeypatch, tmp_path):
             "connector": "CAMAsyncAFDConnector",
             "host": "192.0.2.1",
             "port": 6455,
-            "num_attention_ranks": 8,
-            "num_ffn_ranks": 8,
+            "num_attention_ranks": attention_ranks,
+            "num_ffn_ranks": ffn_ranks,
             "async": True,
             "compute_gate_on_attention": True,
             "connector_extra_config": {
                 "dynamicQuant": 1,
-                "attn_ranks_per_dp": 4,
+                "attn_ranks_per_dp": attention_tp,
                 "async_moe_ubatching": True,
                 "async_moe_num_ubatches": 2,
                 "async_moe_split": "token",

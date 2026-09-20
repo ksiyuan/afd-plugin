@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Local 16-NPU DSV4 Flash async CAM concurrent-request acceptance case."""
+"""Local DSV4 Flash async CAM concurrent-request acceptance cases (16 and 8 NPUs)."""
 
 from __future__ import annotations
 
@@ -14,17 +14,21 @@ from tests.conftest import run_runner
 from tests.e2e.environment import devices_from_env, prepend_env_paths, required_env
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ASYNC_CAM_SCENARIO,
-    DSV4_ATTENTION_RANKS,
-    DSV4_FFN_RANKS,
+    DSV4_SCENARIOS,
+    DSV4_TOPOLOGY_BY_SCENARIO,
 )
 
 CAM_VENDOR_PATH = Path("/usr/local/Ascend/cann-9.0.1/opp/vendors/CAM")
 
 
-def build_runner_command(output_path: Path) -> list[str]:
+def build_runner_command(
+    output_path: Path,
+    scenario: str = DSV4_ASYNC_CAM_SCENARIO,
+) -> list[str]:
     if required_env("AFD_E2E_BACKEND") != "npu":
         raise RuntimeError("DSV4 async CAM E2E requires AFD_E2E_BACKEND=npu")
-    devices = devices_from_env("AFD_E2E_DEVICES", DSV4_ATTENTION_RANKS + DSV4_FFN_RANKS)
+    attention_ranks, ffn_ranks, _ = DSV4_TOPOLOGY_BY_SCENARIO[scenario]
+    devices = devices_from_env("AFD_E2E_DEVICES", attention_ranks + ffn_ranks)
     return [
         sys.executable,
         "-m",
@@ -36,11 +40,11 @@ def build_runner_command(output_path: Path) -> list[str]:
         "--device-backend",
         "npu",
         "--attention-devices",
-        ",".join(devices[:DSV4_ATTENTION_RANKS]),
+        ",".join(devices[:attention_ranks]),
         "--ffn-devices",
-        ",".join(devices[DSV4_ATTENTION_RANKS:]),
+        ",".join(devices[attention_ranks:]),
         "--scenario",
-        DSV4_ASYNC_CAM_SCENARIO,
+        scenario,
         "--served-model-name-prefix",
         "dsv4-flash",
         "--afd-host",
@@ -100,9 +104,9 @@ def build_environment() -> dict[str, str]:
 @pytest.mark.npu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize("scenario", [DSV4_ASYNC_CAM_SCENARIO])
+@pytest.mark.parametrize("scenario", DSV4_SCENARIOS)
 def test_deepseek_v4_flash_async_cam(scenario: str, tmp_path: Path) -> None:
     run_runner(
-        build_runner_command(tmp_path / f"{scenario}.json"),
+        build_runner_command(tmp_path / f"{scenario}.json", scenario),
         env=build_environment(),
     )

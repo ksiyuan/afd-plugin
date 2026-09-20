@@ -28,9 +28,13 @@ from tests.e2e.models.deepseek_v4_flash.completions import evaluate_completions
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ASYNC_CAM_SCENARIO,
     DSV4_ATTENTION_RANKS,
-    DSV4_ATTENTION_TP_SIZE,
     DSV4_FFN_RANKS,
     DSV4_PROCESS_TERMINATION_TIMEOUT_S,
+    DSV4_SCENARIOS,
+    DSV4_SMALL_ASYNC_CAM_SCENARIO,
+    DSV4_SMALL_ATTENTION_RANKS,
+    DSV4_SMALL_FFN_RANKS,
+    DSV4_TOPOLOGY_BY_SCENARIO,
 )
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
@@ -192,7 +196,7 @@ def main() -> int:
 
         if args.scenario == ASYNC_CAM_SCENARIO:
             run_completion_evaluation(args)
-        elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+        elif args.scenario in DSV4_SCENARIOS:
             run_concurrent_completion_evaluation(args)
         else:
             run_gsm8k_evaluation(args)
@@ -215,7 +219,7 @@ def main() -> int:
                         processes,
                         termination_timeout_s=(
                             DSV4_PROCESS_TERMINATION_TIMEOUT_S
-                            if args.scenario == DSV4_ASYNC_CAM_SCENARIO
+                            if args.scenario in DSV4_SCENARIOS
                             else PROCESS_TERMINATION_TIMEOUT_S
                         ),
                         deferred_sigkill_pgids=deferred_sigkill_pgids,
@@ -284,6 +288,7 @@ def parse_args() -> argparse.Namespace:
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
             DSV4_ASYNC_CAM_SCENARIO,
+            DSV4_SMALL_ASYNC_CAM_SCENARIO,
             *V2_SCENARIOS,
         ],
         required=True,
@@ -391,7 +396,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     """Set topology and features for the selected fixed scenario."""
     is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
     is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
-    is_dsv4 = args.scenario == DSV4_ASYNC_CAM_SCENARIO
+    is_dsv4 = args.scenario in DSV4_SCENARIOS
     scenario_settings = {
         "baseline-graph": (True, True, False, 4, 0),
         "afd-eager-2a1f": (False, False, False, 2, 1),
@@ -421,6 +426,13 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_ATTENTION_RANKS,
             DSV4_FFN_RANKS,
         ),
+        DSV4_SMALL_ASYNC_CAM_SCENARIO: (
+            False,
+            False,
+            False,
+            DSV4_SMALL_ATTENTION_RANKS,
+            DSV4_SMALL_FFN_RANKS,
+        ),
         "afd-v2-eager-1a1f": (False, False, False, 1, 1),
         "afd-v2-eager-dp2": (False, False, False, 2, 2),
         "afd-v2-eager-tp2": (False, False, False, 2, 2),
@@ -438,7 +450,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_ffn_ranks = ffn_ranks
     args.tp_size = 1
     if is_dsv4:
-        args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
+        args.attention_tp_size = DSV4_TOPOLOGY_BY_SCENARIO[args.scenario][2]
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -554,7 +566,7 @@ def validate_topology(
         in (
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
+            *DSV4_SCENARIOS,
         )
         and args.device_backend != "npu"
     ):
@@ -656,7 +668,7 @@ def build_vllm_command(
     )
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_SCENARIOS:
         afd_config.update(dsv4_config.additional_config())
     cmd = [
         args.vllm_bin,
@@ -761,7 +773,7 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     return args.device_backend == "npu" and args.scenario in (
         ASYNC_CAM_SCENARIO,
         ASYNC_UBATCH_SCENARIO,
-        DSV4_ASYNC_CAM_SCENARIO,
+        *DSV4_SCENARIOS,
     )
 
 
@@ -916,7 +928,7 @@ def build_env(
     ):
         env.pop("VLLM_ASCEND_ENABLE_FLASHCOMM1", None)
     env.pop("AFD_PLUGIN_EARLY_ENGINE_PATCH", None)
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_SCENARIOS:
         env.update(dsv4_config.role_environment(role))
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
