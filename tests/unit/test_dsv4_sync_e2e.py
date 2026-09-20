@@ -43,6 +43,13 @@ def _arguments(
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_API_PORT", raising=False)
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_AFD_PORT", raising=False)
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION", raising=False)
+    for name in (
+        "AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN",
+        "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS",
+        "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS",
+        "AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION",
+    ):
+        monkeypatch.delenv(name, raising=False)
     command = entrypoint.build_runner_command(scenario, tmp_path / "responses.json")
     monkeypatch.setattr(sys, "argv", ["runner", *command[3:]])
     return runner.parse_args()
@@ -80,8 +87,10 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
         command = runner.build_vllm_command(args, role=role)
         assert command[command.index("--data-parallel-size") + 1] == dp
         assert command[command.index("--tensor-parallel-size") + 1] == tp
-        assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
-        assert command[command.index("--max-model-len") + 1] == "1048576"
+        assert command[command.index("--max-num-batched-tokens") + 1] == "1024"
+        assert command[command.index("--max-model-len") + 1] == "8192"
+        assert command[command.index("--max-num-seqs") + 1] == "16"
+        assert command[command.index("--gpu-memory-utilization") + 1] == "0.7"
         assert command[command.index("--quantization") + 1] == "ascend"
         assert "--enforce-eager" in command
         # DeepSeek V4 shards by tensor parallel here: an expert-parallel world
@@ -217,6 +226,61 @@ def test_dsv4_sync_rejects_non_npu_backends(
                 )
             ],
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "flag"),
+    [
+        ("AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN", "32768", "--max-model-len"),
+        (
+            "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS",
+            "2048",
+            "--max-num-batched-tokens",
+        ),
+        ("AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS", "12", "--max-num-seqs"),
+        (
+            "AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION",
+            "0.85",
+            "--gpu-memory-utilization",
+        ),
+    ],
+)
+def test_dsv4_sync_runtime_profile_env_overrides(
+    monkeypatch,
+    tmp_path,
+    name,
+    value,
+    flag,
+):
+    """A host can retune the context and batch budget without a code change."""
+    args = _arguments(monkeypatch, tmp_path)
+    monkeypatch.setenv(name, value)
+    runner.configure_scenario(args)
+
+    command = runner.build_vllm_command(args, role="attention")
+
+    assert command[command.index(flag) + 1] == value
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS", "9"),
+        ("AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS", "nope"),
+        ("AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN", "0"),
+        ("AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION", "1.5"),
+    ],
+)
+def test_dsv4_sync_runtime_profile_rejects_bad_values(
+    monkeypatch,
+    tmp_path,
+    name,
+    value,
+):
+    args = _arguments(monkeypatch, tmp_path)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        runner.configure_scenario(args)
 
 
 def test_dsv4_sync_omits_quantization_for_a_declaring_checkpoint(monkeypatch, tmp_path):

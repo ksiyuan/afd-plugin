@@ -215,12 +215,19 @@ SOC before running — `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=ascend950` on A5 and
 `SOC_VERSION=910c` on A3 — with `python -m pip install -v
 --no-build-isolation --no-deps -e .`.
 
-The fixed deployment uses eager execution, MBT=8192, max-model-len=1048576,
-max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024. Both
-roles explicitly disable `enable_dsv4_shared_compressor_workspace`. The gate
-stays on FFN — CAMP2P rejects `compute_gate_on_attention=true` — and
-`connector_extra_config` carries only `hccl_buffer_size=2048` and
-`quant_mode=0`. Prefix caching, native DBO, and KV transfer are not enabled.
+The fixed deployment uses eager execution, MBT=1024, max-model-len=8192,
+max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024. The
+context and batch values follow the A5/A3 launch scripts rather than the
+16-die asynchronous case's budget, because DeepSeek V4 out-of-memory on A3 is
+usually the context/batch budget and not the shard count. Each of them is
+overridable per host: `AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN`,
+`AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS`,
+`AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS` (never below the ten concurrent requests),
+and `AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION`. Both roles explicitly disable
+`enable_dsv4_shared_compressor_workspace`. The gate stays on FFN — CAMP2P
+rejects `compute_gate_on_attention=true` — and `connector_extra_config`
+carries only `hccl_buffer_size=2048` and `quant_mode=0`. Prefix caching,
+native DBO, and KV transfer are not enabled.
 
 `--quantization ascend` is passed only when the checkpoint does not declare
 another method in its own `config.json`: the A3 int8 W8A8 checkpoint is loaded

@@ -59,6 +59,21 @@ DSV4_ASCEND_QUANTIZATION = "ascend"
 # needs that; the A3 int8 W8A8 one is loaded through the Ascend method.
 DSV4_CHECKPOINT_QUANTIZATION = "none"
 DSV4_SYNC_QUANTIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION"
+# Context, batch, and memory budget. The asynchronous case keeps the 16-die
+# budget it was validated with; the synchronous cases default to the smaller
+# profile the A5 and A3 launch scripts use, because DeepSeek V4 out-of-memory
+# on A3 is usually the context/batch budget rather than the shard count. Every
+# value is overridable so a host can be tuned without editing the case.
+DSV4_MAX_MODEL_LEN = "1048576"
+DSV4_MAX_NUM_BATCHED_TOKENS = "8192"
+DSV4_MAX_NUM_SEQS = "16"
+DSV4_MEMORY_UTILIZATION = "0.7"
+DSV4_SYNC_MAX_MODEL_LEN = "8192"
+DSV4_SYNC_MAX_NUM_BATCHED_TOKENS = "1024"
+DSV4_SYNC_MAX_MODEL_LEN_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN"
+DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS"
+DSV4_SYNC_MAX_NUM_SEQS_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS"
+DSV4_SYNC_MEMORY_UTILIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION"
 DSV4_CONCURRENT_REQUESTS = 10
 DSV4_REQUEST_TIMEOUT_S = 300
 DSV4_COMPLETION_MAX_TOKENS = 256
@@ -104,14 +119,91 @@ def sync_camp2p_quantization(model: str) -> str | None:
     return DSV4_ASCEND_QUANTIZATION
 
 
+def _positive_int(value: str, name: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return parsed
+
+
+def _positive_float(value: str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    if not 0 < parsed <= 1:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    return parsed
+
+
+def sync_runtime_profile() -> dict[str, str]:
+    """Resolve the synchronous cases' context, batch, and memory budget.
+
+    The ten concurrent oracle requests must be able to run together, so
+    `--max-num-seqs` cannot drop below their count.
+    """
+    max_num_seqs = os.environ.get(
+        DSV4_SYNC_MAX_NUM_SEQS_ENV,
+        DSV4_MAX_NUM_SEQS,
+    )
+    if _positive_int(max_num_seqs, DSV4_SYNC_MAX_NUM_SEQS_ENV) < (
+        DSV4_CONCURRENT_REQUESTS
+    ):
+        raise ValueError(
+            f"{DSV4_SYNC_MAX_NUM_SEQS_ENV} must be at least "
+            f"{DSV4_CONCURRENT_REQUESTS} for the concurrent oracle",
+        )
+    return {
+        "max_model_len": str(
+            _positive_int(
+                os.environ.get(DSV4_SYNC_MAX_MODEL_LEN_ENV, DSV4_SYNC_MAX_MODEL_LEN),
+                DSV4_SYNC_MAX_MODEL_LEN_ENV,
+            ),
+        ),
+        "max_num_batched_tokens": str(
+            _positive_int(
+                os.environ.get(
+                    DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV,
+                    DSV4_SYNC_MAX_NUM_BATCHED_TOKENS,
+                ),
+                DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV,
+            ),
+        ),
+        "max_num_seqs": str(
+            _positive_int(max_num_seqs, DSV4_SYNC_MAX_NUM_SEQS_ENV),
+        ),
+        "memory_utilization": str(
+            _positive_float(
+                os.environ.get(
+                    DSV4_SYNC_MEMORY_UTILIZATION_ENV,
+                    DSV4_MEMORY_UTILIZATION,
+                ),
+                DSV4_SYNC_MEMORY_UTILIZATION_ENV,
+            ),
+        ),
+    }
+
+
 def _configure_dsv4_arguments(
     args: argparse.Namespace,
     quantization: str | None,
+    *,
+    max_model_len: str = DSV4_MAX_MODEL_LEN,
+    max_num_batched_tokens: str = DSV4_MAX_NUM_BATCHED_TOKENS,
+    max_num_seqs: str = DSV4_MAX_NUM_SEQS,
+    memory_utilization: str = DSV4_MEMORY_UTILIZATION,
 ) -> None:
     """Apply the fixed model arguments shared by every DSV4 scenario.
 
     `quantization` is the `--quantization` value to pass, or None to omit the
-    flag so the checkpoint's own configuration decides.
+    flag so the checkpoint's own configuration decides. The remaining keyword
+    arguments default to the asynchronous case's fixed deployment; the
+    synchronous cases resolve them per host, because the recorded A3 and A5
+    deployments run far smaller context and batch limits than the 16-die
+    asynchronous case.
     """
     if args.completion_output_path is None:
         raise ValueError("--completion-output-path is required for DSV4")
@@ -127,15 +219,15 @@ def _configure_dsv4_arguments(
         "--seed",
         "1024",
         "--max-model-len",
-        "1048576",
+        max_model_len,
         "--max-num-batched-tokens",
-        "8192",
+        max_num_batched_tokens,
         "--max-num-seqs",
-        "16",
+        max_num_seqs,
         "--block-size",
         "128",
         "--gpu-memory-utilization",
-        "0.7",
+        memory_utilization,
         *(["--quantization", quantization] if quantization is not None else []),
         "--tokenizer-mode",
         "deepseek_v4",
@@ -196,7 +288,11 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
             separators=(",", ":"),
         )
     ]
-    _configure_dsv4_arguments(args, sync_camp2p_quantization(args.model))
+    _configure_dsv4_arguments(
+        args,
+        sync_camp2p_quantization(args.model),
+        **sync_runtime_profile(),
+    )
 
 
 def additional_config() -> dict[str, bool]:
