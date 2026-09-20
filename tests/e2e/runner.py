@@ -32,10 +32,8 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_FFN_RANKS,
     DSV4_PROCESS_TERMINATION_TIMEOUT_S,
     DSV4_SCENARIOS,
-    DSV4_SYNC_ATTENTION_RANKS,
-    DSV4_SYNC_ATTENTION_TP_SIZE,
-    DSV4_SYNC_CAMP2P_SCENARIO,
-    DSV4_SYNC_FFN_RANKS,
+    DSV4_SYNC_CAMP2P_SCENARIOS,
+    DSV4_SYNC_SHAPES,
 )
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
@@ -438,13 +436,6 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_ATTENTION_RANKS,
             DSV4_FFN_RANKS,
         ),
-        DSV4_SYNC_CAMP2P_SCENARIO: (
-            False,
-            False,
-            False,
-            DSV4_SYNC_ATTENTION_RANKS,
-            DSV4_SYNC_FFN_RANKS,
-        ),
         "afd-v2-eager-1a1f": (False, False, False, 1, 1),
         "afd-v2-eager-dp2": (False, False, False, 2, 2),
         "afd-v2-eager-tp2": (False, False, False, 2, 2),
@@ -452,6 +443,14 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
     }
+    for sync_scenario, shape in DSV4_SYNC_SHAPES.items():
+        scenario_settings[sync_scenario] = (
+            False,
+            False,
+            False,
+            shape.attention_ranks,
+            shape.ffn_ranks,
+        )
     baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
         args.scenario
     ]
@@ -461,10 +460,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
     args.tp_size = 1
+    sync_shape = DSV4_SYNC_SHAPES.get(args.scenario)
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
-    elif args.scenario == DSV4_SYNC_CAMP2P_SCENARIO:
-        args.attention_tp_size = DSV4_SYNC_ATTENTION_TP_SIZE
+    elif sync_shape is not None:
+        args.attention_tp_size = sync_shape.tp_size
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -473,7 +473,14 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.attention_tp_size = 2
     else:
         args.attention_tp_size = 1
-    args.ffn_tp_size = 2 if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS else 1
+    if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
+        args.ffn_tp_size = 2
+    elif sync_shape is not None:
+        # The synchronous DSV4 shapes are square, so the FFN side shards by the
+        # same tensor-parallel size and never enables expert parallelism.
+        args.ffn_tp_size = sync_shape.tp_size
+    else:
+        args.ffn_tp_size = 1
     args.use_v2_model_runner = args.scenario in V2_SCENARIOS
     if args.use_v2_model_runner:
         if args.afd_async or args.afd_connector == ASYNC_AFD_CONNECTOR:
@@ -534,7 +541,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
-    elif args.scenario == DSV4_SYNC_CAMP2P_SCENARIO:
+    elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
         dsv4_config.configure_sync_camp2p_scenario(args)
     if use_graph:
         args.cudagraph_capture_size = 8
@@ -703,10 +710,18 @@ def build_vllm_command(
         str(role_dp_size),
         "--tensor-parallel-size",
         str(tp_size),
-        "--enable-expert-parallel",
-        "--additional-config",
-        json.dumps(afd_config, separators=(",", ":")),
     ]
+    if args.scenario not in DSV4_SYNC_CAMP2P_SCENARIOS:
+        # The synchronous DSV4 shapes shard DeepSeek V4 by tensor parallel and
+        # keep the expert-parallel world at one: an EP world greater than one
+        # selects MC2 on A5, whose dispatch operator does not tile.
+        cmd.append("--enable-expert-parallel")
+    cmd.extend(
+        [
+            "--additional-config",
+            json.dumps(afd_config, separators=(",", ":")),
+        ],
+    )
     if args.use_v2_model_runner:
         cmd.extend(
             [

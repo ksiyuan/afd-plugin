@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Local NPU DSV4 Flash case over the synchronous CAMP2P boundary.
+"""Local NPU DSV4 Flash cases over the synchronous CAMP2P boundary.
 
-The synchronous connector needs no CAM vendor package: the plugin's own
-a2e/e2a operators carry the activations and, for the DeepSeek V4 Hash layers,
-the token ids that the FFN-side gate routes with.
+DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs
+its smallest workable shape: 2A2F on four dies for A5, and 4A4F on eight dies
+for A3. The synchronous connector needs no CAM vendor package: the plugin's
+own a2e/e2a operators carry the activations and, for the DeepSeek V4 Hash
+layers, the token ids that the FFN-side gate routes with.
 """
 
 from __future__ import annotations
@@ -18,19 +20,16 @@ import pytest
 from tests.conftest import run_runner
 from tests.e2e.environment import devices_from_env, required_env
 from tests.e2e.models.deepseek_v4_flash.config import (
-    DSV4_SYNC_ATTENTION_RANKS,
-    DSV4_SYNC_CAMP2P_SCENARIO,
-    DSV4_SYNC_FFN_RANKS,
+    DSV4_SYNC_CAMP2P_SCENARIOS,
+    DSV4_SYNC_SHAPES,
 )
 
 
-def build_runner_command(output_path: Path) -> list[str]:
+def build_runner_command(scenario: str, output_path: Path) -> list[str]:
+    shape = DSV4_SYNC_SHAPES[scenario]
     if required_env("AFD_E2E_BACKEND") != "npu":
         raise RuntimeError("DSV4 sync CAMP2P E2E requires AFD_E2E_BACKEND=npu")
-    devices = devices_from_env(
-        "AFD_E2E_DEVICES",
-        DSV4_SYNC_ATTENTION_RANKS + DSV4_SYNC_FFN_RANKS,
-    )
+    devices = devices_from_env("AFD_E2E_DEVICES", shape.device_count)
     return [
         sys.executable,
         "-m",
@@ -42,11 +41,11 @@ def build_runner_command(output_path: Path) -> list[str]:
         "--device-backend",
         "npu",
         "--attention-devices",
-        ",".join(devices[:DSV4_SYNC_ATTENTION_RANKS]),
+        ",".join(devices[: shape.attention_ranks]),
         "--ffn-devices",
-        ",".join(devices[DSV4_SYNC_ATTENTION_RANKS:]),
+        ",".join(devices[shape.attention_ranks :]),
         "--scenario",
-        DSV4_SYNC_CAMP2P_SCENARIO,
+        scenario,
         "--served-model-name-prefix",
         "dsv4-flash-sync",
         "--afd-host",
@@ -96,9 +95,9 @@ def build_environment() -> dict[str, str]:
 @pytest.mark.npu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize("scenario", [DSV4_SYNC_CAMP2P_SCENARIO])
+@pytest.mark.parametrize("scenario", DSV4_SYNC_CAMP2P_SCENARIOS)
 def test_deepseek_v4_flash_sync_camp2p(scenario: str, tmp_path: Path) -> None:
     run_runner(
-        build_runner_command(tmp_path / f"{scenario}.json"),
+        build_runner_command(scenario, tmp_path / f"{scenario}.json"),
         env=build_environment(),
     )

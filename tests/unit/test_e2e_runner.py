@@ -23,6 +23,7 @@ from tests.e2e.accuracy import gsm8k as helpers_gsm8k
 from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
+from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
 
@@ -475,7 +476,14 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),
-        (runner.DSV4_SYNC_CAMP2P_SCENARIO, (False, False, False, 1, 1, 1, 1, 1, False)),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A5_SCENARIO,
+            (False, False, False, 2, 2, 1, 2, 2, False),
+        ),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,
+            (False, False, False, 4, 4, 1, 4, 4, False),
+        ),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-eager-tp2", (False, False, False, 2, 2, 1, 2, 2, True)),

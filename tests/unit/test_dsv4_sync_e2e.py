@@ -11,17 +11,39 @@ import pytest
 
 from tests.e2e import runner
 from tests.e2e.models.deepseek_v4_flash import test_sync_camp2p_npu as entrypoint
+from tests.e2e.models.deepseek_v4_flash.config import (
+    DSV4_SYNC_CAMP2P_A3_SCENARIO,
+    DSV4_SYNC_CAMP2P_A5_SCENARIO,
+    DSV4_SYNC_SHAPES,
+)
+
+# (attention DP, attention TP, FFN DP, FFN TP) each shape must produce.
+EXPECTED_PARALLELISM = {
+    DSV4_SYNC_CAMP2P_A5_SCENARIO: ("1", "2", "1", "2"),
+    DSV4_SYNC_CAMP2P_A3_SCENARIO: ("1", "4", "1", "4"),
+}
 
 
-def _arguments(monkeypatch, tmp_path, model: str = "/models/dsv4"):
+def _devices_for(scenario: str) -> str:
+    count = DSV4_SYNC_SHAPES[scenario].device_count
+    return ",".join(str(index) for index in range(count))
+
+
+def _arguments(
+    monkeypatch,
+    tmp_path,
+    *,
+    scenario: str = DSV4_SYNC_CAMP2P_A5_SCENARIO,
+    model: str = "/models/dsv4",
+):
     monkeypatch.setenv("AFD_E2E_BACKEND", "npu")
-    monkeypatch.setenv("AFD_E2E_DEVICES", "0,1")
+    monkeypatch.setenv("AFD_E2E_DEVICES", _devices_for(scenario))
     monkeypatch.setenv("AFD_NPU_E2E_MODEL", model)
     monkeypatch.setenv("HCCL_IF_IP", "192.0.2.1")
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_API_PORT", raising=False)
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_AFD_PORT", raising=False)
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION", raising=False)
-    command = entrypoint.build_runner_command(tmp_path / "responses.json")
+    command = entrypoint.build_runner_command(scenario, tmp_path / "responses.json")
     monkeypatch.setattr(sys, "argv", ["runner", *command[3:]])
     return runner.parse_args()
 
@@ -35,8 +57,9 @@ def _model_with_config(root, quant_method: str | None) -> str:
     return str(root)
 
 
-def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path):
-    args = _arguments(monkeypatch, tmp_path)
+@pytest.mark.parametrize("scenario", sorted(EXPECTED_PARALLELISM))
+def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
+    args = _arguments(monkeypatch, tmp_path, scenario=scenario)
     runner.configure_scenario(args)
     runner.validate_topology(
         args,
@@ -49,7 +72,11 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path):
     assert args.afd_async is False
     assert args.compute_gate_on_attention is False
     assert args.gsm8k_output_path is None
-    for role, dp, tp in (("attention", "1", "1"), ("ffn", "1", "1")):
+    expected = EXPECTED_PARALLELISM[scenario]
+    for role, dp, tp in (
+        ("attention", expected[0], expected[1]),
+        ("ffn", expected[2], expected[3]),
+    ):
         command = runner.build_vllm_command(args, role=role)
         assert command[command.index("--data-parallel-size") + 1] == dp
         assert command[command.index("--tensor-parallel-size") + 1] == tp
@@ -57,7 +84,9 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path):
         assert command[command.index("--max-model-len") + 1] == "1048576"
         assert command[command.index("--quantization") + 1] == "ascend"
         assert "--enforce-eager" in command
-        assert "--enable-expert-parallel" in command
+        # DeepSeek V4 shards by tensor parallel here: an expert-parallel world
+        # greater than one selects MC2 on A5 and does not tile.
+        assert "--enable-expert-parallel" not in command
         assert "--enable-dbo" not in command
         assert "--kv-transfer-config" not in command
         config = json.loads(command[command.index("--additional-config") + 1])
@@ -70,8 +99,8 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path):
             "connector": "CAMP2pAFDConnector",
             "host": "192.0.2.1",
             "port": 6456,
-            "num_attention_ranks": 1,
-            "num_ffn_ranks": 1,
+            "num_attention_ranks": int(expected[0]) * int(expected[1]),
+            "num_ffn_ranks": int(expected[2]) * int(expected[3]),
             "connector_extra_config": {
                 "hccl_buffer_size": 2048,
                 "quant_mode": 0,
@@ -79,16 +108,18 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path):
         }
         env = runner.build_env("0", args, role=role, e2e_run_id="test")
         assert env["VLLM_PLUGINS"] == "ascend,afd"
-        # Attention TP=1 has no TP/SP token split, so the async case's
-        # FlashComm1 setting must not leak into this path.
+        # Attention TP>1 has a TP/SP token split, but this connector path must
+        # not inherit the async case's FlashComm1 setting.
         assert "VLLM_ASCEND_ENABLE_FLASHCOMM1" not in env
 
 
+@pytest.mark.parametrize("scenario", sorted(EXPECTED_PARALLELISM))
 def test_dsv4_sync_main_uses_concurrent_requests_and_longer_cleanup(
     monkeypatch,
     tmp_path,
+    scenario,
 ):
-    args = _arguments(monkeypatch, tmp_path)
+    args = _arguments(monkeypatch, tmp_path, scenario=scenario)
     cleanup_options = {}
     evaluations = []
     process = SimpleNamespace(pid=123, poll=lambda: None)
@@ -121,12 +152,35 @@ def test_dsv4_sync_main_uses_concurrent_requests_and_longer_cleanup(
     assert cleanup_options["deferred_sigkill_pgids"] == ()
 
 
-@pytest.mark.parametrize("devices", ["0", "0,0"])
-def test_dsv4_sync_entrypoint_rejects_wrong_devices(monkeypatch, tmp_path, devices):
-    _arguments(monkeypatch, tmp_path)
-    monkeypatch.setenv("AFD_E2E_DEVICES", devices)
-    with pytest.raises(RuntimeError, match="exactly 2 devices|devices must be unique"):
-        entrypoint.build_runner_command(tmp_path / "responses.json")
+@pytest.mark.parametrize("scenario", sorted(EXPECTED_PARALLELISM))
+def test_dsv4_sync_entrypoint_rejects_wrong_devices(monkeypatch, tmp_path, scenario):
+    count = DSV4_SYNC_SHAPES[scenario].device_count
+    wrong_counts = [
+        ",".join(str(index) for index in range(count - 1)),
+        ",".join(str(index) for index in range(count + 1)),
+    ]
+    for devices in [*wrong_counts, ",".join(["0"] * count)]:
+        _arguments(monkeypatch, tmp_path, scenario=scenario)
+        monkeypatch.setenv("AFD_E2E_DEVICES", devices)
+        with pytest.raises(
+            RuntimeError,
+            match=rf"exactly {count} devices|devices must be unique",
+        ):
+            entrypoint.build_runner_command(scenario, tmp_path / "responses.json")
+
+
+def test_dsv4_sync_scenarios_reject_each_others_device_count(monkeypatch, tmp_path):
+    """The two shapes are host-specific; the other host's list must fail."""
+    a5_count = DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A5_SCENARIO].device_count
+    a3_count = DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO].device_count
+    assert a5_count != a3_count
+    _arguments(monkeypatch, tmp_path, scenario=DSV4_SYNC_CAMP2P_A5_SCENARIO)
+    monkeypatch.setenv("AFD_E2E_DEVICES", _devices_for(DSV4_SYNC_CAMP2P_A3_SCENARIO))
+    with pytest.raises(RuntimeError, match=rf"exactly {a5_count} devices"):
+        entrypoint.build_runner_command(
+            DSV4_SYNC_CAMP2P_A5_SCENARIO,
+            tmp_path / "responses.json",
+        )
 
 
 @pytest.mark.parametrize(
@@ -140,12 +194,29 @@ def test_dsv4_sync_rejects_deployment_overrides(monkeypatch, tmp_path, field):
 
 
 @pytest.mark.parametrize("backend", ["gpu", "cpu"])
-def test_dsv4_sync_rejects_non_npu_backends(monkeypatch, tmp_path, backend):
-    args = _arguments(monkeypatch, tmp_path)
+@pytest.mark.parametrize("scenario", sorted(EXPECTED_PARALLELISM))
+def test_dsv4_sync_rejects_non_npu_backends(
+    monkeypatch,
+    tmp_path,
+    scenario,
+    backend,
+):
+    args = _arguments(monkeypatch, tmp_path, scenario=scenario)
     args.device_backend = backend
     runner.configure_scenario(args)
+    shape = DSV4_SYNC_SHAPES[scenario]
     with pytest.raises(ValueError, match="require NPU"):
-        runner.validate_topology(args, ["0"], ["1"])
+        runner.validate_topology(
+            args,
+            [str(index) for index in range(shape.attention_ranks)],
+            [
+                str(index)
+                for index in range(
+                    shape.attention_ranks,
+                    shape.attention_ranks + shape.ffn_ranks,
+                )
+            ],
+        )
 
 
 def test_dsv4_sync_omits_quantization_for_a_declaring_checkpoint(monkeypatch, tmp_path):

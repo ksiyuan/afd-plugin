@@ -195,15 +195,25 @@ Defaults: API ports 19280/19281, AFD rendezvous port 6455, startup timeout
 `AFD_NPU_E2E_VLLM_BIN` selects the executable. Build the plugin-owned 910C
 operators before running. Model and all sixteen device IDs must be supplied explicitly; missing setup fails rather than skips.
 
-## DSV4 Flash sync CAMP2P concurrent requests (local, 2 NPUs)
+## DSV4 Flash sync CAMP2P concurrent requests (local, 4 or 8 NPUs)
 
-`afd-dsv4-flash-sync-camp2p-1a1f` runs one Attention rank and one FFN rank
-over the synchronous `CAMP2pAFDConnector`, which needs no CAM vendor package:
-the plugin's own a2e/e2a operators carry the activations and the DeepSeek V4
-Hash-layer token ids. Build them for the target SOC before running, for
-example `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=ascend950 python -m pip install -v
---no-build-isolation --no-deps -e .`. On A5 keep the expert-parallel world
-size at one, as this case does.
+Two local-only scenarios run DeepSeek V4 Flash over the synchronous
+`CAMP2pAFDConnector`, which needs no CAM vendor package: the plugin's own
+a2e/e2a operators carry the activations and the DeepSeek V4 Hash-layer token
+ids.
+
+| Scenario | Host | Shape | Devices |
+| --- | --- | --- | --- |
+| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP1/TP2 + FFN DP1/TP2 | 4 |
+| `afd-dsv4-flash-sync-camp2p-4a4f` | A3 (Ascend 910C) | Attention DP1/TP4 + FFN DP1/TP4 | 8 |
+
+DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs
+its smallest workable shape, and the ranks are tensor-parallel shards with the
+expert-parallel world left at one: an EP world greater than one selects MC2 on
+A5, whose dispatch operator does not tile. Build the operators for the target
+SOC before running — `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=ascend950` on A5 and
+`SOC_VERSION=910c` on A3 — with `python -m pip install -v
+--no-build-isolation --no-deps -e .`.
 
 The fixed deployment uses eager execution, MBT=8192, max-model-len=1048576,
 max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024. Both
@@ -212,12 +222,11 @@ stays on FFN — CAMP2P rejects `compute_gate_on_attention=true` — and
 `connector_extra_config` carries only `hccl_buffer_size=2048` and
 `quant_mode=0`. Prefix caching, native DBO, and KV transfer are not enabled.
 
-This case runs on both A3 and A5. `--quantization ascend` is passed only when
-the checkpoint does not declare another method in its own `config.json`: the
-A3 int8 W8A8 checkpoint is loaded through the Ascend method, while the A5
-FP8/W4A8 checkpoint declares `fp8` and vLLM rejects that mismatch. Set
-`AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` to force a value, or to `none` to omit
-the flag and let the checkpoint decide.
+`--quantization ascend` is passed only when the checkpoint does not declare
+another method in its own `config.json`: the A3 int8 W8A8 checkpoint is loaded
+through the Ascend method, while the A5 FP8/W4A8 checkpoint declares `fp8` and
+vLLM rejects that mismatch. Set `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` to force a
+value, or to `none` to omit the flag and let the checkpoint decide.
 
 The concurrent oracle and its assertions match the async case: ten chat
 requests ask for `12 + 7` through `21 + 7` with temperature=0, thinking=false,
@@ -228,19 +237,25 @@ the async FFN cleanup exception, because no CAM receive is pending.
 
 ```bash
 export AFD_E2E_BACKEND=npu
-export AFD_E2E_DEVICES=0,1
 export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash
 export HCCL_IF_IP=<local-communication-ip>
 export HCCL_SOCKET_IFNAME=eth0
+# A5: four dies
+export AFD_E2E_DEVICES=0,1,2,3
 python -m pytest -q -s \
-  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-1a1f]'
+  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-2a2f]'
+# A3: eight dies
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7
+python -m pytest -q -s \
+  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-4a4f]'
 ```
 
 Defaults: API ports 19380/19381, AFD rendezvous port 6456, startup timeout
 1800 seconds. Override these using `AFD_NPU_DSV4_SYNC_E2E_API_PORT`,
 `AFD_NPU_DSV4_SYNC_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
-`AFD_NPU_E2E_VLLM_BIN` selects the executable. Model and both device IDs must
-be supplied explicitly; missing setup fails rather than skips.
+`AFD_NPU_E2E_VLLM_BIN` selects the executable. The model and exactly the
+scenario's device count must be supplied; a list sized for the other shape
+fails rather than skips.
 
 ## Run with the Codex skill
 
