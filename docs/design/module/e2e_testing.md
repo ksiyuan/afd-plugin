@@ -26,7 +26,9 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
   - "tests/unit/test_dsv4_e2e.py"
+  - "tests/unit/test_dsv4_sync_e2e.py"
   - "tests/e2e/environment.py"
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
@@ -139,6 +141,19 @@ interruption, before the runner tears down services. Model-specific fixed
 settings live alongside the model entrypoint. It does not run
 GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
 FFN cleanup exception above and is not selected by the four-device PR gate.
+
+`afd-dsv4-flash-sync-camp2p-1a1f` is the synchronous sibling of that case: a
+local-only DSV4 Flash run over `CAMP2pAFDConnector` on two Ascend NPUs, one
+Attention rank and one FFN rank, eager. It needs no CAM vendor package — the
+plugin's own a2e/e2a operators carry both the activations and, for the DSV4
+Hash layers, the token ids the FFN-side gate routes with — so it is the
+transport available on both A3 and A5 once the ops are built for the target
+SOC. Because CAMP2P rejects gate-on-Attention and any nonzero CAM
+quantization mode, the gate stays on FFN and `connector_extra_config` carries
+only `hccl_buffer_size` and `quant_mode=0`. It reuses the ten-request
+concurrent oracle of the async case, takes the same 60-second shutdown grace,
+and deliberately does **not** take the async FFN cleanup exception: no CAM
+receive is pending on this path.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,

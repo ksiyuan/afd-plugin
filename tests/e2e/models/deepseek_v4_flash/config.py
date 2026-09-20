@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Fixed DSV4 Flash async CAM deployment and acceptance parameters."""
+"""Fixed DSV4 Flash deployment and acceptance parameters.
+
+Two transports are covered: the asynchronous CAM connector, and the
+synchronous CAMP2P connector, which needs no CAM vendor package.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +12,21 @@ import argparse
 import json
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
+DSV4_SYNC_CAMP2P_SCENARIO = "afd-dsv4-flash-sync-camp2p-1a1f"
+DSV4_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, DSV4_SYNC_CAMP2P_SCENARIO)
 DSV4_ATTENTION_RANKS = 8
 DSV4_FFN_RANKS = 8
 DSV4_ATTENTION_TP_SIZE = 4
+# The synchronous path runs the one-Attention/one-FFN split the A5 and A3
+# bring-up validated: no expert-parallel world for the FFN side to tile.
+DSV4_SYNC_ATTENTION_RANKS = 1
+DSV4_SYNC_FFN_RANKS = 1
+DSV4_SYNC_ATTENTION_TP_SIZE = 1
+DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
+# CAMP2P sizes its AFD HCCL domains through this override; the A5 and A3 runs
+# used 2048 MB. quant_mode stays 0, the only mode the runtime accepts today.
+DSV4_SYNC_HCCL_BUFFER_SIZE_MB = 2048
+DSV4_SYNC_QUANT_MODE = 0
 DSV4_CONCURRENT_REQUESTS = 10
 DSV4_REQUEST_TIMEOUT_S = 300
 DSV4_COMPLETION_MAX_TOKENS = 256
@@ -21,25 +37,12 @@ DSV4_PROMPT_SECOND_OPERAND = 7
 DSV4_PROCESS_TERMINATION_TIMEOUT_S = 60
 
 
-def configure_scenario(args: argparse.Namespace) -> None:
+def _configure_dsv4_arguments(args: argparse.Namespace) -> None:
+    """Apply the fixed model arguments shared by every DSV4 scenario."""
     if args.completion_output_path is None:
         raise ValueError("--completion-output-path is required for DSV4")
-    args.afd_connector = "CAMAsyncAFDConnector"
-    args.afd_async = True
-    args.compute_gate_on_attention = True
-    args.afd_connector_extra_config = [
-        json.dumps(
-            {
-                "dynamicQuant": 1,
-                "attn_ranks_per_dp": DSV4_ATTENTION_TP_SIZE,
-                "async_moe_ubatching": True,
-                "async_moe_num_ubatches": 2,
-                "async_moe_split": "token",
-            }
-        )
-    ]
-    # Keep this local 16-NPU case aligned with the DSV4 prefill scripts.
-    # Reject ad-hoc overrides so its case ID denotes one fixed deployment.
+    # Keep these local cases aligned with the DSV4 prefill scripts.
+    # Reject ad-hoc overrides so a case ID denotes one fixed deployment.
     if args.common_vllm_arg or args.attention_vllm_arg or args.ffn_vllm_arg:
         raise ValueError("DSV4 scenario does not accept extra vLLM arguments")
     if args.use_decode_bench_connector:
@@ -79,6 +82,46 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "--reasoning-parser",
         "deepseek_v4",
     ]
+
+
+def configure_scenario(args: argparse.Namespace) -> None:
+    """Configure the 16-NPU asynchronous CAM deployment."""
+    args.afd_connector = "CAMAsyncAFDConnector"
+    args.afd_async = True
+    args.compute_gate_on_attention = True
+    args.afd_connector_extra_config = [
+        json.dumps(
+            {
+                "dynamicQuant": 1,
+                "attn_ranks_per_dp": DSV4_ATTENTION_TP_SIZE,
+                "async_moe_ubatching": True,
+                "async_moe_num_ubatches": 2,
+                "async_moe_split": "token",
+            }
+        )
+    ]
+    _configure_dsv4_arguments(args)
+
+
+def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
+    """Configure the two-NPU synchronous CAMP2P deployment.
+
+    CAMP2P carries the Hash-layer token ids over the a2e ids channel, so the
+    gate stays on FFN and no CAM vendor package is involved.
+    """
+    args.afd_connector = DSV4_SYNC_CAMP2P_CONNECTOR
+    args.afd_async = False
+    args.compute_gate_on_attention = False
+    args.afd_connector_extra_config = [
+        json.dumps(
+            {
+                "hccl_buffer_size": DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
+                "quant_mode": DSV4_SYNC_QUANT_MODE,
+            },
+            separators=(",", ":"),
+        )
+    ]
+    _configure_dsv4_arguments(args)
 
 
 def additional_config() -> dict[str, bool]:
