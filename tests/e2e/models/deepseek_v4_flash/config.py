@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_SYNC_CAMP2P_SCENARIO = "afd-dsv4-flash-sync-camp2p-1a1f"
@@ -27,6 +29,12 @@ DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
 # used 2048 MB. quant_mode stays 0, the only mode the runtime accepts today.
 DSV4_SYNC_HCCL_BUFFER_SIZE_MB = 2048
 DSV4_SYNC_QUANT_MODE = 0
+DSV4_ASCEND_QUANTIZATION = "ascend"
+# `--quantization none` means "pass no --quantization at all" and let the
+# checkpoint's own quantization_config decide. The A5 FP8/W4A8 checkpoint
+# needs that; the A3 int8 W8A8 one is loaded through the Ascend method.
+DSV4_CHECKPOINT_QUANTIZATION = "none"
+DSV4_SYNC_QUANTIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION"
 DSV4_CONCURRENT_REQUESTS = 10
 DSV4_REQUEST_TIMEOUT_S = 300
 DSV4_COMPLETION_MAX_TOKENS = 256
@@ -37,8 +45,50 @@ DSV4_PROMPT_SECOND_OPERAND = 7
 DSV4_PROCESS_TERMINATION_TIMEOUT_S = 60
 
 
-def _configure_dsv4_arguments(args: argparse.Namespace) -> None:
-    """Apply the fixed model arguments shared by every DSV4 scenario."""
+def _declared_quant_method(model: str) -> str | None:
+    """Return the quantization method the checkpoint config declares, if any."""
+    try:
+        config = json.loads((Path(model) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    quantization_config = config.get("quantization_config")
+    if not isinstance(quantization_config, dict):
+        return None
+    method = quantization_config.get("quant_method")
+    return method if isinstance(method, str) and method else None
+
+
+def sync_camp2p_quantization(model: str) -> str | None:
+    """Resolve the `--quantization` value the synchronous case should pass.
+
+    vLLM rejects `--quantization ascend` against a checkpoint that declares a
+    different method, which is what the A5 FP8/W4A8 checkpoint does, while the
+    A3 int8 W8A8 checkpoint is loaded through the Ascend method. Pass `ascend`
+    unless the checkpoint declares another method; an explicit
+    `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` overrides either way, and `none`
+    omits the flag entirely.
+    """
+    override = os.environ.get(DSV4_SYNC_QUANTIZATION_ENV)
+    if override is not None:
+        value = override.strip()
+        if not value or value.lower() == DSV4_CHECKPOINT_QUANTIZATION:
+            return None
+        return value
+    declared = _declared_quant_method(model)
+    if declared is not None and declared != DSV4_ASCEND_QUANTIZATION:
+        return None
+    return DSV4_ASCEND_QUANTIZATION
+
+
+def _configure_dsv4_arguments(
+    args: argparse.Namespace,
+    quantization: str | None,
+) -> None:
+    """Apply the fixed model arguments shared by every DSV4 scenario.
+
+    `quantization` is the `--quantization` value to pass, or None to omit the
+    flag so the checkpoint's own configuration decides.
+    """
     if args.completion_output_path is None:
         raise ValueError("--completion-output-path is required for DSV4")
     # Keep these local cases aligned with the DSV4 prefill scripts.
@@ -62,8 +112,7 @@ def _configure_dsv4_arguments(args: argparse.Namespace) -> None:
         "128",
         "--gpu-memory-utilization",
         "0.7",
-        "--quantization",
-        "ascend",
+        *(["--quantization", quantization] if quantization is not None else []),
         "--tokenizer-mode",
         "deepseek_v4",
         "--model-loader-extra-config",
@@ -100,7 +149,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
             }
         )
     ]
-    _configure_dsv4_arguments(args)
+    _configure_dsv4_arguments(args, DSV4_ASCEND_QUANTIZATION)
 
 
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
@@ -121,7 +170,7 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
             separators=(",", ":"),
         )
     ]
-    _configure_dsv4_arguments(args)
+    _configure_dsv4_arguments(args, sync_camp2p_quantization(args.model))
 
 
 def additional_config() -> dict[str, bool]:

@@ -212,6 +212,13 @@ stays on FFN — CAMP2P rejects `compute_gate_on_attention=true` — and
 `connector_extra_config` carries only `hccl_buffer_size=2048` and
 `quant_mode=0`. Prefix caching, native DBO, and KV transfer are not enabled.
 
+This case runs on both A3 and A5. `--quantization ascend` is passed only when
+the checkpoint does not declare another method in its own `config.json`: the
+A3 int8 W8A8 checkpoint is loaded through the Ascend method, while the A5
+FP8/W4A8 checkpoint declares `fp8` and vLLM rejects that mismatch. Set
+`AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` to force a value, or to `none` to omit
+the flag and let the checkpoint decide.
+
 The concurrent oracle and its assertions match the async case: ten chat
 requests ask for `12 + 7` through `21 + 7` with temperature=0, thinking=false,
 and max_tokens=256; every response must contain one nonempty answer and finish
