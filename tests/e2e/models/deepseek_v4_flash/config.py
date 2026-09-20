@@ -12,18 +12,42 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
-DSV4_SYNC_CAMP2P_SCENARIO = "afd-dsv4-flash-sync-camp2p-1a1f"
-DSV4_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, DSV4_SYNC_CAMP2P_SCENARIO)
+DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
+DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-4a4f"
+DSV4_SYNC_CAMP2P_SCENARIOS = (
+    DSV4_SYNC_CAMP2P_A5_SCENARIO,
+    DSV4_SYNC_CAMP2P_A3_SCENARIO,
+)
+DSV4_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, *DSV4_SYNC_CAMP2P_SCENARIOS)
 DSV4_ATTENTION_RANKS = 8
 DSV4_FFN_RANKS = 8
 DSV4_ATTENTION_TP_SIZE = 4
-# The synchronous path runs the one-Attention/one-FFN split the A5 and A3
-# bring-up validated: no expert-parallel world for the FFN side to tile.
-DSV4_SYNC_ATTENTION_RANKS = 1
-DSV4_SYNC_FFN_RANKS = 1
-DSV4_SYNC_ATTENTION_TP_SIZE = 1
+
+
+# DeepSeek V4 does not fit on one Attention or one FFN die: A5 needs at least
+# 2A2F and A3 at least 4A4F. Both shapes are square, so the rank count is the
+# tensor-parallel size. The expert-parallel world stays at one — an EP world
+# greater than one selects MC2 on A5, whose dispatch operator does not tile
+# (docs/npu/A5_BRINGUP_NOTES.md).
+class DSV4SyncShape(NamedTuple):
+    """Fixed synchronous CAMP2P deployment shape for one host class."""
+
+    attention_ranks: int
+    ffn_ranks: int
+    tp_size: int
+
+    @property
+    def device_count(self) -> int:
+        return self.attention_ranks + self.ffn_ranks
+
+
+DSV4_SYNC_SHAPES = {
+    DSV4_SYNC_CAMP2P_A5_SCENARIO: DSV4SyncShape(2, 2, 2),
+    DSV4_SYNC_CAMP2P_A3_SCENARIO: DSV4SyncShape(4, 4, 4),
+}
 DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
 # CAMP2P sizes its AFD HCCL domains through this override; the A5 and A3 runs
 # used 2048 MB. quant_mode stays 0, the only mode the runtime accepts today.
@@ -153,10 +177,12 @@ def configure_scenario(args: argparse.Namespace) -> None:
 
 
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
-    """Configure the two-NPU synchronous CAMP2P deployment.
+    """Configure a synchronous CAMP2P deployment.
 
-    CAMP2P carries the Hash-layer token ids over the a2e ids channel, so the
-    gate stays on FFN and no CAM vendor package is involved.
+    The caller selects the A5 (2A2F) or A3 (4A4F) shape through the scenario;
+    the connector settings are the same for both. CAMP2P carries the Hash-layer
+    token ids over the a2e ids channel, so the gate stays on FFN and no CAM
+    vendor package is involved.
     """
     args.afd_connector = DSV4_SYNC_CAMP2P_CONNECTOR
     args.afd_async = False
