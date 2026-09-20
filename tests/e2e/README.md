@@ -195,6 +195,46 @@ Defaults: API ports 19280/19281, AFD rendezvous port 6455, startup timeout
 `AFD_NPU_E2E_VLLM_BIN` selects the executable. Build the plugin-owned 910C
 operators before running. Model and all sixteen device IDs must be supplied explicitly; missing setup fails rather than skips.
 
+## DSV4 Flash sync CAMP2P concurrent requests (local, 2 NPUs)
+
+`afd-dsv4-flash-sync-camp2p-1a1f` runs one Attention rank and one FFN rank
+over the synchronous `CAMP2pAFDConnector`, which needs no CAM vendor package:
+the plugin's own a2e/e2a operators carry the activations and the DeepSeek V4
+Hash-layer token ids. Build them for the target SOC before running, for
+example `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=ascend950 python -m pip install -v
+--no-build-isolation --no-deps -e .`. On A5 keep the expert-parallel world
+size at one, as this case does.
+
+The fixed deployment uses eager execution, MBT=8192, max-model-len=1048576,
+max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024. Both
+roles explicitly disable `enable_dsv4_shared_compressor_workspace`. The gate
+stays on FFN — CAMP2P rejects `compute_gate_on_attention=true` — and
+`connector_extra_config` carries only `hccl_buffer_size=2048` and
+`quant_mode=0`. Prefix caching, native DBO, and KV transfer are not enabled.
+
+The concurrent oracle and its assertions match the async case: ten chat
+requests ask for `12 + 7` through `21 + 7` with temperature=0, thinking=false,
+and max_tokens=256; every response must contain one nonempty answer and finish
+with `stop`. Service liveness and owned-process cleanup must pass, with 60
+seconds allowed for shutdown before escalation. This path does **not** take
+the async FFN cleanup exception, because no CAM receive is pending.
+
+```bash
+export AFD_E2E_BACKEND=npu
+export AFD_E2E_DEVICES=0,1
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash
+export HCCL_IF_IP=<local-communication-ip>
+export HCCL_SOCKET_IFNAME=eth0
+python -m pytest -q -s \
+  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-1a1f]'
+```
+
+Defaults: API ports 19380/19381, AFD rendezvous port 6456, startup timeout
+1800 seconds. Override these using `AFD_NPU_DSV4_SYNC_E2E_API_PORT`,
+`AFD_NPU_DSV4_SYNC_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
+`AFD_NPU_E2E_VLLM_BIN` selects the executable. Model and both device IDs must
+be supplied explicitly; missing setup fails rather than skips.
+
 ## Run with the Codex skill
 
 The repository includes the [`run-e2e`](../../.agents/skills/run-e2e/SKILL.md)

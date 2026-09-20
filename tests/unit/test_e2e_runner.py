@@ -475,6 +475,7 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),
+        (runner.DSV4_SYNC_CAMP2P_SCENARIO, (False, False, False, 1, 1, 1, 1, 1, False)),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-eager-tp2", (False, False, False, 2, 2, 1, 2, 2, True)),

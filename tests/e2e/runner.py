@@ -31,6 +31,11 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ATTENTION_TP_SIZE,
     DSV4_FFN_RANKS,
     DSV4_PROCESS_TERMINATION_TIMEOUT_S,
+    DSV4_SCENARIOS,
+    DSV4_SYNC_ATTENTION_RANKS,
+    DSV4_SYNC_ATTENTION_TP_SIZE,
+    DSV4_SYNC_CAMP2P_SCENARIO,
+    DSV4_SYNC_FFN_RANKS,
 )
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
@@ -200,7 +205,7 @@ def main() -> int:
 
         if args.scenario == ASYNC_CAM_SCENARIO:
             run_completion_evaluation(args)
-        elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+        elif args.scenario in DSV4_SCENARIOS:
             run_concurrent_completion_evaluation(args)
         else:
             if args.enable_dbo:
@@ -227,7 +232,7 @@ def main() -> int:
                         processes,
                         termination_timeout_s=(
                             DSV4_PROCESS_TERMINATION_TIMEOUT_S
-                            if args.scenario == DSV4_ASYNC_CAM_SCENARIO
+                            if args.scenario in DSV4_SCENARIOS
                             else PROCESS_TERMINATION_TIMEOUT_S
                         ),
                         deferred_sigkill_pgids=deferred_sigkill_pgids,
@@ -295,7 +300,7 @@ def parse_args() -> argparse.Namespace:
             "afd-graph-dbo-2a2f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
+            *DSV4_SCENARIOS,
             *V2_SCENARIOS,
         ],
         required=True,
@@ -403,7 +408,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     """Set topology and features for the selected fixed scenario."""
     is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
     is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
-    is_dsv4 = args.scenario == DSV4_ASYNC_CAM_SCENARIO
+    is_dsv4 = args.scenario in DSV4_SCENARIOS
     scenario_settings = {
         "baseline-graph": (True, True, False, 4, 0),
         "afd-eager-2a1f": (False, False, False, 2, 1),
@@ -433,6 +438,13 @@ def configure_scenario(args: argparse.Namespace) -> None:
             DSV4_ATTENTION_RANKS,
             DSV4_FFN_RANKS,
         ),
+        DSV4_SYNC_CAMP2P_SCENARIO: (
+            False,
+            False,
+            False,
+            DSV4_SYNC_ATTENTION_RANKS,
+            DSV4_SYNC_FFN_RANKS,
+        ),
         "afd-v2-eager-1a1f": (False, False, False, 1, 1),
         "afd-v2-eager-dp2": (False, False, False, 2, 2),
         "afd-v2-eager-tp2": (False, False, False, 2, 2),
@@ -449,8 +461,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
     args.tp_size = 1
-    if is_dsv4:
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
+    elif args.scenario == DSV4_SYNC_CAMP2P_SCENARIO:
+        args.attention_tp_size = DSV4_SYNC_ATTENTION_TP_SIZE
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -518,8 +532,10 @@ def configure_scenario(args: argparse.Namespace) -> None:
             for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
-    if is_dsv4:
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
+    elif args.scenario == DSV4_SYNC_CAMP2P_SCENARIO:
+        dsv4_config.configure_sync_camp2p_scenario(args)
     if use_graph:
         args.cudagraph_capture_size = 8
     if enable_dbo:
@@ -570,15 +586,12 @@ def validate_topology(
     if args.use_v2_model_runner and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
     if (
-        args.scenario
-        in (
-            ASYNC_CAM_SCENARIO,
-            ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
-        )
+        args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
         and args.device_backend != "npu"
     ):
         raise ValueError("async CAM scenarios require NPU")
+    if args.scenario in DSV4_SCENARIOS and args.device_backend != "npu":
+        raise ValueError("DSV4 scenarios require NPU")
     for role, rank_count in (
         ("attention", args.num_attention_ranks),
         ("ffn", args.num_ffn_ranks),
@@ -676,7 +689,7 @@ def build_vllm_command(
     )
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_SCENARIOS:
         afd_config.update(dsv4_config.additional_config())
     cmd = [
         args.vllm_bin,
