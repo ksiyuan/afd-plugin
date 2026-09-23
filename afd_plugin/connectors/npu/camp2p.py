@@ -28,6 +28,7 @@ from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.a2e_layout import (
+    attention_rank_token_counts,
     ffn_rank_for_attention_rank,
     ffn_receive_rows,
     padded_tile_rows,
@@ -636,7 +637,15 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         # Rows this rank's payload holds, from the count snapshot rather than from
         # the payload tensor: a traced or padded step reports its rows through the
         # graph, and reading a symbol there is what makes the compiled path fail.
-        payload_rows = self._own_reported_rows(stage_idx)
+        own_counts = attention_rank_token_counts(
+            self.dp_token_counts.get(stage_idx, ()),
+            attention_size=self.attn_size,
+        )
+        payload_rows = (
+            None
+            if own_counts is None or self.role_rank >= len(own_counts)
+            else own_counts[self.role_rank]
+        )
         graph_rows = _reported_attention_tokens(forward_context)
         if graph_rows is not None:
             # A graph step sends the rows its captured graph holds and cannot pad
