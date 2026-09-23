@@ -28,11 +28,9 @@ from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from afd_plugin.a2e_layout import (
-    attention_rank_token_counts,
-    attention_tile_rows,
-    fallback_tile_rows,
     ffn_rank_for_attention_rank,
     ffn_receive_rows,
+    padded_tile_rows,
 )
 from afd_plugin.compat.npu import ensure_cam_p2p_ops_available
 from afd_plugin.config import AFDConfig
@@ -582,30 +580,14 @@ class CAMP2pAFDConnector(AFDConnectorBase):
             ffn_size=self.ffn_size,
         )
         if ffn_rank is None:
-            return fallback_tile_rows(fallback=self.max_num_tokens)
-        return attention_tile_rows(
+            return max(1, self.max_num_tokens)
+        return padded_tile_rows(
             stage_token_counts,
             ffn_rank=ffn_rank,
             attention_size=self.attn_size,
             ffn_size=self.ffn_size,
             fallback=self.max_num_tokens,
         )
-
-    def _own_reported_rows(self, stage_idx: int) -> int | None:
-        """Return the token count reported for this Attention rank, or ``None``.
-
-        Only the connector's integer snapshot of the counts is read, never the
-        tensors themselves: this runs inside the traced model forward, where the
-        DP tensors are symbolic and any comparison against them fails.
-        """
-
-        counts = attention_rank_token_counts(
-            self.dp_token_counts.get(stage_idx, ()),
-            attention_size=self.attn_size,
-        )
-        if counts is None or self.role_rank >= len(counts):
-            return None
-        return counts[self.role_rank]
 
     def send_attn_output(
         self,
@@ -659,18 +641,13 @@ class CAMP2pAFDConnector(AFDConnectorBase):
         if graph_rows is not None:
             # A graph step sends the rows its captured graph holds and cannot pad
             # them, so the tile the FFN rank sizes its receive with has to be
-            # exactly those rows. Every Attention peer of that FFN rank derives the
-            # tile from the published counts, so a peer that reports a different
-            # count is a step this layout cannot represent -- and one A2E reads
-            # past, into that peer's activations.
+            # exactly those rows.
             if graph_rows != int(wire_rows):
                 raise RuntimeError(
                     f"CAMP2P Attention rank {self.role_rank} sends the {graph_rows} "
                     f"rows of its graph while this step's A2E tile is {wire_rows} "
                     f"rows (layer={metadata.layer_idx}, stage={stage_idx}, "
-                    f"dp_counts={self.dp_token_counts.get(stage_idx, ())}). A graph "
-                    "step cannot pad its payload, so the Attention peers of one FFN "
-                    "rank have to run the same padded token count.",
+                    f"dp_counts={self.dp_token_counts.get(stage_idx, ())}).",
                 )
             padded_payload = False
         else:

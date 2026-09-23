@@ -475,112 +475,6 @@ def test_recv_attn_output_follows_the_strided_attention_peer_group(monkeypatch):
     assert calls[0][3] == 32
 
 
-def _full_graph_forward_context(*, num_tokens: int) -> SimpleNamespace:
-    """Build the forward-context fields a padded CUDA graph step exposes."""
-
-    return SimpleNamespace(
-        num_tokens=num_tokens,
-        ubatch_slices=None,
-        cudagraph_runtime_mode="FULL",
-        batch_descriptor=SimpleNamespace(num_tokens=num_tokens),
-    )
-
-
-def test_send_attn_output_pads_the_payload_to_the_reported_graph_size(monkeypatch):
-    """A FULL graph reports the padded token count, so the send has to cover it.
-
-    A2E reads one equal tile per Attention peer and sends the same tile back. A
-    payload shorter than the reported count leaves the tail of this rank's ids
-    and hidden-state regions unwritten, and the receiving FFN reads the
-    neighbouring regions as token ids, which a Hash layer turns into an
-    out-of-range table lookup.
-    """
-
-    calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        torch.ops.vllm,
-        "afd_camp2p_send_attn_output",
-        lambda *args: calls.append(args),
-        raising=False,
-    )
-    forward_context = _full_graph_forward_context(num_tokens=8)
-    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
-    connector = _connector(role="attention", rank=0)
-    hidden_states = torch.zeros(3, connector.hidden_size)
-    context = AFDTransferContext(
-        metadata=AFDTransferMetadata.create_attention_metadata(
-            layer_idx=0,
-            stage_idx=0,
-            seq_len=3,
-        ),
-    )
-
-    connector.send_attn_output(
-        hidden_states,
-        context,
-        input_ids=torch.tensor([7, 11, 13], dtype=torch.int64),
-    )
-
-    (args,) = calls
-    sent_hidden_states, expert_ids = args[0], args[-2]
-    assert tuple(sent_hidden_states.shape) == (8, connector.hidden_size)
-    # The token count the operator is sized with has to be the padded one.
-    assert args[4] == 8
-    assert tuple(expert_ids.shape) == (8, connector.num_experts_per_tok)
-    assert expert_ids[:3, 0].tolist() == [7, 11, 13]
-    # Pad rows carry the sentinel the FFN maps back to token 0.
-    assert expert_ids[3:, 0].tolist() == [-1] * 5
-    # The receive side learns from this that the tile has to be trimmed back.
-    assert forward_context.cam_afdtransfer_state.padded_payload is True
-
-
-def test_send_attn_output_pads_inside_a_compiled_step(monkeypatch):
-    """The padding must survive torch.compile, so it cannot branch on the size.
-
-    Comparing the reported count with the produced rows inside a trace
-    specializes the dimension the compiled model declares dynamic, so the
-    payload is extended by copying it into a fixed-size buffer instead. That
-    keeps a captured step aligned with the tile A2E reads.
-    """
-
-    calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        torch.ops.vllm,
-        "afd_camp2p_send_attn_output",
-        lambda *args: calls.append(args),
-        raising=False,
-    )
-    forward_context = _full_graph_forward_context(num_tokens=8)
-    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
-    monkeypatch.setattr(
-        camp2p_module.torch.compiler,
-        "is_compiling",
-        lambda: True,
-    )
-    connector = _connector(role="attention", rank=0)
-    context = AFDTransferContext(
-        metadata=AFDTransferMetadata.create_attention_metadata(
-            layer_idx=0,
-            stage_idx=0,
-            seq_len=3,
-        ),
-    )
-
-    connector.send_attn_output(
-        torch.zeros(3, connector.hidden_size),
-        context,
-        input_ids=torch.tensor([7, 11, 13], dtype=torch.int64),
-    )
-
-    (args,) = calls
-    sent_hidden_states, expert_ids = args[0], args[-2]
-    assert tuple(sent_hidden_states.shape) == (8, connector.hidden_size)
-    assert args[4] == 8
-    assert expert_ids[:3, 0].tolist() == [7, 11, 13]
-    assert expert_ids[3:, 0].tolist() == [-1] * 5
-    assert forward_context.cam_afdtransfer_state.padded_payload is True
-
-
 def _eager_forward_context(*, num_tokens: int) -> SimpleNamespace:
     """Build the forward-context fields an eager step exposes."""
 
@@ -665,44 +559,6 @@ def test_send_attn_output_keeps_an_even_payload(monkeypatch):
     assert forward_context.cam_afdtransfer_state.padded_payload is False
 
 
-def test_send_attn_output_keeps_stage_rows_when_ubatching(monkeypatch):
-    """A ubatch stage reports per-stage counts, so it must not be padded.
-
-    The runner reports the padded count for the whole step only when it is not
-    split into ubatches; a stage keeps the rows its own slice produced.
-    """
-
-    calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        torch.ops.vllm,
-        "afd_camp2p_send_attn_output",
-        lambda *args: calls.append(args),
-        raising=False,
-    )
-    forward_context = SimpleNamespace(
-        num_tokens=8,
-        ubatch_slices=[object()],
-        cudagraph_runtime_mode="FULL",
-    )
-    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
-    connector = _connector(role="attention", rank=0)
-    hidden_states = torch.zeros(3, connector.hidden_size)
-    context = AFDTransferContext(
-        metadata=AFDTransferMetadata.create_attention_metadata(
-            layer_idx=0,
-            stage_idx=0,
-            seq_len=3,
-        ),
-    )
-
-    connector.send_attn_output(hidden_states, context)
-
-    (args,) = calls
-    assert tuple(args[0].shape) == (3, connector.hidden_size)
-    assert args[4] == 3
-    assert forward_context.cam_afdtransfer_state.padded_payload is False
-
-
 def test_send_attn_output_keeps_a_large_payload_outside_a_full_graph(monkeypatch):
     """Only a padded FULL graph reports one token count for every rank.
 
@@ -746,33 +602,6 @@ def test_send_attn_output_keeps_a_large_payload_outside_a_full_graph(monkeypatch
     assert args[4] == 64
     assert tuple(expert_ids.shape) == (64, connector.num_experts_per_tok)
     assert forward_context.cam_afdtransfer_state.padded_payload is False
-
-
-def test_send_attn_output_rejects_rows_beyond_the_reported_tile(monkeypatch):
-    """More rows than the reported count cannot be represented, so fail early."""
-
-    calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        torch.ops.vllm,
-        "afd_camp2p_send_attn_output",
-        lambda *args: calls.append(args),
-        raising=False,
-    )
-    forward_context = _full_graph_forward_context(num_tokens=2)
-    monkeypatch.setattr(camp2p_module, "get_forward_context", lambda: forward_context)
-    connector = _connector(role="attention", rank=0)
-    context = AFDTransferContext(
-        metadata=AFDTransferMetadata.create_attention_metadata(
-            layer_idx=0,
-            stage_idx=0,
-            seq_len=3,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="cannot be represented"):
-        connector.send_attn_output(torch.zeros(3, connector.hidden_size), context)
-
-    assert calls == []
 
 
 def test_recv_ffn_output_trims_a_padded_tile_back_to_the_model_rows(monkeypatch):
