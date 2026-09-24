@@ -147,10 +147,10 @@ FFN cleanup exception above and is not selected by the four-device PR gate.
 `CAMP2pAFDConnector`, each following its host's recorded launch profile.
 DeepSeek V4 does not fit on a single Attention or FFN die, so A5 runs 2A2F on
 four devices and A3 4A4F on eight, and the two profiles differ in more than rank
-count: A5 reproduces its host's recorded `vllm serve` launch flags — Attention
+count: A5 follows its host's recorded `vllm serve` launch flags — Attention
 DP2/TP1 and FFN DP2/TP1 with expert parallelism, that script's own
-`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), native DBO at 2/12, a
-4096 context, and no API server count, seed, block size, batch or memory budget,
+`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), a 4096 context, and no
+API server count, seed, block size, batch or memory budget,
 prefix-caching, or chunked-prefill flag — while A3 shards by tensor parallel
 with the expert-parallel world at one, eager, with the 8192/1024 budget and the
 case's deployment flags. A5 keeps the case's DSV4 model-path switches
@@ -168,11 +168,11 @@ gate-on-Attention and any nonzero CAM quantization mode, the gate stays on FFN
 in both profiles. Each case reuses the ten-request concurrent oracle of the
 async case, takes the same 60-second shutdown grace, and deliberately does
 **not** take the async FFN cleanup exception: no CAM receive is pending on this
-path. A5 runs native DBO; because the coverage gate matches vLLM's GPU model
-runner debug line that prints the created `UBatchSlice` objects and the pinned
-Ascend NPU runtime logs no equivalent line, that profile exercises DBO without
-machine-verifying the split, keeps the caller's logging level, and reports the
-gap instead of failing on it.
+path. That script also enables native DBO at 2/12, which the case does not: the
+DBO split path is the current suspect for the DSA attention operator tiling
+failure seen on this profile, so the case leaves DBO off while that is
+root-caused. The profile keeps the recorded thresholds, and neither the split
+coverage gate nor forced `VLLM_LOGGING_LEVEL=DEBUG` applies while it is off.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,

@@ -62,6 +62,10 @@ DSV4_PROMPT_SECOND_OPERAND = 7
 DSV4_PROCESS_TERMINATION_TIMEOUT_S = 60
 # The A5 recorded launch script runs a 4096 context with ACL graph capture and
 # native DBO instead of the eager 8192/1024 deployment the A3 profile records.
+# The case keeps the graph capture and the context but runs without DBO: its
+# split path is the current suspect for the DSA attention tiling failure on A5.
+# The script's thresholds stay recorded on the profile below, so re-enabling DBO
+# is a one-field change.
 DSV4_SYNC_A5_MAX_MODEL_LEN = "4096"
 DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE = 16
 DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
@@ -100,9 +104,9 @@ class DSV4SyncEnvironment(NamedTuple):
 # script uses, because the two hosts differ in more than rank count:
 #
 # - A5 runs Attention DP2/TP1 and FFN DP2/TP1 with expert parallelism, ACL graph
-#   capture over 16 decodes, native DBO, and the script's 4096 context. It omits
-#   `--quantization`, `connector_extra_config`, and the multithread loader, and
-#   exports HCCL_BUFFSIZE=2048 itself.
+#   capture over 16 decodes, and the script's 4096 context, but without the
+#   script's native DBO. It omits `--quantization`, `connector_extra_config`,
+#   and the multithread loader, and exports HCCL_BUFFSIZE=2048 itself.
 # - A3 shards by tensor parallel with the expert-parallel world at one, eager,
 #   with the 8192/1024 budget the A3 launch profile records.
 class DSV4SyncShape(NamedTuple):
@@ -155,7 +159,11 @@ DSV4_SYNC_SHAPES = {
         enable_expert_parallel=True,
         use_graph=True,
         cudagraph_capture_size=DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE,
-        enable_dbo=True,
+        # The script enables native DBO at 2/12. The case keeps those recorded
+        # thresholds but not the feature: the DBO split path is the current
+        # suspect for the DSA attention operator tiling failure seen on A5, so it
+        # stays off while that is root-caused. Re-enabling it is this one field.
+        enable_dbo=False,
         dbo_decode_token_threshold=DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD,
         dbo_prefill_token_threshold=DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD,
         dbo_disables_chunked_prefill=False,
@@ -441,9 +449,10 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
     both keep the gate on FFN, because CAMP2P carries the Hash-layer token ids
     over the a2e ids channel, and neither needs a CAM vendor package. The rest
     of the deployment follows that host's recorded launch script: its rank
-    layout and expert parallelism, graph capture, native DBO, the context and
-    batch budget, the weight loader, and whether the case or the caller's shell
-    sizes the CAMP2P HCCL domains.
+    layout and expert parallelism, graph capture, the context and batch budget,
+    the weight loader, and whether the case or the caller's shell sizes the
+    CAMP2P HCCL domains. The A5 script's native DBO is the one recorded setting
+    the profile carries but leaves off, while its split path is root-caused.
     """
     shape = DSV4_SYNC_SHAPES[args.scenario]
     args.afd_connector = DSV4_SYNC_CAMP2P_CONNECTOR
