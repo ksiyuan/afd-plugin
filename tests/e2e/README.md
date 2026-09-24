@@ -278,7 +278,7 @@ applies. The A3 profile stays eager and has no DBO either.
 
 The A5 case is an expected failure. Under the ten concurrent requests, that
 profile has returned a repeated operand (`19.` for `Compute 19 + 7`), a
-degenerate repetition loop (`10-10-2000 10:00:00 …`), a refusal, and a
+degenerate repetition loop (`10 10:56:33 10:56:33 …`), a refusal, and a
 quoted sentence that was never in the prompt — with a different failing request
 in each run and no stable failure set. That is generation corruption, not the
 oracle's exactness: the wrong sums fail the relaxed check too.
@@ -286,11 +286,17 @@ oracle's exactness: the wrong sums fail the relaxed check too.
 Ruled out so far: native DBO (already off in the case), the exact-answer oracle
 (the profile accepts a stated sum), the 128-token block and prefix caching
 (both pinned on the profile), and the operator tiling failures that removing DBO
-and pinning the DSA model-path switches cleared. The A5 Attention/FFN path
-itself is what remains, and the case stays in the tree as
-`xfail(strict=False)` so the corruption is reported instead of hidden — it
-reports `xpass` once the cause is fixed, which is the signal to drop the marker.
-The A3 profile is unaffected.
+and pinning the DSA model-path switches cleared.
+
+The lead is the A2E tile bookkeeping for uneven Attention peers, which this
+branch does not carry: A5 runs Attention DP2, so its two Attention ranks hold
+different token counts in a step and the FFN side has to reconcile rows, while
+A3 runs Attention DP1/TP4, where the ranks are uniform — and A3 passes. The
+padded-tile and per-rank row helpers live in `afd_plugin/a2e_layout.py`, which
+the plugin's a2e work adds; a host running this case against that work should be
+retried. The case stays in the tree as `xfail(strict=False)` so the corruption is
+reported instead of hidden — it reports `xpass` once the cause is fixed, which is
+the signal to drop the marker. The A3 profile is unaffected.
 
 ```bash
 export AFD_E2E_BACKEND=npu
