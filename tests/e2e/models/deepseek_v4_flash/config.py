@@ -63,15 +63,9 @@ DSV4_SYNC_A5_MAX_MODEL_LEN = "4096"
 DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE = 16
 DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
 DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD = 12
-# The device mapping and weights path each host's launch script records, so a
-# run needs no device list and, on A5, no weights path either.
-DSV4_SYNC_A5_DEVICES = ("2", "3", "0", "1")
-DSV4_SYNC_A5_MODEL = "/mnt/weight/A5-weights/DeepSeek-V4-Flash"
-DSV4_SYNC_A3_DEVICES = ("0", "1", "2", "3", "4", "5", "6", "7")
 DSV4_SYNC_ALLOC_CONF_EXPANDABLE = "expandable_segments:True"
 DSV4_SYNC_ALLOC_CONF_PLAIN = "expandable_segments:False"
-# Both scripts run their two roles on one host: the rendezvous host defaults to
-# the loopback address and only takes the caller's when one is exported.
+# The A5 script runs both roles on one host and announces the loopback address.
 DSV4_SYNC_LOCAL_AFD_HOST = "127.0.0.1"
 # The A3 profile sizes its CAMP2P domains per domain instead of through the
 # caller's global HCCL_BUFFSIZE.
@@ -84,6 +78,9 @@ DSV4_SYNC_CONNECTOR_EXTRA_CONFIG = {
 class DSV4SyncEnvironment(NamedTuple):
     """Process environment the host's recorded launch script relies on."""
 
+    # The recorded A3 rendezvous uses the caller's address, so it requires the
+    # NIC variables; the A5 script starts both roles on 127.0.0.1.
+    nic_env_required: bool = True
     # AFD forces spawn multiprocessing so workers re-initialize the device in a
     # fresh process. The A5 launch script relies on the platform default.
     force_spawn: bool = True
@@ -110,12 +107,6 @@ class DSV4SyncShape(NamedTuple):
     attention_ranks: int
     ffn_ranks: int
     tp_size: int
-    # Recorded host facts the case carries so a run needs no setup beyond the
-    # weights: the device mapping its launch script uses, and the weights path
-    # that script records (None where the path is deployment-specific, so the
-    # caller supplies it).
-    devices: tuple[str, ...] = ()
-    model: str | None = None
     enable_expert_parallel: bool = False
     use_graph: bool = False
     cudagraph_capture_size: int = 0
@@ -160,9 +151,6 @@ DSV4_SYNC_SHAPES = {
         attention_ranks=2,
         ffn_ranks=2,
         tp_size=1,
-        # The mapping and weights path the host's launch script records.
-        devices=DSV4_SYNC_A5_DEVICES,
-        model=DSV4_SYNC_A5_MODEL,
         enable_expert_parallel=True,
         use_graph=True,
         cudagraph_capture_size=DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE,
@@ -198,6 +186,7 @@ DSV4_SYNC_SHAPES = {
         # the sum to the hosts that answer it.
         check_answer=False,
         environment=DSV4SyncEnvironment(
+            nic_env_required=False,
             force_spawn=False,
             keep_hccl_buffsize=True,
             npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
@@ -207,9 +196,6 @@ DSV4_SYNC_SHAPES = {
         attention_ranks=4,
         ffn_ranks=4,
         tp_size=4,
-        # Attention on the first four dies, FFN on the last four. The weights
-        # path is deployment-specific, so the caller supplies it.
-        devices=DSV4_SYNC_A3_DEVICES,
         # Smoke coverage, like A5: this host has not been validated against the
         # answer oracle, so the case checks the concurrent plumbing only.
         check_answer=False,

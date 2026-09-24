@@ -305,40 +305,21 @@ def test_dsv4_sync_a5_environment_follows_the_launch_script(monkeypatch):
 
 
 def test_dsv4_sync_a5_afd_host_defaults_to_loopback(monkeypatch, tmp_path):
-    """Both profiles announce 127.0.0.1 unless the caller supplies an address."""
-    for scenario in (DSV4_SYNC_CAMP2P_A5_SCENARIO, DSV4_SYNC_CAMP2P_A3_SCENARIO):
-        _arguments(monkeypatch, tmp_path, scenario=scenario)
-        monkeypatch.delenv("HCCL_IF_IP", raising=False)
-        command = entrypoint.build_runner_command(scenario, tmp_path / "responses.json")
-        assert command[command.index("--afd-host") + 1] == "127.0.0.1"
-
-        monkeypatch.setenv("HCCL_IF_IP", "192.0.2.9")
-        command = entrypoint.build_runner_command(scenario, tmp_path / "responses.json")
-        assert command[command.index("--afd-host") + 1] == "192.0.2.9"
-
-
-def test_dsv4_sync_profiles_carry_the_recorded_host_facts(monkeypatch, tmp_path):
-    """A run needs no device list, and only A3 needs a weights path."""
-    monkeypatch.delenv("AFD_E2E_DEVICES", raising=False)
-    monkeypatch.delenv("AFD_NPU_E2E_MODEL", raising=False)
-    monkeypatch.delenv("AFD_E2E_BACKEND", raising=False)
-
-    shape = DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A5_SCENARIO]
+    """The A5 script announces 127.0.0.1 and needs no NIC variable."""
+    _arguments(monkeypatch, tmp_path, scenario=DSV4_SYNC_CAMP2P_A5_SCENARIO)
+    monkeypatch.delenv("HCCL_IF_IP", raising=False)
     command = entrypoint.build_runner_command(
         DSV4_SYNC_CAMP2P_A5_SCENARIO,
         tmp_path / "responses.json",
     )
-    assert command[command.index("--model") + 1] == shape.model
-    assert command[command.index("--attention-devices") + 1] == ",".join(
-        shape.devices[: shape.attention_ranks],
-    )
-    assert command[command.index("--ffn-devices") + 1] == ",".join(
-        shape.devices[shape.attention_ranks :],
-    )
+    assert command[command.index("--afd-host") + 1] == "127.0.0.1"
 
-    a3 = DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO]
-    assert a3.model is None
-    with pytest.raises(RuntimeError, match="AFD_NPU_E2E_MODEL"):
+
+def test_dsv4_sync_a3_requires_the_caller_address(monkeypatch, tmp_path):
+    """The A3 profile still takes the caller's advertised rendezvous address."""
+    _arguments(monkeypatch, tmp_path, scenario=DSV4_SYNC_CAMP2P_A3_SCENARIO)
+    monkeypatch.delenv("HCCL_IF_IP", raising=False)
+    with pytest.raises(RuntimeError, match="HCCL_IF_IP"):
         entrypoint.build_runner_command(
             DSV4_SYNC_CAMP2P_A3_SCENARIO,
             tmp_path / "responses.json",

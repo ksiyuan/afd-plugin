@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import run_runner
+from tests.e2e.environment import devices_from_env, required_env
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SYNC_CAMP2P_SCENARIOS,
     DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
@@ -29,52 +30,29 @@ from tests.e2e.models.deepseek_v4_flash.config import (
 )
 
 
-def device_indices(shape: DSV4SyncShape) -> list[str]:
-    """Return the device list to split between the two roles.
+def _afd_host(shape: DSV4SyncShape) -> str:
+    """Return the AFD rendezvous host the selected profile expects.
 
-    Each profile carries the mapping its host's launch script records, so a case
-    run needs no device list. `AFD_E2E_DEVICES` overrides it and must still match
-    the profile's die count, because the list is what selects the host: a list
-    sized for the other host fails instead of skipping.
+    The A3 profile takes the caller's advertised address, which its recorded
+    launch script passes explicitly. The A5 script starts both roles on the
+    loopback address and needs no NIC variable.
     """
-    override = os.environ.get("AFD_E2E_DEVICES")
-    devices = (
-        [item.strip() for item in override.split(",") if item.strip()]
-        if override
-        else list(shape.devices)
-    )
-    if len(devices) != shape.device_count:
-        raise RuntimeError(
-            f"AFD_E2E_DEVICES must contain exactly {shape.device_count} devices",
-        )
-    if len(devices) != len(set(devices)):
-        raise RuntimeError("AFD_E2E_DEVICES devices must be unique")
-    return devices
-
-
-def model_path(shape: DSV4SyncShape) -> str:
-    """Return the weights path, preferring the caller's over the recorded one."""
-    model = os.environ.get("AFD_NPU_E2E_MODEL") or shape.model
-    if not model:
-        raise RuntimeError(
-            "AFD_NPU_E2E_MODEL must be set for this host: its profile records no "
-            "weights path",
-        )
-    return model
+    if shape.environment.nic_env_required:
+        return required_env("HCCL_IF_IP")
+    return os.environ.get("HCCL_IF_IP") or DSV4_SYNC_LOCAL_AFD_HOST
 
 
 def build_runner_command(scenario: str, output_path: Path) -> list[str]:
     shape = DSV4_SYNC_SHAPES[scenario]
-    backend = os.environ.get("AFD_E2E_BACKEND")
-    if backend and backend != "npu":
-        raise RuntimeError("DSV4 sync CAMP2P E2E runs on NPU only")
-    devices = device_indices(shape)
+    if required_env("AFD_E2E_BACKEND") != "npu":
+        raise RuntimeError("DSV4 sync CAMP2P E2E requires AFD_E2E_BACKEND=npu")
+    devices = devices_from_env("AFD_E2E_DEVICES", shape.device_count)
     return [
         sys.executable,
         "-m",
         "tests.e2e.runner",
         "--model",
-        model_path(shape),
+        required_env("AFD_NPU_E2E_MODEL"),
         "--vllm-bin",
         os.environ.get("AFD_NPU_E2E_VLLM_BIN", "vllm"),
         "--device-backend",
@@ -88,7 +66,7 @@ def build_runner_command(scenario: str, output_path: Path) -> list[str]:
         "--served-model-name-prefix",
         "dsv4-flash-sync",
         "--afd-host",
-        os.environ.get("HCCL_IF_IP") or DSV4_SYNC_LOCAL_AFD_HOST,
+        _afd_host(shape),
         "--api-port-base",
         os.environ.get("AFD_NPU_DSV4_SYNC_E2E_API_PORT", "19380"),
         "--afd-port",
@@ -101,20 +79,25 @@ def build_runner_command(scenario: str, output_path: Path) -> list[str]:
 
 
 def build_environment(scenario: str) -> dict[str, str]:
-    """Runtime environment for the operator transport.
+    """Runtime environment for the operator transport on a multi-NIC host.
 
     Every entry follows the selected host profile's recorded launch script. The
-    A3 profile drops any inherited HCCL_BUFFSIZE, because CAMP2P sizes its own
-    AFD HCCL domains there. The A5 profile keeps the script's global buffer size,
-    its plain allocator setting, and the platform's default multiprocessing start
-    method. Both roles run on one host, so the NIC variables are optional and a
-    supplied interface is forwarded to Gloo/TP. No CAM vendor package is
-    involved on either host, so no CAM vendor variable is installed.
+    A3 profile requires the caller's NIC and drops any inherited HCCL_BUFFSIZE,
+    because CAMP2P sizes its own AFD HCCL domains. The A5 profile keeps the
+    script's global buffer size, its plain allocator setting, and the platform's
+    default multiprocessing start method; its NIC variables stay optional, and
+    the socket names are only forwarded when the caller supplies one. No CAM
+    vendor package is involved on either host, so no CAM vendor variable is
+    installed.
     """
     shape = DSV4_SYNC_SHAPES[scenario]
     environment = shape.environment
     env = os.environ.copy()
-    interface = os.environ.get("HCCL_SOCKET_IFNAME", "")
+    if environment.nic_env_required:
+        interface = required_env("HCCL_SOCKET_IFNAME")
+        required_env("HCCL_IF_IP")
+    else:
+        interface = os.environ.get("HCCL_SOCKET_IFNAME", "")
     if environment.keep_hccl_buffsize:
         env.setdefault("HCCL_BUFFSIZE", str(DSV4_SYNC_HCCL_BUFFER_SIZE_MB))
     else:
