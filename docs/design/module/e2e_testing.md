@@ -147,14 +147,18 @@ FFN cleanup exception above and is not selected by the four-device PR gate.
 `CAMP2pAFDConnector`, each following its host's recorded launch profile.
 DeepSeek V4 does not fit on a single Attention or FFN die, so A5 runs 2A2F on
 four devices and A3 4A4F on eight, and the two profiles differ in more than rank
-count: A5 shards by data parallel (Attention DP2/TP1, FFN DP2/TP1) with expert
-parallelism, ACL graph capture in `FULL_DECODE_ONLY` over 16 decodes, native
-DBO, and the script's 4096 context, while A3 shards by tensor parallel with the
-expert-parallel world at one, eager, with the 8192/1024 budget. A5 also passes
-no `--quantization` and sizes no CAMP2P domain itself, keeping the script's
-global `HCCL_BUFFSIZE`; A3 carries `connector_extra_config` with only
-`hccl_buffer_size` and `quant_mode=0` and resolves the Ascend quantization
-method from its checkpoint. Neither needs a CAM vendor package: the plugin's own
+count: A5 reproduces its host's recorded `vllm serve` invocation — Attention
+DP2/TP1 and FFN DP2/TP1 with expert parallelism, that script's own
+`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), native DBO at 2/12, a
+4096 context, no API server count, seed, block size, batch or memory budget,
+prefix-caching, or chunked-prefill flag, and only the AFD block in
+`additional_config` — while A3 shards by tensor parallel with the
+expert-parallel world at one, eager, with the 8192/1024 budget and the case's
+deployment switches. A5 passes no `--quantization` either and sizes no CAMP2P
+domain itself, keeping the script's global `HCCL_BUFFSIZE`; A3 carries
+`connector_extra_config` with only `hccl_buffer_size` and `quant_mode=0` and
+resolves the Ascend quantization method from its checkpoint. Neither needs a CAM
+vendor package: the plugin's own
 a2e/e2a operators carry both the activations and, for the DSV4 Hash layers, the
 token ids the FFN-side gate routes with, so this is the transport available on
 both A3 and A5 once the ops are built for the target SOC. Because CAMP2P rejects
