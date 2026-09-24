@@ -54,11 +54,9 @@ ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
 ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
 V2_SYNC_CONNECTOR = "P2pNcclAFDConnector"
-# Graph capture and DBO defaults for the scenarios that do not carry their own
-# launch profile; the DSV4 synchronous profiles override both.
+# Graph capture default for the scenarios that do not carry their own launch
+# profile; the DSV4 synchronous profiles override it.
 DEFAULT_CUDAGRAPH_CAPTURE_SIZE = 8
-DEFAULT_DBO_DECODE_TOKEN_THRESHOLD = 1
-DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD = 8
 V2_SCENARIOS = (
     "afd-v2-eager-1a1f",
     "afd-v2-eager-dp2",
@@ -454,10 +452,13 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
     }
     for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
+        # The A5 script's native DBO stays off for these scenarios: a split batch
+        # is the current suspect for the DSA operator tiling failure on that
+        # host.
         scenario_settings[sync_scenario] = (
             False,
             dsv4_config.sync_use_graph(sync_profile),
-            sync_profile.enable_dbo,
+            False,
             sync_profile.attention_ranks,
             sync_profile.ffn_ranks,
         )
@@ -561,16 +562,8 @@ def configure_scenario(args: argparse.Namespace) -> None:
             else DEFAULT_CUDAGRAPH_CAPTURE_SIZE
         )
     if enable_dbo:
-        args.dbo_decode_token_threshold = (
-            active_sync_profile.dbo_decode_token_threshold
-            if active_sync_profile is not None
-            else DEFAULT_DBO_DECODE_TOKEN_THRESHOLD
-        )
-        args.dbo_prefill_token_threshold = (
-            active_sync_profile.dbo_prefill_token_threshold
-            if active_sync_profile is not None
-            else DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD
-        )
+        args.dbo_decode_token_threshold = 1
+        args.dbo_prefill_token_threshold = 8
         if not any(
             arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
         ):
