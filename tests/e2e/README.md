@@ -198,109 +198,52 @@ operators before running. Model and all sixteen device IDs must be supplied expl
 ## DSV4 Flash sync CAMP2P concurrent requests (local, 4 or 8 NPUs)
 
 Two local-only scenarios run DeepSeek V4 Flash over the synchronous
-`CAMP2pAFDConnector`, which needs no CAM vendor package: the plugin's own
-a2e/e2a operators carry the activations and the DeepSeek V4 Hash-layer token
-ids. Each scenario runs its host's recorded launch profile, because the two
-hosts differ in more than rank count.
+`CAMP2pAFDConnector` — no CAM vendor package, since the plugin's own a2e/e2a
+operators carry the activations and the Hash-layer token ids — each at its host's
+recorded launch shape:
 
 | Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
 | `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off, 128-token block, prefix caching off | 4 |
 | `afd-dsv4-flash-sync-camp2p-4a4f` | A3 (Ascend 910C) | Attention DP1/TP4 + FFN DP1/TP4, expert-parallel world at one, eager, 8192 context | 8 |
 
-DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs its
-smallest workable shape with the deployment its launch script records. Build the
-operators for the target SOC before running — `AFD_BUILD_ASCEND_OPS=1
-SOC_VERSION=ascend950` on A5 and `SOC_VERSION=910c` on A3 — with `python -m pip
-install -v --no-build-isolation --no-deps -e .`.
+Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
+`910c` on A3). The device list is role-defining — the first `attention_ranks`
+entries go to Attention and the rest to FFN, so A5 passes `2,3,0,1` for its
+recorded mapping — and a list sized for the other host fails rather than skips.
 
-The device list is role-defining: the first `attention_ranks` entries go to
-Attention and the remaining ones to FFN. The A5 run therefore passes
-`2,3,0,1`, reproducing the recorded mapping of Attention on dies 2 and 3 and FFN
-on dies 0 and 1. A list sized for the other host fails rather than skips.
+Both profiles are **smoke cases**: the async case's ten concurrent chat requests
+(`12 + 7` … `21 + 7`, temperature=0, thinking=false, max_tokens=256) must be served
+together, each returning a nonempty answer that finished. Neither compares the
+answer with the expected sum — A5 corrupts part of a concurrent batch (below) and
+A3 has not been validated against the oracle — and `check_answer` on a profile
+turns the exact check back on once its host is validated.
 
-`--quantization` is not passed on A5, matching its script, which lets the
-FP8/W4A8 checkpoint's own `config.json` decide. On A3 the int8 W8A8 checkpoint
-is loaded through the Ascend method, so `ascend` is passed unless that
-checkpoint declares another method. Set `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` to
-force a value, or to `none` to omit the flag and let the checkpoint decide.
+Deployment differences worth knowing:
 
-The A5 profile also keeps `HCCL_BUFFSIZE=2048`, its plain allocator setting
-(`PYTORCH_NPU_ALLOC_CONF=expandable_segments:False`), and the platform's
-default multiprocessing start method, and it sizes no CAMP2P HCCL domain
-itself. The A3 profile drops any inherited `HCCL_BUFFSIZE` and sizes its CAMP2P
-domains through `connector_extra_config`. Only the A3 profile requires the NIC
-variables; on A5 the rendezvous host defaults to `127.0.0.1` and a supplied
-`HCCL_SOCKET_IFNAME` is forwarded to Gloo/TP.
+- **A5** drops the native DBO its script enables (a split batch is the current
+  suspect for the DSA operator tiling failure there, so the recorded 2/12
+  thresholds stay on the profile unused), pins `--block-size 128` and
+  `--no-enable-prefix-caching` where its script leaves vLLM's defaults, keeps
+  `HCCL_BUFFSIZE=2048` with the plain allocator, and needs no NIC variable.
+- **A3** drops an inherited `HCCL_BUFFSIZE`, sizes its own CAMP2P domains through
+  `connector_extra_config`, and requires `HCCL_IF_IP` and `HCCL_SOCKET_IFNAME`.
+- `--quantization` is resolved from the checkpoint: A5's FP8/W4A8 checkpoint
+  decides, A3's int8 W8A8 loads through `ascend`.
+- Both keep the case's DSV4 model-path switches (`multistream_dsv4_dsa_overlap`,
+  `enable_dsa_cp`, and `enable_dsv4_shared_compressor_workspace` off) and leave
+  the gate on FFN; KV transfer is not enabled. Shutdown allows 60 seconds, and
+  the async FFN cleanup exception does not apply because no CAM receive is
+  pending.
 
-The fixed deployment passes `--block-size 128`, `--seed 1024`, and disables
-prefix caching. The A3 profile passes those flags; the A5 profile emits the
-launch flags its host's `vllm serve` script records, minus the native DBO that
-script also enables — its own `--compilation-config` (`FULL_DECODE_ONLY`,
-capture 16) and `--max-model-len 4096` — plus the two cache-layout settings that
-script leaves at vLLM's defaults: `--block-size 128` and
-`--no-enable-prefix-caching`. Its ten concurrent chat requests share one template
-prefix, and that reuse is the current suspect for the corrupted answers the
-profile produced before those two settings were pinned. The A5 profile therefore
-passes no API server count, seed, batch or memory budget, or chunked-prefill
-flag. It does keep the case's DSV4 model-path switches
-(`multistream_dsv4_dsa_overlap=false`, `enable_dsa_cp=false`,
-`enable_dsv4_shared_compressor_workspace=false`): the pinned runtime defaults
-the multistream DSA overlap to True, and that path's RoPE
-(`inplace_partial_rotary_mul`) fails to tile on A5. Every budget value is still
-overridable per host with `AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN`,
-`AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS`,
-`AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS` (never below the ten concurrent requests),
-and `AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION`, so a host can be retuned without
-editing the case. `AFD_NPU_DSV4_SYNC_E2E_EAGER=1` runs the synchronous cases
-without ACL graph capture, for a host whose capture path trips a runtime
-operator failure. The gate stays on FFN in both profiles — CAMP2P rejects
-`compute_gate_on_attention=true`. KV transfer is not enabled.
-
-The concurrent oracle asks the same ten chat requests as the async case: `12 + 7`
-through `21 + 7` with temperature=0, thinking=false, and max_tokens=256, and every
-run requires the ten requests to be served together, each with a nonempty answer
-that finished. Neither synchronous profile compares the answer yet — A5 corrupts
-part of a concurrent batch (see the blocker below) and A3 has not been validated
-against the oracle — so both cover the concurrent plumbing, and only the
-asynchronous case keeps the exact check. Service liveness and owned-process
-cleanup must pass, with 60 seconds allowed for shutdown before escalation. This
-path does **not** take the async FFN cleanup exception, because no CAM receive is
-pending.
-
-The A5 script enables native DBO at 2/12; the case does not. The DBO split path
-is the current suspect for the DSA attention operator tiling failure seen on
-this profile, so DBO stays off while that is root-caused. The profile keeps the
-script's recorded thresholds, so re-enabling it is one field, and while it is
-off neither the split coverage gate nor forced `VLLM_LOGGING_LEVEL=DEBUG`
-applies. The A3 profile stays eager and has no DBO either.
-
-### Known blocker: A5 corrupted answers under concurrent load
-
-The A5 case is a smoke case. Under the ten concurrent requests, that profile has
-returned a repeated operand (`19.` for `Compute 19 + 7`), a degenerate repetition
-loop (`10 10:56:33 10:56:33 …`), a refusal, and a quoted sentence that was never
-in the prompt — with a different failing request in each run and no stable
-failure set. That is generation corruption, not answer-check strictness: the
-answers are simply wrong.
-
-Ruled out so far: native DBO (already off in the case), answer-check strictness,
-the 128-token block and prefix caching
-(both pinned on the profile), and the operator tiling failures that removing DBO
-and pinning the DSA model-path switches cleared.
-
-The lead is the A2E tile bookkeeping for uneven Attention peers, which this
-branch does not carry: A5 runs Attention DP2, so its two Attention ranks hold
-different token counts in a step and the FFN side has to reconcile rows, while
-A3 runs Attention DP1/TP4, where the ranks are uniform. The
-padded-tile and per-rank row helpers live in `afd_plugin/a2e_layout.py`, which
-the plugin's a2e work adds; a host running this case against that work should be
-retried.
-
-So both synchronous profiles cover the concurrent plumbing only — ten requests
-served together, each answer nonempty and finished — and leave the sum unchecked.
-Set `check_answer` back to true for a profile once its host is validated; only the
-asynchronous case compares the sum today.
+**Known blocker: A5 corrupted answers under concurrent load.** That profile has
+returned a repeated operand, a degenerate repetition loop, a refusal, and a quoted
+sentence that was never in the prompt, with a different failing request each run.
+Ruled out: DBO (already off), answer-check strictness, the 128-token block, prefix
+caching, and the operator tiling failures those changes cleared. The lead is the
+A2E tile bookkeeping for uneven Attention peers, which this branch does not carry
+(A5 runs Attention DP2, A3 DP1/TP4); those helpers live in
+`afd_plugin/a2e_layout.py`.
 
 ```bash
 export AFD_E2E_BACKEND=npu
