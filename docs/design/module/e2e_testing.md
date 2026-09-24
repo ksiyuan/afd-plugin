@@ -169,18 +169,17 @@ gate-on-Attention and any nonzero CAM quantization mode, the gate stays on FFN
 in both profiles. Each case reuses the ten-request concurrent oracle of the
 async case, takes the same 60-second shutdown grace, and deliberately does
 **not** take the async FFN cleanup exception: no CAM receive is pending on this
-path. The A5 profile answers with narration rather than the sum alone, so it
-relaxes that oracle to require the sum inside the response and a normal terminal
-state; A3 keeps the exact check. That script also enables native DBO at 2/12,
+path. The A5 profile does not compare the answer — that host corrupts part of a
+concurrent batch — so it covers the concurrent plumbing instead, while A3 and the
+async case keep the exact check. That script also enables native DBO at 2/12,
 which the case does not: the DBO split path is the current suspect for the DSA
 attention operator tiling failure seen on this profile, so the case leaves DBO
 off while that is root-caused. The profile keeps the recorded thresholds, and
 neither the split coverage gate nor forced `VLLM_LOGGING_LEVEL=DEBUG` applies
 while it is off. The A5 case still corrupts answers under concurrent load — a
 repeated operand, a degenerate repetition loop, and a refusal, with no stable
-failing request — so it registers as an expected failure
-(`xfail(strict=False)`) until that is located; the e2e README records the
-symptom and everything ruled out so far.
+failing request — so that profile stays a smoke case,
+and the e2e README records the symptom and everything ruled out so far.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,

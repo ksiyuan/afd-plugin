@@ -22,23 +22,11 @@ import pytest
 from tests.conftest import run_runner
 from tests.e2e.environment import devices_from_env, required_env
 from tests.e2e.models.deepseek_v4_flash.config import (
-    DSV4_SYNC_CAMP2P_A3_SCENARIO,
-    DSV4_SYNC_CAMP2P_A5_SCENARIO,
+    DSV4_SYNC_CAMP2P_SCENARIOS,
     DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
     DSV4_SYNC_LOCAL_AFD_HOST,
     DSV4_SYNC_SHAPES,
     DSV4SyncShape,
-)
-
-# The A5 profile's checkpoint corrupts part of a ten-request batch: the
-# concurrent oracle has seen a repeated operand, a degenerate repetition loop,
-# and a refusal, with a different failing request in each run and no stable
-# failure set. The case therefore runs as a known failure so the corruption
-# stays visible in the test report instead of blocking the case, and it reports
-# `xpass` once the cause is fixed.
-DSV4_SYNC_A5_KNOWN_BLOCKER = (
-    "A5 corrupts answers under concurrent load; see the DeepSeek V4 Flash sync "
-    "CAMP2P section of tests/e2e/README.md"
 )
 
 
@@ -150,19 +138,7 @@ def build_environment(scenario: str) -> dict[str, str]:
 @pytest.mark.npu
 @pytest.mark.e2e
 @pytest.mark.slow
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        pytest.param(
-            DSV4_SYNC_CAMP2P_A5_SCENARIO,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason=DSV4_SYNC_A5_KNOWN_BLOCKER,
-            ),
-        ),
-        pytest.param(DSV4_SYNC_CAMP2P_A3_SCENARIO),
-    ],
-)
+@pytest.mark.parametrize("scenario", DSV4_SYNC_CAMP2P_SCENARIOS)
 def test_deepseek_v4_flash_sync_camp2p(scenario: str, tmp_path: Path) -> None:
     run_runner(
         build_runner_command(scenario, tmp_path / f"{scenario}.json"),

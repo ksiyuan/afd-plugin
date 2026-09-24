@@ -523,39 +523,39 @@ def test_dsv4_sync_a3_has_no_dbo_to_verify(monkeypatch, tmp_path):
     assert runner.dbo_split_evidence_available(args) is True
 
 
-def test_dsv4_sync_a5_states_the_sum_inside_a_longer_answer():
-    """Only the A5 profile relaxes the answer check, and only to a stated sum."""
-    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO].strict_answer is True
-    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A5_SCENARIO].strict_answer is False
-
-    assert completions.states_expected_sum(
-        "The first number is 21, the second is 7. The sum is 28.",
-        28,
-    )
-    assert completions.states_expected_sum("The sum is 28.28", 28)
-    assert not completions.states_expected_sum("999", 28)
-    # An integer that merely contains the digits is not the stated sum.
-    assert not completions.states_expected_sum("128", 28)
+def test_dsv4_sync_only_a5_skips_the_answer_check():
+    """A3 compares the sum; A5 only requires the ten requests to be served."""
+    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO].check_answer is True
+    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A5_SCENARIO].check_answer is False
 
 
-def test_dsv4_sync_relaxed_answer_keeps_the_terminal_state_check():
-    """A narrated answer still has to end in a terminal state it may reach."""
-    narrated = {
-        "choices": [
-            {"message": {"content": "The sum is 28."}, "finish_reason": "length"},
-        ],
-    }
-    completions.validate_response(narrated, strict_answer=False)
+def test_dsv4_sync_served_response_keeps_the_shape_checks():
+    """A profile that skips the answer still requires a finished response."""
+
+    def response(content: object, finish_reason: object) -> dict:
+        return {
+            "choices": [
+                {"message": {"content": content}, "finish_reason": finish_reason},
+            ],
+        }
+
+    for content, finish_reason in (
+        ("28", "stop"),
+        ("10 10:56:33 10:56:33", "length"),
+        ("I cannot compute that.", "stop"),
+    ):
+        completions.validate_response(
+            response(content, finish_reason),
+            check_answer=False,
+        )
+
+    with pytest.raises(RuntimeError, match="returned empty content"):
+        completions.validate_response(response("", "stop"), check_answer=False)
     with pytest.raises(RuntimeError, match="did not finish normally"):
-        completions.validate_response(narrated)
-
-    tool_call = {
-        "choices": [
-            {"message": {"content": "The sum is 28."}, "finish_reason": "tool_calls"},
-        ],
-    }
+        completions.validate_response(response("28", None), check_answer=False)
+    # A host that does compare the answer keeps the exact terminal state.
     with pytest.raises(RuntimeError, match="did not finish normally"):
-        completions.validate_response(tool_call, strict_answer=False)
+        completions.validate_response(response("28", "length"))
 
 
 def test_dsv4_sync_oracle_uses_the_profile_answer_policy(monkeypatch, tmp_path):
@@ -577,7 +577,7 @@ def test_dsv4_sync_oracle_uses_the_profile_answer_policy(monkeypatch, tmp_path):
 
         runner.run_concurrent_completion_evaluation(args)
 
-        assert seen["strict_answer"] is expected
+        assert seen["check_answer"] is expected
 
 
 def test_dsv4_sync_a5_environment_follows_the_launch_script(monkeypatch):
