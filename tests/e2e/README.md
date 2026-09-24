@@ -250,10 +250,15 @@ The concurrent oracle and its assertions match the async case: ten chat
 requests ask for `12 + 7` through `21 + 7` with temperature=0, thinking=false,
 and max_tokens=256; every response must contain one nonempty answer and finish
 with `stop`. Service liveness and owned-process cleanup must pass, with 60
-seconds allowed for shutdown before escalation. A5 enables native DBO, so the
-run must additionally record at least one live two-ubatch step during the
-evaluation window. This path does **not** take the async FFN cleanup exception,
-because no CAM receive is pending.
+seconds allowed for shutdown before escalation. This path does **not** take the
+async FFN cleanup exception, because no CAM receive is pending.
+
+A5 runs native DBO. It is exercised end to end but not machine-verified there:
+the DBO coverage gate matches vLLM's GPU model runner debug line that prints
+the created `UBatchSlice` objects, and the pinned Ascend NPU runtime logs no
+equivalent line. The A5 run therefore keeps the caller's logging level instead
+of forcing `VLLM_LOGGING_LEVEL=DEBUG`, and prints a `[dbo-coverage]` notice in
+place of the gate. The A3 profile stays eager and has no DBO to verify.
 
 ```bash
 export AFD_E2E_BACKEND=npu

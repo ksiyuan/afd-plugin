@@ -117,6 +117,11 @@ class DSV4SyncShape(NamedTuple):
     dbo_prefill_token_threshold: int = 0
     # A5 keeps chunked prefill enabled alongside DBO, as its script does.
     dbo_disables_chunked_prefill: bool = True
+    # The DBO coverage gate matches vLLM's GPU model runner debug line that
+    # prints the created `UBatchSlice` objects. The pinned Ascend NPU runtime
+    # logs no such line, so a profile that runs DBO there exercises it without
+    # machine-verifying the split, and needs no forced DEBUG logging.
+    dbo_split_evidence_available: bool = True
     max_model_len: str = DSV4_SYNC_MAX_MODEL_LEN
     # None omits the flag entirely so vLLM's own default applies.
     max_num_batched_tokens: str | None = DSV4_SYNC_MAX_NUM_BATCHED_TOKENS
@@ -144,6 +149,7 @@ DSV4_SYNC_SHAPES = {
         dbo_decode_token_threshold=DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD,
         dbo_prefill_token_threshold=DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD,
         dbo_disables_chunked_prefill=False,
+        dbo_split_evidence_available=False,
         max_model_len=DSV4_SYNC_A5_MAX_MODEL_LEN,
         max_num_batched_tokens=None,
         max_num_seqs=None,

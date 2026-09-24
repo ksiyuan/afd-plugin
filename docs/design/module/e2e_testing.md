@@ -162,8 +162,11 @@ gate-on-Attention and any nonzero CAM quantization mode, the gate stays on FFN
 in both profiles. Each case reuses the ten-request concurrent oracle of the
 async case, takes the same 60-second shutdown grace, and deliberately does
 **not** take the async FFN cleanup exception: no CAM receive is pending on this
-path. A5 enables native DBO, so its evaluation window must additionally record
-a live two-ubatch step.
+path. A5 runs native DBO; because the coverage gate matches vLLM's GPU model
+runner debug line that prints the created `UBatchSlice` objects and the pinned
+Ascend NPU runtime logs no equivalent line, that profile exercises DBO without
+machine-verifying the split, keeps the caller's logging level, and reports the
+gap instead of failing on it.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,
