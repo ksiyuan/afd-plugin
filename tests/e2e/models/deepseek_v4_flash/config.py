@@ -130,6 +130,14 @@ class DSV4SyncShape(NamedTuple):
     multithread_load: bool = True
     connector_extra_config: dict[str, int] | None = DSV4_SYNC_CONNECTOR_EXTRA_CONFIG
     quantization_from_checkpoint: bool = True
+    # A profile whose host launch script is the validated deployment emits only
+    # the flags that script passes, instead of the case's extra deployment
+    # defaults (API server count, seed, block size, prefix caching, chunked
+    # prefill, and the Attention data-parallel address).
+    verbatim_launch: bool = False
+    # Exact `--compilation-config` JSON when the script passes one; the runner
+    # then omits its own capture-size flags.
+    compilation_config: dict[str, object] | None = None
     environment: DSV4SyncEnvironment = DSV4SyncEnvironment()
 
     @property
@@ -157,6 +165,11 @@ DSV4_SYNC_SHAPES = {
         multithread_load=False,
         connector_extra_config=None,
         quantization_from_checkpoint=False,
+        verbatim_launch=True,
+        compilation_config={
+            "cudagraph_capture_sizes": [DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE],
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+        },
         environment=DSV4SyncEnvironment(
             nic_env_required=False,
             force_spawn=False,
@@ -297,6 +310,7 @@ def _configure_dsv4_arguments(
     max_num_seqs: str | None = DSV4_MAX_NUM_SEQS,
     memory_utilization: str | None = DSV4_MEMORY_UTILIZATION,
     multithread_load: bool = True,
+    verbatim_launch: bool = False,
 ) -> None:
     """Apply the fixed model arguments shared by every DSV4 scenario.
 
@@ -307,6 +321,12 @@ def _configure_dsv4_arguments(
     deployments differ from the 16-die asynchronous case. A None budget value
     omits that flag entirely so vLLM's own default applies, and
     `multithread_load` selects the scripted multithreaded weight loader.
+
+    `verbatim_launch` emits only what a recorded `vllm serve` script passes,
+    because for that host the script is the validated deployment: no API server
+    count, seed, block size, prefix-caching, or chunked-prefill flag. Tokenizer
+    mode and the remote-code flag stay, since the concurrent oracle needs the
+    model's chat template and tokenizer.
     """
     if args.completion_output_path is None:
         raise ValueError("--completion-output-path is required for DSV4")
@@ -316,11 +336,11 @@ def _configure_dsv4_arguments(
         raise ValueError("DSV4 scenario does not accept extra vLLM arguments")
     if args.use_decode_bench_connector:
         raise ValueError("DSV4 scenario runs without a KV transfer connector")
+    deployment_defaults = (
+        [] if verbatim_launch else ["--api-server-count", "1", "--seed", "1024"]
+    )
     args.common_vllm_arg = [
-        "--api-server-count",
-        "1",
-        "--seed",
-        "1024",
+        *deployment_defaults,
         "--max-model-len",
         max_model_len,
         *(
@@ -329,8 +349,7 @@ def _configure_dsv4_arguments(
             else []
         ),
         *(["--max-num-seqs", max_num_seqs] if max_num_seqs is not None else []),
-        "--block-size",
-        "128",
+        *([] if verbatim_launch else ["--block-size", "128"]),
         *(
             ["--gpu-memory-utilization", memory_utilization]
             if memory_utilization is not None
@@ -348,13 +367,22 @@ def _configure_dsv4_arguments(
             else []
         ),
         "--trust-remote-code",
-        "--no-enable-prefix-caching",
-        "--enable-chunked-prefill",
+        *(
+            []
+            if verbatim_launch
+            else ["--no-enable-prefix-caching", "--enable-chunked-prefill"]
+        ),
     ]
     args.attention_vllm_arg = [
-        "--data-parallel-address",
-        args.afd_host,
-        "--no-disable-hybrid-kv-cache-manager",
+        *(
+            []
+            if verbatim_launch
+            else [
+                "--data-parallel-address",
+                args.afd_host,
+                "--no-disable-hybrid-kv-cache-manager",
+            ]
+        ),
         "--tool-call-parser",
         "deepseek_v4",
         "--enable-auto-tool-choice",
@@ -406,11 +434,20 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
         args,
         sync_camp2p_quantization(args.model, shape),
         multithread_load=shape.multithread_load,
+        verbatim_launch=shape.verbatim_launch,
         **sync_runtime_profile(shape),
     )
 
 
-def additional_config() -> dict[str, bool]:
+def additional_config(verbatim_launch: bool = False) -> dict[str, bool]:
+    """Return the DSV4 deployment switches for the scenario's `additional_config`.
+
+    The asynchronous and A3 cases pin these switches explicitly. A profile that
+    follows its host's launch script emits none of them, because that script
+    passes only the AFD block and relies on the runtime defaults.
+    """
+    if verbatim_launch:
+        return {}
     return {
         "enable_cpu_binding": True,
         "enable_force_load_balance": False,

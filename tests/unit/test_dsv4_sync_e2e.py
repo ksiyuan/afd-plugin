@@ -111,7 +111,18 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
         )
         assert ("--enable-dbo" in command) is profile.enable_dbo
         assert ("--enforce-eager" in command) is not profile.use_graph
-        if profile.use_graph:
+        if profile.compilation_config is not None:
+            # A verbatim profile passes its host script's compilation config and
+            # nothing else from the case's graph deployment.
+            assert (
+                json.loads(
+                    command[command.index("--compilation-config") + 1],
+                )
+                == profile.compilation_config
+            )
+            assert "--cudagraph-capture-sizes" not in command
+            assert "--max-cudagraph-capture-size" not in command
+        elif profile.use_graph:
             capture_size = str(profile.cudagraph_capture_size)
             assert command[command.index("--cudagraph-capture-sizes") + 1] == (
                 capture_size
@@ -120,6 +131,25 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
             assert command[command.index("--max-num-seqs") + 1] == (
                 profile.max_num_seqs or capture_size
             )
+        if profile.verbatim_launch:
+            # Only the script's own deployment flags, plus the tokenizer mode and
+            # parsers the concurrent chat oracle needs.
+            for absent in (
+                "--api-server-count",
+                "--seed",
+                "--block-size",
+                "--no-enable-prefix-caching",
+                "--enable-chunked-prefill",
+                "--data-parallel-address",
+                "--no-disable-hybrid-kv-cache-manager",
+            ):
+                assert absent not in command, absent
+        else:
+            assert command[command.index("--api-server-count") + 1] == "1"
+            assert command[command.index("--seed") + 1] == "1024"
+            assert command[command.index("--block-size") + 1] == "128"
+            assert "--no-enable-prefix-caching" in command
+            assert "--enable-chunked-prefill" in command
         if profile.enable_dbo:
             assert command[command.index("--dbo-decode-token-threshold") + 1] == str(
                 profile.dbo_decode_token_threshold,
@@ -136,8 +166,12 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
             assert "--quantization" not in command
         assert "--kv-transfer-config" not in command
         config = json.loads(command[command.index("--additional-config") + 1])
-        assert config["enable_dsv4_shared_compressor_workspace"] is False
-        assert config["enable_cpu_binding"] is True
+        if profile.verbatim_launch:
+            # The host script passes only the AFD block.
+            assert set(config) == {"afd"}
+        else:
+            assert config["enable_dsv4_shared_compressor_workspace"] is False
+            assert config["enable_cpu_binding"] is True
         # Exact equality also pins the absent keys: CAMP2P rejects both the
         # asynchronous mode and gate-on-Attention.
         expected_afd = {

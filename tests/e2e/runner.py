@@ -704,6 +704,7 @@ def build_vllm_command(
     )
     role_dp_size = max(1, role_total_ranks // tp_size)
     is_npu = args.device_backend == "npu"
+    sync_profile = sync_shape(args.scenario)
     connector = args.afd_connector or (
         "CAMP2pAFDConnector" if is_npu else "P2pNcclAFDConnector"
     )
@@ -728,7 +729,13 @@ def build_vllm_command(
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
     if args.scenario in DSV4_SCENARIOS:
-        afd_config.update(dsv4_config.additional_config())
+        afd_config.update(
+            dsv4_config.additional_config(
+                verbatim_launch=bool(
+                    sync_profile is not None and sync_profile.verbatim_launch,
+                ),
+            ),
+        )
     cmd = [
         args.vllm_bin,
         "serve",
@@ -742,7 +749,6 @@ def build_vllm_command(
         "--tensor-parallel-size",
         str(tp_size),
     ]
-    sync_profile = sync_shape(args.scenario)
     if sync_profile is None or sync_profile.enable_expert_parallel:
         # Non-DSV4 AFD scenarios always run expert parallel. The A5 DSV4 sync
         # profile follows its launch script, which runs Attention DP2/TP1 and
@@ -763,7 +769,16 @@ def build_vllm_command(
                 "--no-async-scheduling",
             ],
         )
-    if args.cuda_graph_full_decode_only:
+    if sync_profile is not None and sync_profile.compilation_config is not None:
+        # A verbatim profile passes the exact compilation config its host script
+        # uses, so the runner adds none of its own capture-size flags.
+        cmd.extend(
+            [
+                "--compilation-config",
+                json.dumps(sync_profile.compilation_config, separators=(",", ":")),
+            ],
+        )
+    elif args.cuda_graph_full_decode_only:
         capture_size = str(args.cudagraph_capture_size)
         # A scenario that fixes its own `--max-num-seqs` (the DSV4 launch
         # profiles do) keeps it: the capture size only has to cover it.
