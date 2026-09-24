@@ -169,9 +169,9 @@ gate-on-Attention and any nonzero CAM quantization mode, the gate stays on FFN
 in both profiles. Each case reuses the ten-request concurrent oracle of the
 async case, takes the same 60-second shutdown grace, and deliberately does
 **not** take the async FFN cleanup exception: no CAM receive is pending on this
-path. The A5 profile does not compare the answer — that host corrupts part of a
-concurrent batch — so it covers the concurrent plumbing instead, while A3 and the
-async case keep the exact check. That script also enables native DBO at 2/12,
+path. Neither synchronous profile compares the answer — A5 corrupts part of a
+concurrent batch and A3 is not validated against the oracle yet — so both cover
+the concurrent plumbing, while the async case keeps the exact check. That script also enables native DBO at 2/12,
 which the case does not: the DBO split path is the current suspect for the DSA
 attention operator tiling failure seen on this profile, so the case leaves DBO
 off while that is root-caused. The profile keeps the recorded thresholds, and
