@@ -46,6 +46,10 @@ DSV4_MAX_MODEL_LEN = "1048576"
 DSV4_MAX_NUM_BATCHED_TOKENS = "8192"
 DSV4_MAX_NUM_SEQS = "16"
 DSV4_MEMORY_UTILIZATION = "0.7"
+# The block the DSV4 DSA, compressor, and indexer caches are laid out for; the
+# case's own deployment pins it, and a verbatim profile records it only where
+# its host script leaves a default the case cannot run correctly with.
+DSV4_BLOCK_SIZE = "128"
 DSV4_SYNC_MAX_MODEL_LEN = "8192"
 DSV4_SYNC_MAX_NUM_BATCHED_TOKENS = "1024"
 DSV4_SYNC_MAX_MODEL_LEN_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN"
@@ -105,7 +109,8 @@ class DSV4SyncEnvironment(NamedTuple):
 #
 # - A5 runs Attention DP2/TP1 and FFN DP2/TP1 with expert parallelism, ACL graph
 #   capture over 16 decodes, and the script's 4096 context, but without the
-#   script's native DBO. It omits `--quantization`, `connector_extra_config`,
+#   script's native DBO, with prefix caching off, and with the case's 128-token
+#   block. It omits `--quantization`, `connector_extra_config`,
 #   and the multithread loader, and exports HCCL_BUFFSIZE=2048 itself.
 # - A3 shards by tensor parallel with the expert-parallel world at one, eager,
 #   with the 8192/1024 budget the A3 launch profile records.
@@ -147,6 +152,11 @@ class DSV4SyncShape(NamedTuple):
     # defaults (API server count, seed, block size, prefix caching, chunked
     # prefill, and the Attention data-parallel address).
     verbatim_launch: bool = False
+    # Cache layout a verbatim profile records when its script leaves the default:
+    # a None block size keeps the script's own, and prefix caching stays on
+    # unless the profile turns it off.
+    disable_prefix_caching: bool = False
+    block_size: str | None = None
     # Exact `--compilation-config` JSON when the script passes one; the runner
     # then omits its own capture-size flags.
     compilation_config: dict[str, object] | None = None
@@ -182,6 +192,13 @@ DSV4_SYNC_SHAPES = {
         connector_extra_config=None,
         quantization_from_checkpoint=False,
         verbatim_launch=True,
+        # The script leaves prefix caching and the block size at vLLM's defaults.
+        # Its ten concurrent chat requests share one template prefix, and that
+        # reuse is the current suspect for the corrupted answers this profile
+        # produces on A5; the DSA caches are laid out for the 128-token block the
+        # case pins on both hosts.
+        disable_prefix_caching=True,
+        block_size=DSV4_BLOCK_SIZE,
         compilation_config={
             "cudagraph_capture_sizes": [DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE],
             "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -352,6 +369,8 @@ def _configure_dsv4_arguments(
     memory_utilization: str | None = DSV4_MEMORY_UTILIZATION,
     multithread_load: bool = True,
     verbatim_launch: bool = False,
+    disable_prefix_caching: bool = False,
+    block_size: str | None = None,
 ) -> None:
     """Apply the fixed model arguments shared by every DSV4 scenario.
 
@@ -365,9 +384,12 @@ def _configure_dsv4_arguments(
 
     `verbatim_launch` emits only what a recorded `vllm serve` script passes,
     because for that host the script is the validated deployment: no API server
-    count, seed, block size, prefix-caching, or chunked-prefill flag. Tokenizer
-    mode and the remote-code flag stay, since the concurrent oracle needs the
-    model's chat template and tokenizer.
+    count, seed, batch or memory budget, block size, prefix-caching, or
+    chunked-prefill flag. Tokenizer mode and the remote-code flag stay, since the
+    concurrent oracle needs the model's chat template and tokenizer. A verbatim
+    profile may still record the cache layout it needs (`block_size`,
+    `disable_prefix_caching`) for a host whose script leaves a default the case
+    cannot run correctly with.
     """
     if args.completion_output_path is None:
         raise ValueError("--completion-output-path is required for DSV4")
@@ -380,6 +402,21 @@ def _configure_dsv4_arguments(
     deployment_defaults = (
         [] if verbatim_launch else ["--api-server-count", "1", "--seed", "1024"]
     )
+    # The case's own deployment pins the 128-token block the DSA caches are laid
+    # out for and disables prefix caching; a verbatim profile takes its script's
+    # default unless it records one of the two.
+    block_size_flags = (
+        ["--block-size", block_size]
+        if block_size is not None
+        else ([] if verbatim_launch else ["--block-size", DSV4_BLOCK_SIZE])
+    )
+    cache_flags = (
+        ["--no-enable-prefix-caching"]
+        if disable_prefix_caching or not verbatim_launch
+        else []
+    )
+    if not verbatim_launch:
+        cache_flags.append("--enable-chunked-prefill")
     args.common_vllm_arg = [
         *deployment_defaults,
         "--max-model-len",
@@ -390,7 +427,7 @@ def _configure_dsv4_arguments(
             else []
         ),
         *(["--max-num-seqs", max_num_seqs] if max_num_seqs is not None else []),
-        *([] if verbatim_launch else ["--block-size", "128"]),
+        *block_size_flags,
         *(
             ["--gpu-memory-utilization", memory_utilization]
             if memory_utilization is not None
@@ -408,11 +445,7 @@ def _configure_dsv4_arguments(
             else []
         ),
         "--trust-remote-code",
-        *(
-            []
-            if verbatim_launch
-            else ["--no-enable-prefix-caching", "--enable-chunked-prefill"]
-        ),
+        *cache_flags,
     ]
     args.attention_vllm_arg = [
         *(
@@ -477,6 +510,8 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
         sync_camp2p_quantization(args.model, shape),
         multithread_load=shape.multithread_load,
         verbatim_launch=shape.verbatim_launch,
+        disable_prefix_caching=shape.disable_prefix_caching,
+        block_size=shape.block_size,
         **sync_runtime_profile(shape),
     )
 

@@ -205,7 +205,7 @@ hosts differ in more than rank count.
 
 | Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
-| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off | 4 |
+| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off, 128-token block, prefix caching off | 4 |
 | `afd-dsv4-flash-sync-camp2p-4a4f` | A3 (Ascend 910C) | Attention DP1/TP4 + FFN DP1/TP4, expert-parallel world at one, eager, 8192 context | 8 |
 
 DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs its
@@ -234,14 +234,16 @@ variables; on A5 the rendezvous host defaults to `127.0.0.1` and a supplied
 `HCCL_SOCKET_IFNAME` is forwarded to Gloo/TP.
 
 The fixed deployment passes `--block-size 128`, `--seed 1024`, and disables
-prefix caching on both hosts. The A3 profile passes those flags; the A5 profile
-instead emits the launch flags its host's `vllm serve` script records, minus the
-native DBO that script also enables: its own `--compilation-config`
-(`FULL_DECODE_ONLY`, capture 16), `--max-model-len 4096`, and nothing else
-beyond the tokenizer mode and the chat parsers the concurrent oracle needs.
-That profile therefore passes no API
-server count, seed, block size, batch or memory budget, prefix-caching, or
-chunked-prefill flag. It does keep the case's DSV4 model-path switches
+prefix caching. The A3 profile passes those flags; the A5 profile emits the
+launch flags its host's `vllm serve` script records, minus the native DBO that
+script also enables — its own `--compilation-config` (`FULL_DECODE_ONLY`,
+capture 16) and `--max-model-len 4096` — plus the two cache-layout settings that
+script leaves at vLLM's defaults: `--block-size 128` and
+`--no-enable-prefix-caching`. Its ten concurrent chat requests share one template
+prefix, and that reuse is the current suspect for the corrupted answers the
+profile produced before those two settings were pinned. The A5 profile therefore
+passes no API server count, seed, batch or memory budget, or chunked-prefill
+flag. It does keep the case's DSV4 model-path switches
 (`multistream_dsv4_dsa_overlap=false`, `enable_dsa_cp=false`,
 `enable_dsv4_shared_compressor_workspace=false`): the pinned runtime defaults
 the multistream DSA overlap to True, and that path's RoPE
