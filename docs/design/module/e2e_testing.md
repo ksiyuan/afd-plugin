@@ -149,9 +149,10 @@ DeepSeek V4 does not fit on a single Attention or FFN die, so A5 runs 2A2F on
 four devices and A3 4A4F on eight, and the two profiles differ in more than rank
 count: A5 follows its host's recorded `vllm serve` launch flags — Attention
 DP2/TP1 and FFN DP2/TP1 with expert parallelism, that script's own
-`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), a 4096 context, and no
-API server count, seed, block size, batch or memory budget,
-prefix-caching, or chunked-prefill flag — while A3 shards by tensor parallel
+`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), a 4096 context, and the
+case's 128-token block with prefix caching off, since that script leaves both at
+a default — and passes no API server count, seed, batch or memory budget, or
+chunked-prefill flag, while A3 shards by tensor parallel
 with the expert-parallel world at one, eager, with the 8192/1024 budget and the
 case's deployment flags. A5 keeps the case's DSV4 model-path switches
 (`multistream_dsv4_dsa_overlap=false` among them), because the pinned runtime

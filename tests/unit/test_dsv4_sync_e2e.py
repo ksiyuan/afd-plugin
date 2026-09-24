@@ -135,17 +135,20 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
             )
         if profile.verbatim_launch:
             # Only the script's own deployment flags, plus the tokenizer mode and
-            # parsers the concurrent chat oracle needs.
+            # parsers the concurrent chat oracle needs, plus the cache layout the
+            # profile records where the script leaves a default it cannot use.
             for absent in (
                 "--api-server-count",
                 "--seed",
-                "--block-size",
-                "--no-enable-prefix-caching",
-                "--enable-chunked-prefill",
                 "--data-parallel-address",
                 "--no-disable-hybrid-kv-cache-manager",
+                "--enable-chunked-prefill",
             ):
                 assert absent not in command, absent
+            assert _flag_value(command, "--block-size") == profile.block_size
+            assert ("--no-enable-prefix-caching" in command) is (
+                profile.disable_prefix_caching
+            )
         else:
             assert command[command.index("--api-server-count") + 1] == "1"
             assert command[command.index("--seed") + 1] == "1024"
