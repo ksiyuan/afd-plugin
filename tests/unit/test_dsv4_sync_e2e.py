@@ -50,6 +50,7 @@ def _arguments(
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_API_PORT", raising=False)
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_AFD_PORT", raising=False)
     monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION", raising=False)
+    monkeypatch.delenv("AFD_NPU_DSV4_SYNC_E2E_EAGER", raising=False)
     for name in (
         "AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN",
         "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS",
@@ -460,6 +461,19 @@ def test_dsv4_sync_a3_environment_needs_no_cam_package(monkeypatch):
     assert env["AFD_FORCE_BALANCED_TOPK_IDS"] == "0"
     assert "CAM_CUST_OPAPI_LIB_PATH" not in env
     assert "HCCL_BUFFSIZE" not in env
+
+
+def test_dsv4_sync_eager_override_drops_graph_capture(monkeypatch, tmp_path):
+    """A host whose capture path trips a runtime op can fall back to eager."""
+    args = _arguments(monkeypatch, tmp_path)
+    monkeypatch.setenv("AFD_NPU_DSV4_SYNC_E2E_EAGER", "1")
+    runner.configure_scenario(args)
+
+    assert args.cuda_graph_full_decode_only is False
+    command = runner.build_vllm_command(args, role="attention")
+
+    assert "--enforce-eager" in command
+    assert "--compilation-config" not in command
 
 
 def test_dsv4_sync_a5_dbo_needs_no_debug_logging(monkeypatch, tmp_path):
