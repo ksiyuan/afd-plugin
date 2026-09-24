@@ -15,7 +15,7 @@ from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
 DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
-DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-4a4f"
+DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-8a8f"
 DSV4_SYNC_CAMP2P_SCENARIOS = (
     DSV4_SYNC_CAMP2P_A5_SCENARIO,
     DSV4_SYNC_CAMP2P_A3_SCENARIO,
@@ -75,23 +75,23 @@ DSV4_SYNC_CONNECTOR_EXTRA_CONFIG = {
 }
 
 
-# DeepSeek V4 does not fit on one Attention or one FFN die: A5 needs at least
-# 2A2F and A3 at least 4A4F. Each host runs the deployment its recorded launch
-# script uses, because the two hosts differ in more than rank count:
+# DeepSeek V4 does not fit on one Attention or one FFN die, so each host runs the
+# smallest shape its recorded launch script works with, and the two differ in
+# more than rank count:
 #
 # - A5 runs Attention DP2/TP1 and FFN DP2/TP1 with expert parallelism, ACL graph
 #   capture over 16 decodes, and the script's 4096 context, but without the
 #   script's native DBO, with prefix caching off, and with the case's 128-token
 #   block. It omits `--quantization`, `connector_extra_config`,
 #   and the multithread loader, and exports HCCL_BUFFSIZE=2048 itself.
-# - A3 shards by tensor parallel with the expert-parallel world at one, eager,
-#   with the 8192/1024 budget the A3 launch profile records.
+# - A3 runs 8A8F on sixteen dies with the parallelism its recorded deployment
+#   uses — Attention DP2/TP4 and FFN DP8/TP1 with expert parallelism — eager,
+#   with the 8192/1024 budget. Eight dies do not fit the checkpoint there.
 class DSV4SyncShape(NamedTuple):
     """Fixed synchronous CAMP2P deployment profile for one host class."""
 
     attention_ranks: int
     ffn_ranks: int
-    tp_size: int
     # Process environment that host's launch script relies on. AFD forces spawn
     # multiprocessing so workers re-initialize the device in a fresh process, and
     # the A5 script relies on the platform default instead.
@@ -103,6 +103,10 @@ class DSV4SyncShape(NamedTuple):
     keep_hccl_buffsize: bool = False
     npu_alloc_conf: str = DSV4_SYNC_ALLOC_CONF_EXPANDABLE
     nic_env_required: bool = True
+    # Tensor-parallel size of each role; the remaining ranks of a role shard by
+    # data parallel, with expert parallelism where the host enables it.
+    attention_tp_size: int = 1
+    ffn_tp_size: int = 1
     enable_expert_parallel: bool = False
     use_graph: bool = False
     cudagraph_capture_size: int = 0
@@ -145,7 +149,6 @@ DSV4_SYNC_SHAPES = {
     DSV4_SYNC_CAMP2P_A5_SCENARIO: DSV4SyncShape(
         attention_ranks=2,
         ffn_ranks=2,
-        tp_size=1,
         enable_expert_parallel=True,
         use_graph=True,
         cudagraph_capture_size=DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE,
@@ -188,9 +191,13 @@ DSV4_SYNC_SHAPES = {
         npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
     ),
     DSV4_SYNC_CAMP2P_A3_SCENARIO: DSV4SyncShape(
-        attention_ranks=4,
-        ffn_ranks=4,
-        tp_size=4,
+        # Sixteen dies: eight do not fit the checkpoint on this host. Attention
+        # shards DP2/TP4 and FFN DP8/TP1 with expert parallelism, the shape its
+        # recorded deployment uses.
+        attention_ranks=8,
+        ffn_ranks=8,
+        attention_tp_size=4,
+        enable_expert_parallel=True,
         # Smoke coverage, like A5: this host has not been validated against the
         # answer oracle, so the case checks the concurrent plumbing only.
         check_answer=False,
@@ -373,14 +380,15 @@ def configure_scenario(args: argparse.Namespace) -> None:
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
     """Configure a synchronous CAMP2P deployment from its host profile.
 
-    The caller selects the A5 (2A2F) or A3 (4A4F) host through the scenario;
+    The caller selects the A5 (2A2F) or A3 (8A8F) host through the scenario;
     both keep the gate on FFN, because CAMP2P carries the Hash-layer token ids
     over the a2e ids channel, and neither needs a CAM vendor package. The rest
     of the deployment follows that host's recorded launch script: its rank
-    layout and expert parallelism, graph capture, the context and batch budget,
-    the weight loader, and whether the case or the caller's shell sizes the
-    CAMP2P HCCL domains. The A5 script's native DBO is the one recorded setting
-    the profile carries but leaves off, while its split path is root-caused.
+    layout, per-role tensor parallelism and expert parallelism, graph capture,
+    the context and batch budget, the weight loader, and whether the case or the
+    caller's shell sizes the CAMP2P HCCL domains. The A5 script's native DBO is
+    the one recorded setting the profile carries but leaves off, while its split
+    path is root-caused.
     """
     shape = DSV4_SYNC_SHAPES[args.scenario]
     args.afd_connector = DSV4_SYNC_CAMP2P_CONNECTOR

@@ -195,7 +195,7 @@ Defaults: API ports 19280/19281, AFD rendezvous port 6455, startup timeout
 `AFD_NPU_E2E_VLLM_BIN` selects the executable. Build the plugin-owned 910C
 operators before running. Model and all sixteen device IDs must be supplied explicitly; missing setup fails rather than skips.
 
-## DSV4 Flash sync CAMP2P concurrent requests (local, 4 or 8 NPUs)
+## DSV4 Flash sync CAMP2P concurrent requests (local, 4 or 16 NPUs)
 
 Two local-only scenarios run DeepSeek V4 Flash over the synchronous
 `CAMP2pAFDConnector` — no CAM vendor package, since the plugin's own a2e/e2a
@@ -205,12 +205,13 @@ recorded launch shape:
 | Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
 | `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off, 128-token block, prefix caching off | 4 |
-| `afd-dsv4-flash-sync-camp2p-4a4f` | A3 (Ascend 910C) | Attention DP1/TP4 + FFN DP1/TP4, expert-parallel world at one, eager, 8192 context | 8 |
+| `afd-dsv4-flash-sync-camp2p-8a8f` | A3 (Ascend 910C) | Attention DP2/TP4 + FFN DP8/TP1, expert parallel, eager, 8192 context | 16 |
 
 Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
 `910c` on A3). The device list is role-defining — the first `attention_ranks`
 entries go to Attention and the rest to FFN, so A5 passes `2,3,0,1` for its
-recorded mapping — and a list sized for the other host fails rather than skips.
+recorded mapping and A3 passes `0-7` for Attention with `8-15` for FFN — and a
+list sized for the other host fails rather than skips.
 
 Both profiles are **smoke cases**: the async case's ten concurrent chat requests
 (`12 + 7` … `21 + 7`, temperature=0, thinking=false, max_tokens=256) must be served
@@ -254,12 +255,12 @@ export HCCL_IF_IP=<local-communication-ip>   # optional on A5
 export HCCL_SOCKET_IFNAME=eth0               # optional on A5
 python -m pytest -q -s \
   'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-2a2f]'
-# A3: eight dies, Attention on 0-3 and FFN on 4-7
-export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7
+# A3: sixteen dies, Attention on 0-7 and FFN on 8-15
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export HCCL_IF_IP=<local-communication-ip>   # required on A3
 export HCCL_SOCKET_IFNAME=eth0              # required on A3
 python -m pytest -q -s \
-  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-4a4f]'
+  'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-8a8f]'
 ```
 
 Defaults: API ports 19380/19381, AFD rendezvous port 6456, startup timeout

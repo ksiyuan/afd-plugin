@@ -474,7 +474,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
     elif active_sync_profile is not None:
-        args.attention_tp_size = active_sync_profile.tp_size
+        args.attention_tp_size = active_sync_profile.attention_tp_size
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -489,7 +489,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
         # A synchronous DSV4 profile sizes the FFN side exactly like its
         # Attention side: A5 shards by data parallel with expert parallelism,
         # A3 by tensor parallel.
-        args.ffn_tp_size = active_sync_profile.tp_size
+        args.ffn_tp_size = active_sync_profile.ffn_tp_size
     else:
         args.ffn_tp_size = 1
     args.use_v2_model_runner = args.scenario in V2_SCENARIOS

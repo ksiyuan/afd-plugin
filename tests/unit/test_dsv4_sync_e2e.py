@@ -17,12 +17,13 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SYNC_SHAPES,
 )
 
-# (attention DP, attention TP, FFN DP, FFN TP) each profile must produce. The
-# A5 profile shards by data parallel with expert parallelism, the A3 profile by
-# tensor parallel.
+# (attention DP, attention TP, FFN DP, FFN TP) each profile must produce. A5
+# shards both roles by data parallel with expert parallelism; A3 uses the shape
+# its recorded deployment runs, Attention DP2/TP4 and FFN DP8/TP1 with expert
+# parallelism on sixteen dies.
 EXPECTED_PARALLELISM = {
     DSV4_SYNC_CAMP2P_A5_SCENARIO: ("2", "1", "2", "1"),
-    DSV4_SYNC_CAMP2P_A3_SCENARIO: ("1", "4", "1", "4"),
+    DSV4_SYNC_CAMP2P_A3_SCENARIO: ("2", "4", "8", "1"),
 }
 
 
