@@ -176,7 +176,11 @@ which the case does not: the DBO split path is the current suspect for the DSA
 attention operator tiling failure seen on this profile, so the case leaves DBO
 off while that is root-caused. The profile keeps the recorded thresholds, and
 neither the split coverage gate nor forced `VLLM_LOGGING_LEVEL=DEBUG` applies
-while it is off.
+while it is off. The A5 case still corrupts answers under concurrent load — a
+repeated operand, a degenerate repetition loop, and a refusal, with no stable
+failing request — so it registers as an expected failure
+(`xfail(strict=False)`) until that is located; the e2e README records the
+symptom and everything ruled out so far.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,
