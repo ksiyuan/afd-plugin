@@ -61,8 +61,6 @@ DSV4_PROCESS_TERMINATION_TIMEOUT_S = 60
 # is a one-field change.
 DSV4_SYNC_A5_MAX_MODEL_LEN = "4096"
 DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE = 16
-DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
-DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD = 12
 DSV4_SYNC_ALLOC_CONF_EXPANDABLE = "expandable_segments:True"
 DSV4_SYNC_ALLOC_CONF_PLAIN = "expandable_segments:False"
 # The A5 script runs both roles on one host and announces the loopback address.
@@ -110,9 +108,6 @@ class DSV4SyncShape(NamedTuple):
     enable_expert_parallel: bool = False
     use_graph: bool = False
     cudagraph_capture_size: int = 0
-    enable_dbo: bool = False
-    dbo_decode_token_threshold: int = 0
-    dbo_prefill_token_threshold: int = 0
     max_model_len: str = DSV4_SYNC_MAX_MODEL_LEN
     # None omits the flag entirely so vLLM's own default applies.
     max_num_batched_tokens: str | None = DSV4_SYNC_MAX_NUM_BATCHED_TOKENS
@@ -152,13 +147,6 @@ DSV4_SYNC_SHAPES = {
         enable_expert_parallel=True,
         use_graph=True,
         cudagraph_capture_size=DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE,
-        # The script enables native DBO at 2/12. The case keeps those recorded
-        # thresholds but not the feature: the DBO split path is the current
-        # suspect for the DSA attention operator tiling failure seen on A5, so it
-        # stays off while that is root-caused. Re-enabling it is this one field.
-        enable_dbo=False,
-        dbo_decode_token_threshold=DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD,
-        dbo_prefill_token_threshold=DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD,
         max_model_len=DSV4_SYNC_A5_MAX_MODEL_LEN,
         max_num_batched_tokens=None,
         max_num_seqs=None,

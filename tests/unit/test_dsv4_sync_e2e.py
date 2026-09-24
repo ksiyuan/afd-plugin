@@ -72,7 +72,8 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
     assert args.compute_gate_on_attention is False
     assert args.gsm8k_output_path is None
     assert args.cuda_graph_full_decode_only is profile.use_graph
-    assert args.enable_dbo is profile.enable_dbo
+    # The recorded A5 DBO stays off, so no DBO flag reaches vLLM.
+    assert args.enable_dbo is False
     expected = EXPECTED_PARALLELISM[scenario]
     for role, dp, tp in (
         ("attention", expected[0], expected[1]),
@@ -93,7 +94,7 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
         assert ("--enable-expert-parallel" in command) is (
             profile.enable_expert_parallel
         )
-        assert ("--enable-dbo" in command) is profile.enable_dbo
+        assert "--enable-dbo" not in command
         assert ("--enforce-eager" in command) is not profile.use_graph
         if profile.compilation_config is not None:
             # A verbatim profile passes its host script's compilation config and
