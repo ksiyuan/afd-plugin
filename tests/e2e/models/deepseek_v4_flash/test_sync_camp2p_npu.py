@@ -4,11 +4,11 @@
 
 DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs
 its own recorded launch profile: the A5 case runs Attention DP2/TP1 and FFN
-DP2/TP1 with expert parallelism, graph capture, and native DBO on four dies,
-while the A3 case shards by tensor parallel on eight. The synchronous connector
-needs no CAM vendor package: the plugin's own a2e/e2a operators carry the
-activations and, for the DeepSeek V4 Hash layers, the token ids that the
-FFN-side gate routes with.
+DP2/TP1 with expert parallelism and graph capture on four dies, without the
+native DBO its launch script records, while the A3 case shards by tensor
+parallel on eight. The synchronous connector needs no CAM vendor package: the
+plugin's own a2e/e2a operators carry the activations and, for the DeepSeek V4
+Hash layers, the token ids that the FFN-side gate routes with.
 """
 
 from __future__ import annotations

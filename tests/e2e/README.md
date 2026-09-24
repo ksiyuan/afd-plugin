@@ -205,7 +205,7 @@ hosts differ in more than rank count.
 
 | Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
-| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), native DBO (2/12), 4096 context | 4 |
+| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), 4096 context, native DBO off | 4 |
 | `afd-dsv4-flash-sync-camp2p-4a4f` | A3 (Ascend 910C) | Attention DP1/TP4 + FFN DP1/TP4, expert-parallel world at one, eager, 8192 context | 8 |
 
 DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs its
@@ -235,10 +235,11 @@ variables; on A5 the rendezvous host defaults to `127.0.0.1` and a supplied
 
 The fixed deployment passes `--block-size 128`, `--seed 1024`, and disables
 prefix caching on both hosts. The A3 profile passes those flags; the A5 profile
-instead emits exactly the launch flags its host's `vllm serve` script records —
-its own `--compilation-config` (`FULL_DECODE_ONLY`, capture 16), native DBO at
-2/12, `--max-model-len 4096`, and nothing else beyond the tokenizer mode and the
-chat parsers the concurrent oracle needs. That profile therefore passes no API
+instead emits the launch flags its host's `vllm serve` script records, minus the
+native DBO that script also enables: its own `--compilation-config`
+(`FULL_DECODE_ONLY`, capture 16), `--max-model-len 4096`, and nothing else
+beyond the tokenizer mode and the chat parsers the concurrent oracle needs.
+That profile therefore passes no API
 server count, seed, block size, batch or memory budget, prefix-caching, or
 chunked-prefill flag. It does keep the case's DSV4 model-path switches
 (`multistream_dsv4_dsa_overlap=false`, `enable_dsa_cp=false`,
@@ -261,12 +262,12 @@ with `stop`. Service liveness and owned-process cleanup must pass, with 60
 seconds allowed for shutdown before escalation. This path does **not** take the
 async FFN cleanup exception, because no CAM receive is pending.
 
-A5 runs native DBO. It is exercised end to end but not machine-verified there:
-the DBO coverage gate matches vLLM's GPU model runner debug line that prints
-the created `UBatchSlice` objects, and the pinned Ascend NPU runtime logs no
-equivalent line. The A5 run therefore keeps the caller's logging level instead
-of forcing `VLLM_LOGGING_LEVEL=DEBUG`, and prints a `[dbo-coverage]` notice in
-place of the gate. The A3 profile stays eager and has no DBO to verify.
+The A5 script enables native DBO at 2/12; the case does not. The DBO split path
+is the current suspect for the DSA attention operator tiling failure seen on
+this profile, so DBO stays off while that is root-caused. The profile keeps the
+script's recorded thresholds, so re-enabling it is one field, and while it is
+off neither the split coverage gate nor forced `VLLM_LOGGING_LEVEL=DEBUG`
+applies. The A3 profile stays eager and has no DBO either.
 
 ```bash
 export AFD_E2E_BACKEND=npu

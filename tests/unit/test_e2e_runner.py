@@ -479,8 +479,10 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         (
             dsv4_config.DSV4_SYNC_CAMP2P_A5_SCENARIO,
             # The A5 profile runs Attention DP2/TP1 and FFN DP2/TP1 with ACL
-            # graph capture and native DBO, exactly like its launch script.
-            (False, True, True, 2, 2, 1, 1, 1, False),
+            # graph capture like its launch script, but without that script's
+            # native DBO, whose split path is the current suspect for the A5 DSA
+            # attention operator tiling failure.
+            (False, True, False, 2, 2, 1, 1, 1, False),
         ),
         (
             dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,

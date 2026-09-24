@@ -236,9 +236,8 @@ def test_dsv4_sync_main_uses_concurrent_requests_and_longer_cleanup(
     )
     assert runner.main() == 0
     assert evaluations == ["concurrent"]
-    # The DBO coverage gate only runs where the runtime logs a two-ubatch split
-    # line; the A5 profile exercises DBO without machine verification and says
-    # so in its output.
+    # The DBO coverage gate runs only for a profile that enables DBO and whose
+    # runtime logs a two-ubatch split line; the A5 profile runs without DBO.
     profile = DSV4_SYNC_SHAPES[scenario]
     expected_checks = int(
         profile.enable_dbo and profile.dbo_split_evidence_available,
@@ -476,8 +475,15 @@ def test_dsv4_sync_eager_override_drops_graph_capture(monkeypatch, tmp_path):
     assert "--compilation-config" not in command
 
 
-def test_dsv4_sync_a5_dbo_needs_no_debug_logging(monkeypatch, tmp_path):
-    """The A5 runtime logs no split line, so DBO keeps the caller's log level."""
+def test_dsv4_sync_a5_runs_without_dbo(monkeypatch, tmp_path):
+    """The A5 case drops the native DBO its host script records.
+
+    The script runs DBO at 2/12, but the DBO split path is the current suspect
+    for the DSA attention operator tiling failure seen on A5, so the profile
+    keeps the recorded thresholds off while that is root-caused. With DBO off no
+    DBO flag reaches vLLM, and neither the coverage gate nor forced DEBUG
+    logging applies.
+    """
     monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
     args = _arguments(
         monkeypatch,
@@ -485,8 +491,16 @@ def test_dsv4_sync_a5_dbo_needs_no_debug_logging(monkeypatch, tmp_path):
         scenario=DSV4_SYNC_CAMP2P_A5_SCENARIO,
     )
     runner.configure_scenario(args)
-    assert args.enable_dbo is True
-    assert runner.dbo_split_evidence_available(args) is False
+    assert args.enable_dbo is False
+
+    command = runner.build_vllm_command(args, role="attention")
+
+    for absent in (
+        "--enable-dbo",
+        "--dbo-decode-token-threshold",
+        "--dbo-prefill-token-threshold",
+    ):
+        assert absent not in command, absent
 
     env = runner.build_env("2,3", args, role="attention")
 
