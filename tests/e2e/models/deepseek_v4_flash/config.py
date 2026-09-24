@@ -439,15 +439,16 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
     )
 
 
-def additional_config(verbatim_launch: bool = False) -> dict[str, bool]:
-    """Return the DSV4 deployment switches for the scenario's `additional_config`.
+def additional_config() -> dict[str, bool]:
+    """Return the DSV4 model-path switches every DSV4 case pins.
 
-    The asynchronous and A3 cases pin these switches explicitly. A profile that
-    follows its host's launch script emits none of them, because that script
-    passes only the AFD block and relies on the runtime defaults.
+    These are not deployment preferences. The pinned Ascend runtime defaults
+    `multistream_dsv4_dsa_overlap` to True (`vllm_ascend/ascend_config.py`), and
+    that path drives the DSA RoPE through `inplace_partial_rotary_mul`, whose
+    tiling function rejects the shapes A5 hands it. The case therefore keeps the
+    switch off, alongside the DSA context-parallel and shared-compressor paths
+    it does not cover.
     """
-    if verbatim_launch:
-        return {}
     return {
         "enable_cpu_binding": True,
         "enable_force_load_balance": False,

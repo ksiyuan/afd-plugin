@@ -235,14 +235,16 @@ variables; on A5 the rendezvous host defaults to `127.0.0.1` and a supplied
 
 The fixed deployment passes `--block-size 128`, `--seed 1024`, and disables
 prefix caching on both hosts. The A3 profile passes those flags; the A5 profile
-instead emits exactly the `vllm serve` invocation its host's launch script
-records — the AFD block as the whole `additional_config`, its own
-`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), native DBO at 2/12,
-`--max-model-len 4096`, and nothing else beyond the tokenizer mode and the chat
-parsers the concurrent oracle needs. That profile therefore passes no API
+instead emits exactly the launch flags its host's `vllm serve` script records —
+its own `--compilation-config` (`FULL_DECODE_ONLY`, capture 16), native DBO at
+2/12, `--max-model-len 4096`, and nothing else beyond the tokenizer mode and the
+chat parsers the concurrent oracle needs. That profile therefore passes no API
 server count, seed, block size, batch or memory budget, prefix-caching, or
-chunked-prefill flag, and leaves the deployment switches of the DSV4
-`additional_config` at the runtime defaults. Every budget value is still
+chunked-prefill flag. It does keep the case's DSV4 model-path switches
+(`multistream_dsv4_dsa_overlap=false`, `enable_dsa_cp=false`,
+`enable_dsv4_shared_compressor_workspace=false`): the pinned runtime defaults
+the multistream DSA overlap to True, and that path's RoPE
+(`inplace_partial_rotary_mul`) fails to tile on A5. Every budget value is still
 overridable per host with `AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN`,
 `AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS`,
 `AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS` (never below the ten concurrent requests),
