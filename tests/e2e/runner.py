@@ -463,7 +463,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         scenario_settings[sync_scenario] = (
             False,
-            sync_profile.use_graph,
+            dsv4_config.sync_use_graph(sync_profile),
             sync_profile.enable_dbo,
             sync_profile.attention_ranks,
             sync_profile.ffn_ranks,
@@ -763,13 +763,18 @@ def build_vllm_command(
                 "--no-async-scheduling",
             ],
         )
-    if sync_profile is not None and sync_profile.compilation_config is not None:
-        # A verbatim profile passes the exact compilation config its host script
-        # uses, so the runner adds none of its own capture-size flags.
+    profile_compilation_config = (
+        None
+        if sync_profile is None
+        else dsv4_config.sync_compilation_config(sync_profile)
+    )
+    if profile_compilation_config is not None:
+        # A profile that carries its host script's compilation config passes it
+        # verbatim, so the runner adds none of its own capture-size flags.
         cmd.extend(
             [
                 "--compilation-config",
-                json.dumps(sync_profile.compilation_config, separators=(",", ":")),
+                json.dumps(profile_compilation_config, separators=(",", ":")),
             ],
         )
     elif args.cuda_graph_full_decode_only:

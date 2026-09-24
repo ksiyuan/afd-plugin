@@ -68,6 +68,8 @@ DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
 DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD = 12
 DSV4_SYNC_ALLOC_CONF_EXPANDABLE = "expandable_segments:True"
 DSV4_SYNC_ALLOC_CONF_PLAIN = "expandable_segments:False"
+# Force eager execution for a host whose graph-capture path fails at runtime.
+DSV4_SYNC_EAGER_ENV = "AFD_NPU_DSV4_SYNC_E2E_EAGER"
 # The A5 script runs both roles on one host and announces the loopback address.
 DSV4_SYNC_LOCAL_AFD_HOST = "127.0.0.1"
 # The A3 profile sizes its CAMP2P domains per domain instead of through the
@@ -183,6 +185,28 @@ DSV4_SYNC_SHAPES = {
         tp_size=4,
     ),
 }
+
+
+def sync_use_graph(shape: DSV4SyncShape) -> bool:
+    """Return whether the profile captures ACL graphs instead of running eager.
+
+    A host whose graph-capture path trips a runtime operator failure can be
+    switched to eager without editing the case by setting
+    `AFD_NPU_DSV4_SYNC_E2E_EAGER` to a truthy value.
+    """
+    return shape.use_graph and not _env_flag(DSV4_SYNC_EAGER_ENV)
+
+
+def sync_compilation_config(shape: DSV4SyncShape) -> dict[str, object] | None:
+    """Return the profile's exact `--compilation-config`, or None when eager."""
+    if not sync_use_graph(shape):
+        return None
+    return shape.compilation_config
+
+
+def _env_flag(name: str) -> bool:
+    """Return whether an environment switch is set to a truthy value."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def sync_shape(scenario: str) -> DSV4SyncShape | None:

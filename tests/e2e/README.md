@@ -249,7 +249,9 @@ overridable per host with `AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN`,
 `AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS`,
 `AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS` (never below the ten concurrent requests),
 and `AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION`, so a host can be retuned without
-editing the case. The gate stays on FFN in both profiles — CAMP2P rejects
+editing the case. `AFD_NPU_DSV4_SYNC_E2E_EAGER=1` runs the synchronous cases
+without ACL graph capture, for a host whose capture path trips a runtime
+operator failure. The gate stays on FFN in both profiles — CAMP2P rejects
 `compute_gate_on_attention=true`. KV transfer is not enabled.
 
 The concurrent oracle and its assertions match the async case: ten chat
