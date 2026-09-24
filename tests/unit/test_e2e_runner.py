@@ -478,7 +478,9 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),
         (
             dsv4_config.DSV4_SYNC_CAMP2P_A5_SCENARIO,
-            (False, False, False, 2, 2, 1, 2, 2, False),
+            # The A5 profile runs Attention DP2/TP1 and FFN DP2/TP1 with ACL
+            # graph capture and native DBO, exactly like its launch script.
+            (False, True, True, 2, 2, 1, 1, 1, False),
         ),
         (
             dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,
@@ -517,11 +519,29 @@ def test_configure_scenario_overwrites_fixed_topology_and_features(
         args.ffn_tp_size,
         args.use_v2_model_runner,
     ) == expected
+    # A scenario that carries its own launch profile (the DSV4 synchronous
+    # cases) uses that profile's graph and DBO settings instead of the defaults.
+    profile = dsv4_config.sync_shape(scenario)
     if args.cuda_graph_full_decode_only:
-        assert args.cudagraph_capture_size == 8
+        expected_capture_size = (
+            profile.cudagraph_capture_size
+            if profile is not None
+            else runner.DEFAULT_CUDAGRAPH_CAPTURE_SIZE
+        )
+        assert args.cudagraph_capture_size == expected_capture_size
     if args.enable_dbo:
-        assert args.dbo_decode_token_threshold == 1
-        assert args.dbo_prefill_token_threshold == 8
+        expected_decode_threshold = (
+            profile.dbo_decode_token_threshold
+            if profile is not None
+            else runner.DEFAULT_DBO_DECODE_TOKEN_THRESHOLD
+        )
+        expected_prefill_threshold = (
+            profile.dbo_prefill_token_threshold
+            if profile is not None
+            else runner.DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD
+        )
+        assert args.dbo_decode_token_threshold == expected_decode_threshold
+        assert args.dbo_prefill_token_threshold == expected_prefill_threshold
 
 
 def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():

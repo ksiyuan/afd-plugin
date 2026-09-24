@@ -143,22 +143,27 @@ GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
 FFN cleanup exception above and is not selected by the four-device PR gate.
 
 `afd-dsv4-flash-sync-camp2p-2a2f` (A5) and `afd-dsv4-flash-sync-camp2p-4a4f`
-(A3) are the synchronous siblings of that case: local-only DSV4 Flash runs
-over `CAMP2pAFDConnector`, eager. DeepSeek V4 does not fit on a single
-Attention or FFN die, so each host runs its smallest workable shape — 2A2F on
-four devices for A5 and 4A4F on eight for A3 — as tensor-parallel shards with
-the expert-parallel world left at one, because an EP world greater than one
-selects MC2 on A5 whose dispatch operator does not tile. They need no CAM
-vendor package: the plugin's own a2e/e2a operators carry both the activations
-and, for the DSV4 Hash layers, the token ids the FFN-side gate routes with, so
-this is the transport available on both A3 and A5 once the ops are built for
-the target SOC. Because CAMP2P rejects gate-on-Attention and any nonzero CAM
-quantization mode, the gate stays on FFN and `connector_extra_config` carries
-only `hccl_buffer_size` and `quant_mode=0`; `--quantization ascend` is passed
-only when the checkpoint does not declare another method. Both cases reuse the
-ten-request concurrent oracle of the async case, take the same 60-second
-shutdown grace, and deliberately do **not** take the async FFN cleanup
-exception: no CAM receive is pending on this path.
+(A3) are the synchronous siblings of that case: local-only DSV4 Flash runs over
+`CAMP2pAFDConnector`, each following its host's recorded launch profile.
+DeepSeek V4 does not fit on a single Attention or FFN die, so A5 runs 2A2F on
+four devices and A3 4A4F on eight, and the two profiles differ in more than rank
+count: A5 shards by data parallel (Attention DP2/TP1, FFN DP2/TP1) with expert
+parallelism, ACL graph capture in `FULL_DECODE_ONLY` over 16 decodes, native
+DBO, and the script's 4096 context, while A3 shards by tensor parallel with the
+expert-parallel world at one, eager, with the 8192/1024 budget. A5 also passes
+no `--quantization` and sizes no CAMP2P domain itself, keeping the script's
+global `HCCL_BUFFSIZE`; A3 carries `connector_extra_config` with only
+`hccl_buffer_size` and `quant_mode=0` and resolves the Ascend quantization
+method from its checkpoint. Neither needs a CAM vendor package: the plugin's own
+a2e/e2a operators carry both the activations and, for the DSV4 Hash layers, the
+token ids the FFN-side gate routes with, so this is the transport available on
+both A3 and A5 once the ops are built for the target SOC. Because CAMP2P rejects
+gate-on-Attention and any nonzero CAM quantization mode, the gate stays on FFN
+in both profiles. Each case reuses the ten-request concurrent oracle of the
+async case, takes the same 60-second shutdown grace, and deliberately does
+**not** take the async FFN cleanup exception: no CAM receive is pending on this
+path. A5 enables native DBO, so its evaluation window must additionally record
+a live two-ubatch step.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,

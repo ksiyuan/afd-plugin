@@ -34,6 +34,7 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SCENARIOS,
     DSV4_SYNC_CAMP2P_SCENARIOS,
     DSV4_SYNC_SHAPES,
+    sync_shape,
 )
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
@@ -53,6 +54,11 @@ ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
 ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
 V2_SYNC_CONNECTOR = "P2pNcclAFDConnector"
+# Graph capture and DBO defaults for the scenarios that do not carry their own
+# launch profile; the DSV4 synchronous profiles override both.
+DEFAULT_CUDAGRAPH_CAPTURE_SIZE = 8
+DEFAULT_DBO_DECODE_TOKEN_THRESHOLD = 1
+DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD = 8
 V2_SCENARIOS = (
     "afd-v2-eager-1a1f",
     "afd-v2-eager-dp2",
@@ -443,13 +449,13 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
     }
-    for sync_scenario, shape in DSV4_SYNC_SHAPES.items():
+    for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
         scenario_settings[sync_scenario] = (
             False,
-            False,
-            False,
-            shape.attention_ranks,
-            shape.ffn_ranks,
+            sync_profile.use_graph,
+            sync_profile.enable_dbo,
+            sync_profile.attention_ranks,
+            sync_profile.ffn_ranks,
         )
     baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
         args.scenario
@@ -460,11 +466,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
     args.tp_size = 1
-    sync_shape = DSV4_SYNC_SHAPES.get(args.scenario)
+    active_sync_profile = sync_shape(args.scenario)
     if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
-    elif sync_shape is not None:
-        args.attention_tp_size = sync_shape.tp_size
+    elif active_sync_profile is not None:
+        args.attention_tp_size = active_sync_profile.tp_size
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -475,10 +481,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.attention_tp_size = 1
     if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
         args.ffn_tp_size = 2
-    elif sync_shape is not None:
-        # The synchronous DSV4 shapes are square, so the FFN side shards by the
-        # same tensor-parallel size and never enables expert parallelism.
-        args.ffn_tp_size = sync_shape.tp_size
+    elif active_sync_profile is not None:
+        # A synchronous DSV4 profile sizes the FFN side exactly like its
+        # Attention side: A5 shards by data parallel with expert parallelism,
+        # A3 by tensor parallel.
+        args.ffn_tp_size = active_sync_profile.tp_size
     else:
         args.ffn_tp_size = 1
     args.use_v2_model_runner = args.scenario in V2_SCENARIOS
@@ -544,15 +551,28 @@ def configure_scenario(args: argparse.Namespace) -> None:
     elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
         dsv4_config.configure_sync_camp2p_scenario(args)
     if use_graph:
-        args.cudagraph_capture_size = 8
+        args.cudagraph_capture_size = (
+            active_sync_profile.cudagraph_capture_size
+            if active_sync_profile is not None
+            else DEFAULT_CUDAGRAPH_CAPTURE_SIZE
+        )
     if enable_dbo:
-        args.dbo_decode_token_threshold = 1
-        args.dbo_prefill_token_threshold = 8
-        if not any(
-            arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
-        ):
-            args.common_vllm_arg.append("--no-enable-chunked-prefill")
-        if not any(
+        args.dbo_decode_token_threshold = (
+            active_sync_profile.dbo_decode_token_threshold
+            if active_sync_profile is not None
+            else DEFAULT_DBO_DECODE_TOKEN_THRESHOLD
+        )
+        args.dbo_prefill_token_threshold = (
+            active_sync_profile.dbo_prefill_token_threshold
+            if active_sync_profile is not None
+            else DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD
+        )
+        # A DSV4 sync profile says whether its launch script keeps chunked
+        # prefill alongside DBO; every other DBO scenario disables it.
+        if (
+            active_sync_profile is None
+            or active_sync_profile.dbo_disables_chunked_prefill
+        ) and not any(
             arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.append("--no-enable-chunked-prefill")
@@ -711,10 +731,12 @@ def build_vllm_command(
         "--tensor-parallel-size",
         str(tp_size),
     ]
-    if args.scenario not in DSV4_SYNC_CAMP2P_SCENARIOS:
-        # The synchronous DSV4 shapes shard DeepSeek V4 by tensor parallel and
-        # keep the expert-parallel world at one: an EP world greater than one
-        # selects MC2 on A5, whose dispatch operator does not tile.
+    sync_profile = sync_shape(args.scenario)
+    if sync_profile is None or sync_profile.enable_expert_parallel:
+        # Non-DSV4 AFD scenarios always run expert parallel. The A5 DSV4 sync
+        # profile follows its launch script, which runs Attention DP2/TP1 and
+        # FFN DP2/TP1 with expert parallelism; the A3 profile shards by tensor
+        # parallel and keeps the expert-parallel world at one.
         cmd.append("--enable-expert-parallel")
     cmd.extend(
         [
@@ -732,10 +754,16 @@ def build_vllm_command(
         )
     if args.cuda_graph_full_decode_only:
         capture_size = str(args.cudagraph_capture_size)
+        # A scenario that fixes its own `--max-num-seqs` (the DSV4 launch
+        # profiles do) keeps it: the capture size only has to cover it.
+        max_num_seqs_args = (
+            []
+            if any(arg == "--max-num-seqs" for arg in args.common_vllm_arg)
+            else ["--max-num-seqs", capture_size]
+        )
         cmd.extend(
             [
-                "--max-num-seqs",
-                capture_size,
+                *max_num_seqs_args,
                 "--max-cudagraph-capture-size",
                 capture_size,
                 "--cudagraph-capture-sizes",
