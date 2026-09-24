@@ -15,6 +15,7 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SYNC_CAMP2P_A3_SCENARIO,
     DSV4_SYNC_CAMP2P_A5_SCENARIO,
     DSV4_SYNC_SHAPES,
+    DSV4SyncShape,
 )
 
 # (attention DP, attention TP, FFN DP, FFN TP) each profile must produce. The
@@ -318,28 +319,24 @@ def test_dsv4_sync_a5_afd_host_defaults_to_loopback(monkeypatch, tmp_path):
 
 
 def test_dsv4_sync_profiles_carry_the_recorded_host_facts(monkeypatch, tmp_path):
-    """A run needs no device list, and only A3 needs a weights path."""
+    """A run needs no device list and no weights path on either host."""
     monkeypatch.delenv("AFD_E2E_DEVICES", raising=False)
     monkeypatch.delenv("AFD_NPU_E2E_MODEL", raising=False)
     monkeypatch.delenv("AFD_E2E_BACKEND", raising=False)
 
-    shape = DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A5_SCENARIO]
-    command = entrypoint.build_runner_command(
-        DSV4_SYNC_CAMP2P_A5_SCENARIO,
-        tmp_path / "responses.json",
-    )
-    assert command[command.index("--model") + 1] == shape.model
-    assert command[command.index("--attention-devices") + 1] == ",".join(
-        shape.devices[: shape.attention_ranks],
-    )
-    assert command[command.index("--ffn-devices") + 1] == ",".join(
-        shape.devices[shape.attention_ranks :],
-    )
-
-    a3 = DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO]
-    assert a3.model is None
-    with pytest.raises(RuntimeError, match="AFD_NPU_E2E_MODEL"):
-        entrypoint.build_runner_command(
-            DSV4_SYNC_CAMP2P_A3_SCENARIO,
-            tmp_path / "responses.json",
+    for scenario in (DSV4_SYNC_CAMP2P_A5_SCENARIO, DSV4_SYNC_CAMP2P_A3_SCENARIO):
+        shape = DSV4_SYNC_SHAPES[scenario]
+        assert shape.model is not None
+        command = entrypoint.build_runner_command(scenario, tmp_path / "responses.json")
+        assert command[command.index("--model") + 1] == shape.model
+        assert command[command.index("--attention-devices") + 1] == ",".join(
+            shape.devices[: shape.attention_ranks],
         )
+        assert command[command.index("--ffn-devices") + 1] == ",".join(
+            shape.devices[shape.attention_ranks :],
+        )
+
+    # A profile that records no path still needs the caller to supply one.
+    bare = DSV4SyncShape(attention_ranks=1, ffn_ranks=1, tp_size=1)
+    with pytest.raises(RuntimeError, match="AFD_NPU_E2E_MODEL"):
+        entrypoint.model_path(bare)
