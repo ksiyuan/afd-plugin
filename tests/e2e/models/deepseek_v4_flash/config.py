@@ -64,13 +64,10 @@ DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE = 16
 DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
 DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD = 12
 # The device mapping and weights path each host's launch script records, so a
-# run needs no device list and no weights path.
+# run needs no device list and, on A5, no weights path either.
 DSV4_SYNC_A5_DEVICES = ("2", "3", "0", "1")
 DSV4_SYNC_A5_MODEL = "/mnt/weight/A5-weights/DeepSeek-V4-Flash"
 DSV4_SYNC_A3_DEVICES = ("0", "1", "2", "3", "4", "5", "6", "7")
-# The A3-loadable int8 W8A8 checkpoint its launch script names; the A5 FP8/W4A8
-# one cannot load on A3.
-DSV4_SYNC_A3_MODEL = "/mnt/sfs_turbo/models/DeepSeek-V4-Flash-w8a8-mtp"
 DSV4_SYNC_ALLOC_CONF_EXPANDABLE = "expandable_segments:True"
 DSV4_SYNC_ALLOC_CONF_PLAIN = "expandable_segments:False"
 # Both scripts run their two roles on one host: the rendezvous host defaults to
@@ -210,10 +207,9 @@ DSV4_SYNC_SHAPES = {
         attention_ranks=4,
         ffn_ranks=4,
         tp_size=4,
-        # Attention on the first four dies, FFN on the last four, over the int8
-        # W8A8 checkpoint the host's launch script names.
+        # Attention on the first four dies, FFN on the last four. The weights
+        # path is deployment-specific, so the caller supplies it.
         devices=DSV4_SYNC_A3_DEVICES,
-        model=DSV4_SYNC_A3_MODEL,
         # Smoke coverage, like A5: this host has not been validated against the
         # answer oracle, so the case checks the concurrent plumbing only.
         check_answer=False,
