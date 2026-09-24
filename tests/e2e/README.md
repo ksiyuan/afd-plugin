@@ -200,59 +200,74 @@ operators before running. Model and all sixteen device IDs must be supplied expl
 Two local-only scenarios run DeepSeek V4 Flash over the synchronous
 `CAMP2pAFDConnector`, which needs no CAM vendor package: the plugin's own
 a2e/e2a operators carry the activations and the DeepSeek V4 Hash-layer token
-ids.
+ids. Each scenario runs its host's recorded launch profile, because the two
+hosts differ in more than rank count.
 
-| Scenario | Host | Shape | Devices |
+| Scenario | Host | Deployment | Devices |
 | --- | --- | --- | --- |
-| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP1/TP2 + FFN DP1/TP2 | 4 |
-| `afd-dsv4-flash-sync-camp2p-4a4f` | A3 (Ascend 910C) | Attention DP1/TP4 + FFN DP1/TP4 | 8 |
+| `afd-dsv4-flash-sync-camp2p-2a2f` | A5 (Ascend 950) | Attention DP2/TP1 + FFN DP2/TP1, expert parallel, ACL graph (`FULL_DECODE_ONLY`, capture 16), native DBO (2/12), 4096 context | 4 |
+| `afd-dsv4-flash-sync-camp2p-4a4f` | A3 (Ascend 910C) | Attention DP1/TP4 + FFN DP1/TP4, expert-parallel world at one, eager, 8192 context | 8 |
 
-DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs
-its smallest workable shape, and the ranks are tensor-parallel shards with the
-expert-parallel world left at one: an EP world greater than one selects MC2 on
-A5, whose dispatch operator does not tile. Build the operators for the target
-SOC before running — `AFD_BUILD_ASCEND_OPS=1 SOC_VERSION=ascend950` on A5 and
-`SOC_VERSION=910c` on A3 — with `python -m pip install -v
---no-build-isolation --no-deps -e .`.
+DeepSeek V4 does not fit on a single Attention or FFN die, so each host runs its
+smallest workable shape with the deployment its launch script records. Build the
+operators for the target SOC before running — `AFD_BUILD_ASCEND_OPS=1
+SOC_VERSION=ascend950` on A5 and `SOC_VERSION=910c` on A3 — with `python -m pip
+install -v --no-build-isolation --no-deps -e .`.
 
-The fixed deployment uses eager execution, MBT=1024, max-model-len=8192,
-max-num-seqs=16, block-size=128, memory utilization=0.7, and seed=1024. The
-context and batch values follow the A5/A3 launch scripts rather than the
-16-die asynchronous case's budget, because DeepSeek V4 out-of-memory on A3 is
-usually the context/batch budget and not the shard count. Each of them is
-overridable per host: `AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN`,
+The device list is role-defining: the first `attention_ranks` entries go to
+Attention and the remaining ones to FFN. The A5 run therefore passes
+`2,3,0,1`, reproducing the recorded mapping of Attention on dies 2 and 3 and FFN
+on dies 0 and 1. A list sized for the other host fails rather than skips.
+
+`--quantization` is not passed on A5, matching its script, which lets the
+FP8/W4A8 checkpoint's own `config.json` decide. On A3 the int8 W8A8 checkpoint
+is loaded through the Ascend method, so `ascend` is passed unless that
+checkpoint declares another method. Set `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` to
+force a value, or to `none` to omit the flag and let the checkpoint decide.
+
+The A5 profile also keeps `HCCL_BUFFSIZE=2048`, its plain allocator setting
+(`PYTORCH_NPU_ALLOC_CONF=expandable_segments:False`), and the platform's
+default multiprocessing start method, and it sizes no CAMP2P HCCL domain
+itself. The A3 profile drops any inherited `HCCL_BUFFSIZE` and sizes its CAMP2P
+domains through `connector_extra_config`. Only the A3 profile requires the NIC
+variables; on A5 the rendezvous host defaults to `127.0.0.1` and a supplied
+`HCCL_SOCKET_IFNAME` is forwarded to Gloo/TP.
+
+The fixed deployment passes `--block-size 128`, `--seed 1024`, and disables
+prefix caching on both hosts. The A5 profile passes neither a batch budget nor a
+memory utilization, exactly like its script; the A3 profile uses MBT=1024,
+max-num-seqs=16, and memory utilization 0.7. Every budget value is overridable
+per host with `AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN`,
 `AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS`,
 `AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS` (never below the ten concurrent requests),
-and `AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION`. Both roles explicitly disable
+and `AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION`, so a host can be retuned without
+editing the case. Both roles explicitly disable
 `enable_dsv4_shared_compressor_workspace`. The gate stays on FFN — CAMP2P
-rejects `compute_gate_on_attention=true` — and `connector_extra_config`
-carries only `hccl_buffer_size=2048` and `quant_mode=0`. Prefix caching,
-native DBO, and KV transfer are not enabled.
-
-`--quantization ascend` is passed only when the checkpoint does not declare
-another method in its own `config.json`: the A3 int8 W8A8 checkpoint is loaded
-through the Ascend method, while the A5 FP8/W4A8 checkpoint declares `fp8` and
-vLLM rejects that mismatch. Set `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` to force a
-value, or to `none` to omit the flag and let the checkpoint decide.
+rejects `compute_gate_on_attention=true`. Prefix caching, native DBO on A3, and
+KV transfer are not enabled.
 
 The concurrent oracle and its assertions match the async case: ten chat
 requests ask for `12 + 7` through `21 + 7` with temperature=0, thinking=false,
 and max_tokens=256; every response must contain one nonempty answer and finish
 with `stop`. Service liveness and owned-process cleanup must pass, with 60
-seconds allowed for shutdown before escalation. This path does **not** take
-the async FFN cleanup exception, because no CAM receive is pending.
+seconds allowed for shutdown before escalation. A5 enables native DBO, so the
+run must additionally record at least one live two-ubatch step during the
+evaluation window. This path does **not** take the async FFN cleanup exception,
+because no CAM receive is pending.
 
 ```bash
 export AFD_E2E_BACKEND=npu
 export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash
-export HCCL_IF_IP=<local-communication-ip>
-export HCCL_SOCKET_IFNAME=eth0
-# A5: four dies
-export AFD_E2E_DEVICES=0,1,2,3
+# A5: four dies, Attention on 2,3 and FFN on 0,1
+export AFD_E2E_DEVICES=2,3,0,1
+export HCCL_IF_IP=<local-communication-ip>   # optional on A5
+export HCCL_SOCKET_IFNAME=eth0               # optional on A5
 python -m pytest -q -s \
   'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-2a2f]'
-# A3: eight dies
+# A3: eight dies, Attention on 0-3 and FFN on 4-7
 export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7
+export HCCL_IF_IP=<local-communication-ip>   # required on A3
+export HCCL_SOCKET_IFNAME=eth0              # required on A3
 python -m pytest -q -s \
   'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-4a4f]'
 ```

@@ -17,11 +17,18 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SYNC_SHAPES,
 )
 
-# (attention DP, attention TP, FFN DP, FFN TP) each shape must produce.
+# (attention DP, attention TP, FFN DP, FFN TP) each profile must produce. The
+# A5 profile shards by data parallel with expert parallelism, the A3 profile by
+# tensor parallel.
 EXPECTED_PARALLELISM = {
-    DSV4_SYNC_CAMP2P_A5_SCENARIO: ("1", "2", "1", "2"),
+    DSV4_SYNC_CAMP2P_A5_SCENARIO: ("2", "1", "2", "1"),
     DSV4_SYNC_CAMP2P_A3_SCENARIO: ("1", "4", "1", "4"),
 }
+
+
+def _flag_value(command: list[str], flag: str) -> str | None:
+    """Return a flag's value, or None when the scenario omits the flag."""
+    return command[command.index(flag) + 1] if flag in command else None
 
 
 def _devices_for(scenario: str) -> str:
@@ -67,6 +74,7 @@ def _model_with_config(root, quant_method: str | None) -> str:
 @pytest.mark.parametrize("scenario", sorted(EXPECTED_PARALLELISM))
 def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
     args = _arguments(monkeypatch, tmp_path, scenario=scenario)
+    profile = DSV4_SYNC_SHAPES[scenario]
     runner.configure_scenario(args)
     runner.validate_topology(
         args,
@@ -79,6 +87,8 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
     assert args.afd_async is False
     assert args.compute_gate_on_attention is False
     assert args.gsm8k_output_path is None
+    assert args.cuda_graph_full_decode_only is profile.use_graph
+    assert args.enable_dbo is profile.enable_dbo
     expected = EXPECTED_PARALLELISM[scenario]
     for role, dp, tp in (
         ("attention", expected[0], expected[1]),
@@ -87,34 +97,60 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
         command = runner.build_vllm_command(args, role=role)
         assert command[command.index("--data-parallel-size") + 1] == dp
         assert command[command.index("--tensor-parallel-size") + 1] == tp
-        assert command[command.index("--max-num-batched-tokens") + 1] == "1024"
-        assert command[command.index("--max-model-len") + 1] == "8192"
-        assert command[command.index("--max-num-seqs") + 1] == "16"
-        assert command[command.index("--gpu-memory-utilization") + 1] == "0.7"
-        assert command[command.index("--quantization") + 1] == "ascend"
-        assert "--enforce-eager" in command
-        # DeepSeek V4 shards by tensor parallel here: an expert-parallel world
-        # greater than one selects MC2 on A5 and does not tile.
-        assert "--enable-expert-parallel" not in command
-        assert "--enable-dbo" not in command
+        assert command[command.index("--max-model-len") + 1] == profile.max_model_len
+        assert (
+            _flag_value(command, "--max-num-batched-tokens")
+            == profile.max_num_batched_tokens
+        )
+        assert (
+            _flag_value(command, "--gpu-memory-utilization")
+            == profile.memory_utilization
+        )
+        assert ("--enable-expert-parallel" in command) is (
+            profile.enable_expert_parallel
+        )
+        assert ("--enable-dbo" in command) is profile.enable_dbo
+        assert ("--enforce-eager" in command) is not profile.use_graph
+        if profile.use_graph:
+            capture_size = str(profile.cudagraph_capture_size)
+            assert command[command.index("--cudagraph-capture-sizes") + 1] == (
+                capture_size
+            )
+            assert "--compilation-config" in command
+            assert command[command.index("--max-num-seqs") + 1] == (
+                profile.max_num_seqs or capture_size
+            )
+        if profile.enable_dbo:
+            assert command[command.index("--dbo-decode-token-threshold") + 1] == str(
+                profile.dbo_decode_token_threshold,
+            )
+            assert command[command.index("--dbo-prefill-token-threshold") + 1] == str(
+                profile.dbo_prefill_token_threshold,
+            )
+            assert ("--no-enable-chunked-prefill" in command) is (
+                profile.dbo_disables_chunked_prefill
+            )
+        if profile.quantization_from_checkpoint:
+            assert command[command.index("--quantization") + 1] == "ascend"
+        else:
+            assert "--quantization" not in command
         assert "--kv-transfer-config" not in command
         config = json.loads(command[command.index("--additional-config") + 1])
         assert config["enable_dsv4_shared_compressor_workspace"] is False
         assert config["enable_cpu_binding"] is True
         # Exact equality also pins the absent keys: CAMP2P rejects both the
         # asynchronous mode and gate-on-Attention.
-        assert config["afd"] == {
+        expected_afd = {
             "role": role,
             "connector": "CAMP2pAFDConnector",
             "host": "192.0.2.1",
             "port": 6456,
             "num_attention_ranks": int(expected[0]) * int(expected[1]),
             "num_ffn_ranks": int(expected[2]) * int(expected[3]),
-            "connector_extra_config": {
-                "hccl_buffer_size": 2048,
-                "quant_mode": 0,
-            },
         }
+        if profile.connector_extra_config is not None:
+            expected_afd["connector_extra_config"] = profile.connector_extra_config
+        assert config["afd"] == expected_afd
         env = runner.build_env("0", args, role=role, e2e_run_id="test")
         assert env["VLLM_PLUGINS"] == "ascend,afd"
         # Attention TP>1 has a TP/SP token split, but this connector path must
@@ -131,6 +167,7 @@ def test_dsv4_sync_main_uses_concurrent_requests_and_longer_cleanup(
     args = _arguments(monkeypatch, tmp_path, scenario=scenario)
     cleanup_options = {}
     evaluations = []
+    dbo_checks = []
     process = SimpleNamespace(pid=123, poll=lambda: None)
     monkeypatch.setattr(runner, "parse_args", lambda: args)
     monkeypatch.setattr(runner, "start_process", lambda *_args: process)
@@ -152,11 +189,18 @@ def test_dsv4_sync_main_uses_concurrent_requests_and_longer_cleanup(
     )
     monkeypatch.setattr(
         runner,
+        "assert_dbo_live_split_coverage",
+        lambda *check_args: dbo_checks.append(check_args),
+    )
+    monkeypatch.setattr(
+        runner,
         "terminate_processes",
         lambda _processes, **kwargs: cleanup_options.update(kwargs),
     )
     assert runner.main() == 0
     assert evaluations == ["concurrent"]
+    # The DBO coverage gate follows the profile: only the A5 case enables DBO.
+    assert len(dbo_checks) == int(DSV4_SYNC_SHAPES[scenario].enable_dbo)
     assert cleanup_options["termination_timeout_s"] == 60
     assert cleanup_options["deferred_sigkill_pgids"] == ()
 
@@ -283,10 +327,16 @@ def test_dsv4_sync_runtime_profile_rejects_bad_values(
         runner.configure_scenario(args)
 
 
-def test_dsv4_sync_omits_quantization_for_a_declaring_checkpoint(monkeypatch, tmp_path):
-    """vLLM rejects `--quantization ascend` against the A5 FP8 checkpoint."""
-    model = _model_with_config(tmp_path / "dsv4-fp8", "fp8")
-    args = _arguments(monkeypatch, tmp_path, model=model)
+@pytest.mark.parametrize("quant_method", ["fp8", "ascend", None])
+def test_dsv4_sync_a5_never_passes_quantization(monkeypatch, tmp_path, quant_method):
+    """The A5 launch script passes no `--quantization` at all."""
+    model = _model_with_config(tmp_path / f"dsv4-{quant_method}", quant_method)
+    args = _arguments(
+        monkeypatch,
+        tmp_path,
+        scenario=DSV4_SYNC_CAMP2P_A5_SCENARIO,
+        model=model,
+    )
     runner.configure_scenario(args)
 
     command = runner.build_vllm_command(args, role="attention")
@@ -294,9 +344,36 @@ def test_dsv4_sync_omits_quantization_for_a_declaring_checkpoint(monkeypatch, tm
     assert "--quantization" not in command
 
 
-def test_dsv4_sync_keeps_ascend_for_an_undeclared_checkpoint(monkeypatch, tmp_path):
+def test_dsv4_sync_a3_omits_quantization_for_a_declaring_checkpoint(
+    monkeypatch,
+    tmp_path,
+):
+    """vLLM rejects `--quantization ascend` against the A3 W8A8 checkpoint."""
+    model = _model_with_config(tmp_path / "dsv4-fp8", "fp8")
+    args = _arguments(
+        monkeypatch,
+        tmp_path,
+        scenario=DSV4_SYNC_CAMP2P_A3_SCENARIO,
+        model=model,
+    )
+    runner.configure_scenario(args)
+
+    command = runner.build_vllm_command(args, role="attention")
+
+    assert "--quantization" not in command
+
+
+def test_dsv4_sync_a3_keeps_ascend_for_an_undeclared_checkpoint(
+    monkeypatch,
+    tmp_path,
+):
     model = _model_with_config(tmp_path / "dsv4-w8a8", None)
-    args = _arguments(monkeypatch, tmp_path, model=model)
+    args = _arguments(
+        monkeypatch,
+        tmp_path,
+        scenario=DSV4_SYNC_CAMP2P_A3_SCENARIO,
+        model=model,
+    )
     runner.configure_scenario(args)
 
     command = runner.build_vllm_command(args, role="attention")
@@ -326,16 +403,62 @@ def test_dsv4_sync_quantization_env_override(
         assert command[command.index("--quantization") + 1] == expected
 
 
-def test_dsv4_sync_environment_needs_no_cam_package(monkeypatch):
+def test_dsv4_sync_a3_environment_needs_no_cam_package(monkeypatch):
     monkeypatch.setenv("HCCL_IF_IP", "192.0.2.1")
     monkeypatch.setenv("HCCL_SOCKET_IFNAME", "eth-test")
     monkeypatch.delenv("CAM_CUST_OPAPI_LIB_PATH", raising=False)
     # A caller shell that exported the async CAM recipe's buffer size must not
     # change this case, which sizes its CAMP2P domains itself.
     monkeypatch.setenv("HCCL_BUFFSIZE", "4096")
-    env = entrypoint.build_environment()
+    env = entrypoint.build_environment(DSV4_SYNC_CAMP2P_A3_SCENARIO)
     assert env["GLOO_SOCKET_IFNAME"] == "eth-test"
     assert env["TP_SOCKET_IFNAME"] == "eth-test"
     assert env["AFD_FORCE_BALANCED_TOPK_IDS"] == "0"
     assert "CAM_CUST_OPAPI_LIB_PATH" not in env
     assert "HCCL_BUFFSIZE" not in env
+
+
+def test_dsv4_sync_a5_environment_follows_the_launch_script(monkeypatch):
+    """The A5 profile keeps the script's buffer size, allocator, and start method."""
+    monkeypatch.delenv("HCCL_SOCKET_IFNAME", raising=False)
+    monkeypatch.delenv("HCCL_IF_IP", raising=False)
+    monkeypatch.delenv("HCCL_BUFFSIZE", raising=False)
+    monkeypatch.delenv("PYTORCH_NPU_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+    env = entrypoint.build_environment(DSV4_SYNC_CAMP2P_A5_SCENARIO)
+    assert env["HCCL_BUFFSIZE"] == "2048"
+    assert env["PYTORCH_NPU_ALLOC_CONF"] == "expandable_segments:False"
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in env
+    assert "AFD_FORCE_SPAWN_MULTIPROCESSING" not in env
+    # The NIC variables stay optional on a single host.
+    assert "GLOO_SOCKET_IFNAME" not in env
+    assert "TP_SOCKET_IFNAME" not in env
+    # A caller who pins the buffer size keeps it.
+    monkeypatch.setenv("HCCL_BUFFSIZE", "4096")
+    monkeypatch.setenv("HCCL_SOCKET_IFNAME", "eth-test")
+    env = entrypoint.build_environment(DSV4_SYNC_CAMP2P_A5_SCENARIO)
+    assert env["HCCL_BUFFSIZE"] == "4096"
+    assert env["GLOO_SOCKET_IFNAME"] == "eth-test"
+    assert env["TP_SOCKET_IFNAME"] == "eth-test"
+
+
+def test_dsv4_sync_a5_afd_host_defaults_to_loopback(monkeypatch, tmp_path):
+    """The A5 script announces 127.0.0.1 and needs no NIC variable."""
+    _arguments(monkeypatch, tmp_path, scenario=DSV4_SYNC_CAMP2P_A5_SCENARIO)
+    monkeypatch.delenv("HCCL_IF_IP", raising=False)
+    command = entrypoint.build_runner_command(
+        DSV4_SYNC_CAMP2P_A5_SCENARIO,
+        tmp_path / "responses.json",
+    )
+    assert command[command.index("--afd-host") + 1] == "127.0.0.1"
+
+
+def test_dsv4_sync_a3_requires_the_caller_address(monkeypatch, tmp_path):
+    """The A3 profile still takes the caller's advertised rendezvous address."""
+    _arguments(monkeypatch, tmp_path, scenario=DSV4_SYNC_CAMP2P_A3_SCENARIO)
+    monkeypatch.delenv("HCCL_IF_IP", raising=False)
+    with pytest.raises(RuntimeError, match="HCCL_IF_IP"):
+        entrypoint.build_runner_command(
+            DSV4_SYNC_CAMP2P_A3_SCENARIO,
+            tmp_path / "responses.json",
+        )

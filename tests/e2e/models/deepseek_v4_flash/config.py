@@ -27,27 +27,6 @@ DSV4_FFN_RANKS = 8
 DSV4_ATTENTION_TP_SIZE = 4
 
 
-# DeepSeek V4 does not fit on one Attention or one FFN die: A5 needs at least
-# 2A2F and A3 at least 4A4F. Both shapes are square, so the rank count is the
-# tensor-parallel size. The expert-parallel world stays at one — an EP world
-# greater than one selects MC2 on A5, whose dispatch operator does not tile
-# (docs/npu/A5_BRINGUP_NOTES.md).
-class DSV4SyncShape(NamedTuple):
-    """Fixed synchronous CAMP2P deployment shape for one host class."""
-
-    attention_ranks: int
-    ffn_ranks: int
-    tp_size: int
-
-    @property
-    def device_count(self) -> int:
-        return self.attention_ranks + self.ffn_ranks
-
-
-DSV4_SYNC_SHAPES = {
-    DSV4_SYNC_CAMP2P_A5_SCENARIO: DSV4SyncShape(2, 2, 2),
-    DSV4_SYNC_CAMP2P_A3_SCENARIO: DSV4SyncShape(4, 4, 4),
-}
 DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
 # CAMP2P sizes its AFD HCCL domains through this override; the A5 and A3 runs
 # used 2048 MB. quant_mode stays 0, the only mode the runtime accepts today.
@@ -55,8 +34,7 @@ DSV4_SYNC_HCCL_BUFFER_SIZE_MB = 2048
 DSV4_SYNC_QUANT_MODE = 0
 DSV4_ASCEND_QUANTIZATION = "ascend"
 # `--quantization none` means "pass no --quantization at all" and let the
-# checkpoint's own quantization_config decide. The A5 FP8/W4A8 checkpoint
-# needs that; the A3 int8 W8A8 one is loaded through the Ascend method.
+# checkpoint's own quantization_config decide.
 DSV4_CHECKPOINT_QUANTIZATION = "none"
 DSV4_SYNC_QUANTIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION"
 # Context, batch, and memory budget. The asynchronous case keeps the 16-die
@@ -82,6 +60,115 @@ DSV4_PROMPT_SECOND_OPERAND = 7
 # Sixteen NPU workers take longer than the small cases to destroy HCCL
 # resources; the observed launcher shutdown alone exceeded 20 seconds.
 DSV4_PROCESS_TERMINATION_TIMEOUT_S = 60
+# The A5 recorded launch script runs a 4096 context with ACL graph capture and
+# native DBO instead of the eager 8192/1024 deployment the A3 profile records.
+DSV4_SYNC_A5_MAX_MODEL_LEN = "4096"
+DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE = 16
+DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
+DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD = 12
+DSV4_SYNC_ALLOC_CONF_EXPANDABLE = "expandable_segments:True"
+DSV4_SYNC_ALLOC_CONF_PLAIN = "expandable_segments:False"
+# The A5 script runs both roles on one host and announces the loopback address.
+DSV4_SYNC_LOCAL_AFD_HOST = "127.0.0.1"
+# The A3 profile sizes its CAMP2P domains per domain instead of through the
+# caller's global HCCL_BUFFSIZE.
+DSV4_SYNC_CONNECTOR_EXTRA_CONFIG = {
+    "hccl_buffer_size": DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
+    "quant_mode": DSV4_SYNC_QUANT_MODE,
+}
+
+
+class DSV4SyncEnvironment(NamedTuple):
+    """Process environment the host's recorded launch script relies on."""
+
+    # The recorded A3 rendezvous uses the caller's address, so it requires the
+    # NIC variables; the A5 script starts both roles on 127.0.0.1.
+    nic_env_required: bool = True
+    # AFD forces spawn multiprocessing so workers re-initialize the device in a
+    # fresh process. The A5 launch script relies on the platform default.
+    force_spawn: bool = True
+    # CAMP2P sizes its own AFD domains, so an inherited global HCCL_BUFFSIZE
+    # must not leak in. A5 exports HCCL_BUFFSIZE instead of per-domain sizing.
+    keep_hccl_buffsize: bool = False
+    npu_alloc_conf: str = DSV4_SYNC_ALLOC_CONF_EXPANDABLE
+
+
+# DeepSeek V4 does not fit on one Attention or one FFN die: A5 needs at least
+# 2A2F and A3 at least 4A4F. Each host runs the deployment its recorded launch
+# script uses, because the two hosts differ in more than rank count:
+#
+# - A5 runs Attention DP2/TP1 and FFN DP2/TP1 with expert parallelism, ACL graph
+#   capture over 16 decodes, native DBO, and the script's 4096 context. It omits
+#   `--quantization`, `connector_extra_config`, and the multithread loader, and
+#   exports HCCL_BUFFSIZE=2048 itself.
+# - A3 shards by tensor parallel with the expert-parallel world at one, eager,
+#   with the 8192/1024 budget the A3 launch profile records.
+class DSV4SyncShape(NamedTuple):
+    """Fixed synchronous CAMP2P deployment profile for one host class."""
+
+    attention_ranks: int
+    ffn_ranks: int
+    tp_size: int
+    enable_expert_parallel: bool = False
+    use_graph: bool = False
+    cudagraph_capture_size: int = 0
+    enable_dbo: bool = False
+    dbo_decode_token_threshold: int = 0
+    dbo_prefill_token_threshold: int = 0
+    # A5 keeps chunked prefill enabled alongside DBO, as its script does.
+    dbo_disables_chunked_prefill: bool = True
+    max_model_len: str = DSV4_SYNC_MAX_MODEL_LEN
+    # None omits the flag entirely so vLLM's own default applies.
+    max_num_batched_tokens: str | None = DSV4_SYNC_MAX_NUM_BATCHED_TOKENS
+    max_num_seqs: str | None = DSV4_MAX_NUM_SEQS
+    memory_utilization: str | None = DSV4_MEMORY_UTILIZATION
+    multithread_load: bool = True
+    connector_extra_config: dict[str, int] | None = DSV4_SYNC_CONNECTOR_EXTRA_CONFIG
+    quantization_from_checkpoint: bool = True
+    environment: DSV4SyncEnvironment = DSV4SyncEnvironment()
+
+    @property
+    def device_count(self) -> int:
+        return self.attention_ranks + self.ffn_ranks
+
+
+DSV4_SYNC_SHAPES = {
+    DSV4_SYNC_CAMP2P_A5_SCENARIO: DSV4SyncShape(
+        attention_ranks=2,
+        ffn_ranks=2,
+        tp_size=1,
+        enable_expert_parallel=True,
+        use_graph=True,
+        cudagraph_capture_size=DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE,
+        enable_dbo=True,
+        dbo_decode_token_threshold=DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD,
+        dbo_prefill_token_threshold=DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD,
+        dbo_disables_chunked_prefill=False,
+        max_model_len=DSV4_SYNC_A5_MAX_MODEL_LEN,
+        max_num_batched_tokens=None,
+        max_num_seqs=None,
+        memory_utilization=None,
+        multithread_load=False,
+        connector_extra_config=None,
+        quantization_from_checkpoint=False,
+        environment=DSV4SyncEnvironment(
+            nic_env_required=False,
+            force_spawn=False,
+            keep_hccl_buffsize=True,
+            npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
+        ),
+    ),
+    DSV4_SYNC_CAMP2P_A3_SCENARIO: DSV4SyncShape(
+        attention_ranks=4,
+        ffn_ranks=4,
+        tp_size=4,
+    ),
+}
+
+
+def sync_shape(scenario: str) -> DSV4SyncShape | None:
+    """Return the synchronous launch profile of a scenario, if it has one."""
+    return DSV4_SYNC_SHAPES.get(scenario)
 
 
 def _declared_quant_method(model: str) -> str | None:
@@ -97,15 +184,15 @@ def _declared_quant_method(model: str) -> str | None:
     return method if isinstance(method, str) and method else None
 
 
-def sync_camp2p_quantization(model: str) -> str | None:
-    """Resolve the `--quantization` value the synchronous case should pass.
+def sync_camp2p_quantization(model: str, shape: DSV4SyncShape) -> str | None:
+    """Resolve the `--quantization` value a synchronous case should pass.
 
-    vLLM rejects `--quantization ascend` against a checkpoint that declares a
-    different method, which is what the A5 FP8/W4A8 checkpoint does, while the
-    A3 int8 W8A8 checkpoint is loaded through the Ascend method. Pass `ascend`
-    unless the checkpoint declares another method; an explicit
-    `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION` overrides either way, and `none`
-    omits the flag entirely.
+    The A5 profile follows its launch script, which passes no `--quantization`
+    at all and lets the FP8/W4A8 checkpoint decide. The A3 int8 W8A8 checkpoint
+    is loaded through the Ascend method, so that profile resolves `ascend` from
+    the checkpoint's own declaration and omits the flag when the checkpoint
+    declares something else. An explicit `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION`
+    overrides either profile, and `none` omits the flag entirely.
     """
     override = os.environ.get(DSV4_SYNC_QUANTIZATION_ENV)
     if override is not None:
@@ -113,6 +200,8 @@ def sync_camp2p_quantization(model: str) -> str | None:
         if not value or value.lower() == DSV4_CHECKPOINT_QUANTIZATION:
             return None
         return value
+    if not shape.quantization_from_checkpoint:
+        return None
     declared = _declared_quant_method(model)
     if declared is not None and declared != DSV4_ASCEND_QUANTIZATION:
         return None
@@ -139,19 +228,37 @@ def _positive_float(value: str, name: str) -> float:
     return parsed
 
 
-def sync_runtime_profile() -> dict[str, str]:
-    """Resolve the synchronous cases' context, batch, and memory budget.
+def _optional_positive_int(name: str, default: str | None) -> str | None:
+    """Validate an optional budget value; None keeps vLLM's own default."""
+    value = os.environ.get(name, default)
+    if value is None:
+        return None
+    return str(_positive_int(value, name))
 
-    The ten concurrent oracle requests must be able to run together, so
-    `--max-num-seqs` cannot drop below their count.
+
+def _optional_positive_float(name: str, default: str | None) -> str | None:
+    """Validate an optional budget value; None keeps vLLM's own default."""
+    value = os.environ.get(name, default)
+    if value is None:
+        return None
+    return str(_positive_float(value, name))
+
+
+def sync_runtime_profile(shape: DSV4SyncShape) -> dict[str, str | None]:
+    """Resolve a synchronous case's context, batch, and memory budget.
+
+    Each value starts from the host profile's recorded launch setting and can
+    be retuned for that host through the environment. None means the flag is
+    not passed at all, so vLLM's own default applies — the A5 script overrides
+    none of the batch or memory limits. The ten concurrent oracle requests must
+    be able to run together, so an explicit `--max-num-seqs` cannot drop below
+    their count.
     """
-    max_num_seqs = os.environ.get(
+    max_num_seqs = _optional_positive_int(
         DSV4_SYNC_MAX_NUM_SEQS_ENV,
-        DSV4_MAX_NUM_SEQS,
+        shape.max_num_seqs,
     )
-    if _positive_int(max_num_seqs, DSV4_SYNC_MAX_NUM_SEQS_ENV) < (
-        DSV4_CONCURRENT_REQUESTS
-    ):
+    if max_num_seqs is not None and int(max_num_seqs) < DSV4_CONCURRENT_REQUESTS:
         raise ValueError(
             f"{DSV4_SYNC_MAX_NUM_SEQS_ENV} must be at least "
             f"{DSV4_CONCURRENT_REQUESTS} for the concurrent oracle",
@@ -159,30 +266,18 @@ def sync_runtime_profile() -> dict[str, str]:
     return {
         "max_model_len": str(
             _positive_int(
-                os.environ.get(DSV4_SYNC_MAX_MODEL_LEN_ENV, DSV4_SYNC_MAX_MODEL_LEN),
+                os.environ.get(DSV4_SYNC_MAX_MODEL_LEN_ENV, shape.max_model_len),
                 DSV4_SYNC_MAX_MODEL_LEN_ENV,
             ),
         ),
-        "max_num_batched_tokens": str(
-            _positive_int(
-                os.environ.get(
-                    DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV,
-                    DSV4_SYNC_MAX_NUM_BATCHED_TOKENS,
-                ),
-                DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV,
-            ),
+        "max_num_batched_tokens": _optional_positive_int(
+            DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV,
+            shape.max_num_batched_tokens,
         ),
-        "max_num_seqs": str(
-            _positive_int(max_num_seqs, DSV4_SYNC_MAX_NUM_SEQS_ENV),
-        ),
-        "memory_utilization": str(
-            _positive_float(
-                os.environ.get(
-                    DSV4_SYNC_MEMORY_UTILIZATION_ENV,
-                    DSV4_MEMORY_UTILIZATION,
-                ),
-                DSV4_SYNC_MEMORY_UTILIZATION_ENV,
-            ),
+        "max_num_seqs": max_num_seqs,
+        "memory_utilization": _optional_positive_float(
+            DSV4_SYNC_MEMORY_UTILIZATION_ENV,
+            shape.memory_utilization,
         ),
     }
 
@@ -192,18 +287,20 @@ def _configure_dsv4_arguments(
     quantization: str | None,
     *,
     max_model_len: str = DSV4_MAX_MODEL_LEN,
-    max_num_batched_tokens: str = DSV4_MAX_NUM_BATCHED_TOKENS,
-    max_num_seqs: str = DSV4_MAX_NUM_SEQS,
-    memory_utilization: str = DSV4_MEMORY_UTILIZATION,
+    max_num_batched_tokens: str | None = DSV4_MAX_NUM_BATCHED_TOKENS,
+    max_num_seqs: str | None = DSV4_MAX_NUM_SEQS,
+    memory_utilization: str | None = DSV4_MEMORY_UTILIZATION,
+    multithread_load: bool = True,
 ) -> None:
     """Apply the fixed model arguments shared by every DSV4 scenario.
 
     `quantization` is the `--quantization` value to pass, or None to omit the
     flag so the checkpoint's own configuration decides. The remaining keyword
     arguments default to the asynchronous case's fixed deployment; the
-    synchronous cases resolve them per host, because the recorded A3 and A5
-    deployments run far smaller context and batch limits than the 16-die
-    asynchronous case.
+    synchronous cases resolve them per host, because the recorded A5 and A3
+    deployments differ from the 16-die asynchronous case. A None budget value
+    omits that flag entirely so vLLM's own default applies, and
+    `multithread_load` selects the scripted multithreaded weight loader.
     """
     if args.completion_output_path is None:
         raise ValueError("--completion-output-path is required for DSV4")
@@ -220,19 +317,30 @@ def _configure_dsv4_arguments(
         "1024",
         "--max-model-len",
         max_model_len,
-        "--max-num-batched-tokens",
-        max_num_batched_tokens,
-        "--max-num-seqs",
-        max_num_seqs,
+        *(
+            ["--max-num-batched-tokens", max_num_batched_tokens]
+            if max_num_batched_tokens is not None
+            else []
+        ),
+        *(["--max-num-seqs", max_num_seqs] if max_num_seqs is not None else []),
         "--block-size",
         "128",
-        "--gpu-memory-utilization",
-        memory_utilization,
+        *(
+            ["--gpu-memory-utilization", memory_utilization]
+            if memory_utilization is not None
+            else []
+        ),
         *(["--quantization", quantization] if quantization is not None else []),
         "--tokenizer-mode",
         "deepseek_v4",
-        "--model-loader-extra-config",
-        json.dumps({"enable_multithread_load": True, "num_threads": 128}),
+        *(
+            [
+                "--model-loader-extra-config",
+                json.dumps({"enable_multithread_load": True, "num_threads": 128}),
+            ]
+            if multithread_load
+            else []
+        ),
         "--trust-remote-code",
         "--no-enable-prefix-caching",
         "--enable-chunked-prefill",
@@ -269,29 +377,30 @@ def configure_scenario(args: argparse.Namespace) -> None:
 
 
 def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
-    """Configure a synchronous CAMP2P deployment.
+    """Configure a synchronous CAMP2P deployment from its host profile.
 
-    The caller selects the A5 (2A2F) or A3 (4A4F) shape through the scenario;
-    the connector settings are the same for both. CAMP2P carries the Hash-layer
-    token ids over the a2e ids channel, so the gate stays on FFN and no CAM
-    vendor package is involved.
+    The caller selects the A5 (2A2F) or A3 (4A4F) host through the scenario;
+    both keep the gate on FFN, because CAMP2P carries the Hash-layer token ids
+    over the a2e ids channel, and neither needs a CAM vendor package. The rest
+    of the deployment follows that host's recorded launch script: its rank
+    layout and expert parallelism, graph capture, native DBO, the context and
+    batch budget, the weight loader, and whether the case or the caller's shell
+    sizes the CAMP2P HCCL domains.
     """
+    shape = DSV4_SYNC_SHAPES[args.scenario]
     args.afd_connector = DSV4_SYNC_CAMP2P_CONNECTOR
     args.afd_async = False
     args.compute_gate_on_attention = False
-    args.afd_connector_extra_config = [
-        json.dumps(
-            {
-                "hccl_buffer_size": DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
-                "quant_mode": DSV4_SYNC_QUANT_MODE,
-            },
-            separators=(",", ":"),
-        )
-    ]
+    args.afd_connector_extra_config = (
+        []
+        if shape.connector_extra_config is None
+        else [json.dumps(shape.connector_extra_config, separators=(",", ":"))]
+    )
     _configure_dsv4_arguments(
         args,
-        sync_camp2p_quantization(args.model),
-        **sync_runtime_profile(),
+        sync_camp2p_quantization(args.model, shape),
+        multithread_load=shape.multithread_load,
+        **sync_runtime_profile(shape),
     )
 
 
