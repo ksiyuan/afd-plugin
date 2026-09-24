@@ -216,18 +216,11 @@ def main() -> int:
                 dbo_eval_started_at = time.time()
             run_gsm8k_evaluation(args)
         if args.enable_dbo:
-            if dbo_split_evidence_available(args):
-                assert_dbo_live_split_coverage(
-                    dbo_split_steps,
-                    dbo_eval_started_at,
-                    args,
-                )
-            else:
-                print(
-                    "\n[dbo-coverage] this profile runs DBO on a runtime that "
-                    "logs no two-ubatch split line, so the split is exercised "
-                    "but not machine-verified here",
-                )
+            assert_dbo_live_split_coverage(
+                dbo_split_steps,
+                dbo_eval_started_at,
+                args,
+            )
 
         ensure_processes_alive(processes)
     finally:
@@ -578,12 +571,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
             if active_sync_profile is not None
             else DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD
         )
-        # A DSV4 sync profile says whether its launch script keeps chunked
-        # prefill alongside DBO; every other DBO scenario disables it.
-        if (
-            active_sync_profile is None
-            or active_sync_profile.dbo_disables_chunked_prefill
-        ) and not any(
+        if not any(
             arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.append("--no-enable-chunked-prefill")
@@ -866,19 +854,6 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     )
 
 
-def dbo_split_evidence_available(args: argparse.Namespace) -> bool:
-    """Return whether the scenario's runtime logs a two-ubatch split line.
-
-    The DBO coverage gate matches vLLM's GPU model runner debug line that prints
-    the created `UBatchSlice` objects, which is also why a DBO run forces
-    `VLLM_LOGGING_LEVEL=DEBUG`. The pinned Ascend NPU runtime prints no such
-    line, so a profile that runs DBO there exercises the split without
-    machine-verifying it and keeps the caller's logging level.
-    """
-    profile = sync_shape(args.scenario)
-    return True if profile is None else profile.dbo_split_evidence_available
-
-
 def decode_bench_connector_config() -> str:
     return json.dumps(
         {
@@ -1055,7 +1030,7 @@ def build_env(
         env["VLLM_PLUGINS"] = "ascend" if args.device_backend == "npu" else ""
     else:
         env["VLLM_PLUGINS"] = "ascend,afd" if args.device_backend == "npu" else "afd"
-    if args.enable_dbo and dbo_split_evidence_available(args):
+    if args.enable_dbo:
         env["VLLM_LOGGING_LEVEL"] = "DEBUG"
     env["PYTHONUNBUFFERED"] = "1"
     if e2e_run_id is not None:

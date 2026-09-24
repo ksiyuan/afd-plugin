@@ -144,42 +144,20 @@ FFN cleanup exception above and is not selected by the four-device PR gate.
 
 `afd-dsv4-flash-sync-camp2p-2a2f` (A5) and `afd-dsv4-flash-sync-camp2p-4a4f`
 (A3) are the synchronous siblings of that case: local-only DSV4 Flash runs over
-`CAMP2pAFDConnector`, each following its host's recorded launch profile.
-DeepSeek V4 does not fit on a single Attention or FFN die, so A5 runs 2A2F on
-four devices and A3 4A4F on eight, and the two profiles differ in more than rank
-count: A5 follows its host's recorded `vllm serve` launch flags — Attention
-DP2/TP1 and FFN DP2/TP1 with expert parallelism, that script's own
-`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), a 4096 context, and the
-case's 128-token block with prefix caching off, since that script leaves both at
-a default — and passes no API server count, seed, batch or memory budget, or
-chunked-prefill flag, while A3 shards by tensor parallel
-with the expert-parallel world at one, eager, with the 8192/1024 budget and the
-case's deployment flags. A5 keeps the case's DSV4 model-path switches
-(`multistream_dsv4_dsa_overlap=false` among them), because the pinned runtime
-defaults that overlap on and its RoPE path fails to tile on A5. It passes no
-`--quantization` either and sizes no CAMP2P
-domain itself, keeping the script's global `HCCL_BUFFSIZE`; A3 carries
-`connector_extra_config` with only `hccl_buffer_size` and `quant_mode=0` and
-resolves the Ascend quantization method from its checkpoint. Neither needs a CAM
-vendor package: the plugin's own
-a2e/e2a operators carry both the activations and, for the DSV4 Hash layers, the
-token ids the FFN-side gate routes with, so this is the transport available on
-both A3 and A5 once the ops are built for the target SOC. Because CAMP2P rejects
-gate-on-Attention and any nonzero CAM quantization mode, the gate stays on FFN
-in both profiles. Each case reuses the ten-request concurrent oracle of the
-async case, takes the same 60-second shutdown grace, and deliberately does
-**not** take the async FFN cleanup exception: no CAM receive is pending on this
-path. Neither synchronous profile compares the answer — A5 corrupts part of a
-concurrent batch and A3 is not validated against the oracle yet — so both cover
-the concurrent plumbing, while the async case keeps the exact check. That script also enables native DBO at 2/12,
-which the case does not: the DBO split path is the current suspect for the DSA
-attention operator tiling failure seen on this profile, so the case leaves DBO
-off while that is root-caused. The profile keeps the recorded thresholds, and
-neither the split coverage gate nor forced `VLLM_LOGGING_LEVEL=DEBUG` applies
-while it is off. The A5 case still corrupts answers under concurrent load — a
-repeated operand, a degenerate repetition loop, and a refusal, with no stable
-failing request — so that profile stays a smoke case,
-and the e2e README records the symptom and everything ruled out so far.
+`CAMP2pAFDConnector`, each following its host's recorded launch profile — A5 on
+four devices as Attention DP2/TP1 with expert parallelism, ACL graph capture, and
+a 4096 context; A3 on eight as Attention DP1/TP4 with the expert-parallel world
+at one and the 8192/1024 budget. Neither needs a CAM vendor package: the plugin's
+own a2e/e2a operators carry the activations and, for the DSV4 Hash layers, the
+token ids the FFN-side gate routes with. Both keep the case's DSV4 model-path
+switches and the gate on FFN, and neither compares the answer: they are smoke
+cases over the ten-request concurrent oracle of the async case, which must be
+served together with a nonempty, finished answer each. A5 additionally drops the
+native DBO its script enables, because the DBO split path is the current suspect
+for the DSA operator tiling failure on that host, and pins the 128-token block
+with prefix caching off; its concurrent answers are still corrupted, which the
+e2e README records together with the A2E tile lead. The async case keeps the
+exact-answer check.
 
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,

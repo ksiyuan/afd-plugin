@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import NamedTuple
 
@@ -33,15 +32,9 @@ DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
 DSV4_SYNC_HCCL_BUFFER_SIZE_MB = 2048
 DSV4_SYNC_QUANT_MODE = 0
 DSV4_ASCEND_QUANTIZATION = "ascend"
-# `--quantization none` means "pass no --quantization at all" and let the
-# checkpoint's own quantization_config decide.
-DSV4_CHECKPOINT_QUANTIZATION = "none"
-DSV4_SYNC_QUANTIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION"
 # Context, batch, and memory budget. The asynchronous case keeps the 16-die
-# budget it was validated with; the synchronous cases default to the smaller
-# profile the A5 and A3 launch scripts use, because DeepSeek V4 out-of-memory
-# on A3 is usually the context/batch budget rather than the shard count. Every
-# value is overridable so a host can be tuned without editing the case.
+# budget it was validated with; the synchronous cases use the smaller profile
+# their launch scripts record.
 DSV4_MAX_MODEL_LEN = "1048576"
 DSV4_MAX_NUM_BATCHED_TOKENS = "8192"
 DSV4_MAX_NUM_SEQS = "16"
@@ -52,10 +45,6 @@ DSV4_MEMORY_UTILIZATION = "0.7"
 DSV4_BLOCK_SIZE = "128"
 DSV4_SYNC_MAX_MODEL_LEN = "8192"
 DSV4_SYNC_MAX_NUM_BATCHED_TOKENS = "1024"
-DSV4_SYNC_MAX_MODEL_LEN_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN"
-DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS"
-DSV4_SYNC_MAX_NUM_SEQS_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS"
-DSV4_SYNC_MEMORY_UTILIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION"
 DSV4_CONCURRENT_REQUESTS = 10
 DSV4_REQUEST_TIMEOUT_S = 300
 DSV4_COMPLETION_MAX_TOKENS = 256
@@ -76,8 +65,6 @@ DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
 DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD = 12
 DSV4_SYNC_ALLOC_CONF_EXPANDABLE = "expandable_segments:True"
 DSV4_SYNC_ALLOC_CONF_PLAIN = "expandable_segments:False"
-# Force eager execution for a host whose graph-capture path fails at runtime.
-DSV4_SYNC_EAGER_ENV = "AFD_NPU_DSV4_SYNC_E2E_EAGER"
 # The A5 script runs both roles on one host and announces the loopback address.
 DSV4_SYNC_LOCAL_AFD_HOST = "127.0.0.1"
 # The A3 profile sizes its CAMP2P domains per domain instead of through the
@@ -126,13 +113,6 @@ class DSV4SyncShape(NamedTuple):
     enable_dbo: bool = False
     dbo_decode_token_threshold: int = 0
     dbo_prefill_token_threshold: int = 0
-    # A5 keeps chunked prefill enabled alongside DBO, as its script does.
-    dbo_disables_chunked_prefill: bool = True
-    # The DBO coverage gate matches vLLM's GPU model runner debug line that
-    # prints the created `UBatchSlice` objects. The pinned Ascend NPU runtime
-    # logs no such line, so a profile that runs DBO there exercises it without
-    # machine-verifying the split, and needs no forced DEBUG logging.
-    dbo_split_evidence_available: bool = True
     max_model_len: str = DSV4_SYNC_MAX_MODEL_LEN
     # None omits the flag entirely so vLLM's own default applies.
     max_num_batched_tokens: str | None = DSV4_SYNC_MAX_NUM_BATCHED_TOKENS
@@ -181,8 +161,6 @@ DSV4_SYNC_SHAPES = {
         enable_dbo=False,
         dbo_decode_token_threshold=DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD,
         dbo_prefill_token_threshold=DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD,
-        dbo_disables_chunked_prefill=False,
-        dbo_split_evidence_available=False,
         max_model_len=DSV4_SYNC_A5_MAX_MODEL_LEN,
         max_num_batched_tokens=None,
         max_num_seqs=None,
@@ -226,13 +204,8 @@ DSV4_SYNC_SHAPES = {
 
 
 def sync_use_graph(shape: DSV4SyncShape) -> bool:
-    """Return whether the profile captures ACL graphs instead of running eager.
-
-    A host whose graph-capture path trips a runtime operator failure can be
-    switched to eager without editing the case by setting
-    `AFD_NPU_DSV4_SYNC_E2E_EAGER` to a truthy value.
-    """
-    return shape.use_graph and not _env_flag(DSV4_SYNC_EAGER_ENV)
+    """Return whether the profile captures ACL graphs instead of running eager."""
+    return shape.use_graph
 
 
 def sync_compilation_config(shape: DSV4SyncShape) -> dict[str, object] | None:
@@ -240,11 +213,6 @@ def sync_compilation_config(shape: DSV4SyncShape) -> dict[str, object] | None:
     if not sync_use_graph(shape):
         return None
     return shape.compilation_config
-
-
-def _env_flag(name: str) -> bool:
-    """Return whether an environment switch is set to a truthy value."""
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def sync_shape(scenario: str) -> DSV4SyncShape | None:
@@ -272,95 +240,14 @@ def sync_camp2p_quantization(model: str, shape: DSV4SyncShape) -> str | None:
     at all and lets the FP8/W4A8 checkpoint decide. The A3 int8 W8A8 checkpoint
     is loaded through the Ascend method, so that profile resolves `ascend` from
     the checkpoint's own declaration and omits the flag when the checkpoint
-    declares something else. An explicit `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION`
-    overrides either profile, and `none` omits the flag entirely.
+    declares something else.
     """
-    override = os.environ.get(DSV4_SYNC_QUANTIZATION_ENV)
-    if override is not None:
-        value = override.strip()
-        if not value or value.lower() == DSV4_CHECKPOINT_QUANTIZATION:
-            return None
-        return value
     if not shape.quantization_from_checkpoint:
         return None
     declared = _declared_quant_method(model)
     if declared is not None and declared != DSV4_ASCEND_QUANTIZATION:
         return None
     return DSV4_ASCEND_QUANTIZATION
-
-
-def _positive_int(value: str, name: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
-    if parsed < 1:
-        raise ValueError(f"{name} must be positive, got {value!r}")
-    return parsed
-
-
-def _positive_float(value: str, name: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a number, got {value!r}") from exc
-    if not 0 < parsed <= 1:
-        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
-    return parsed
-
-
-def _optional_positive_int(name: str, default: str | None) -> str | None:
-    """Validate an optional budget value; None keeps vLLM's own default."""
-    value = os.environ.get(name, default)
-    if value is None:
-        return None
-    return str(_positive_int(value, name))
-
-
-def _optional_positive_float(name: str, default: str | None) -> str | None:
-    """Validate an optional budget value; None keeps vLLM's own default."""
-    value = os.environ.get(name, default)
-    if value is None:
-        return None
-    return str(_positive_float(value, name))
-
-
-def sync_runtime_profile(shape: DSV4SyncShape) -> dict[str, str | None]:
-    """Resolve a synchronous case's context, batch, and memory budget.
-
-    Each value starts from the host profile's recorded launch setting and can
-    be retuned for that host through the environment. None means the flag is
-    not passed at all, so vLLM's own default applies — the A5 script overrides
-    none of the batch or memory limits. The ten concurrent oracle requests must
-    be able to run together, so an explicit `--max-num-seqs` cannot drop below
-    their count.
-    """
-    max_num_seqs = _optional_positive_int(
-        DSV4_SYNC_MAX_NUM_SEQS_ENV,
-        shape.max_num_seqs,
-    )
-    if max_num_seqs is not None and int(max_num_seqs) < DSV4_CONCURRENT_REQUESTS:
-        raise ValueError(
-            f"{DSV4_SYNC_MAX_NUM_SEQS_ENV} must be at least "
-            f"{DSV4_CONCURRENT_REQUESTS} for the concurrent oracle",
-        )
-    return {
-        "max_model_len": str(
-            _positive_int(
-                os.environ.get(DSV4_SYNC_MAX_MODEL_LEN_ENV, shape.max_model_len),
-                DSV4_SYNC_MAX_MODEL_LEN_ENV,
-            ),
-        ),
-        "max_num_batched_tokens": _optional_positive_int(
-            DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV,
-            shape.max_num_batched_tokens,
-        ),
-        "max_num_seqs": max_num_seqs,
-        "memory_utilization": _optional_positive_float(
-            DSV4_SYNC_MEMORY_UTILIZATION_ENV,
-            shape.memory_utilization,
-        ),
-    }
 
 
 def _configure_dsv4_arguments(
@@ -512,11 +399,14 @@ def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
     _configure_dsv4_arguments(
         args,
         sync_camp2p_quantization(args.model, shape),
+        max_model_len=shape.max_model_len,
+        max_num_batched_tokens=shape.max_num_batched_tokens,
+        max_num_seqs=shape.max_num_seqs,
+        memory_utilization=shape.memory_utilization,
         multithread_load=shape.multithread_load,
         verbatim_launch=shape.verbatim_launch,
         disable_prefix_caching=shape.disable_prefix_caching,
         block_size=shape.block_size,
-        **sync_runtime_profile(shape),
     )
 
 
