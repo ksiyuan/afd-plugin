@@ -209,11 +209,8 @@ recorded launch shape:
 
 Build the operators for the target SOC first (`SOC_VERSION=ascend950` on A5,
 `910c` on A3). The device list is role-defining — the first `attention_ranks`
-entries go to Attention and the rest to FFN — and each profile carries the
-mapping its host's launch script records (A5: Attention on dies 2 and 3, FFN on
-0 and 1), so a run needs no device list. `AFD_E2E_DEVICES` overrides it and must
-still match the profile's die count: a list sized for the other host fails
-rather than skips.
+entries go to Attention and the rest to FFN, so A5 passes `2,3,0,1` for its
+recorded mapping — and a list sized for the other host fails rather than skips.
 
 Both profiles are **smoke cases**: the async case's ten concurrent chat requests
 (`12 + 7` … `21 + 7`, temperature=0, thinking=false, max_tokens=256) must be served
@@ -230,11 +227,7 @@ Deployment differences worth knowing:
   `--no-enable-prefix-caching` where its script leaves vLLM's defaults, keeps
   `HCCL_BUFFSIZE=2048` with the plain allocator, and needs no NIC variable.
 - **A3** drops an inherited `HCCL_BUFFSIZE`, sizes its own CAMP2P domains through
-  `connector_extra_config`, and records no weights path, so its run needs
-  `AFD_NPU_E2E_MODEL`.
-- Both roles run on one host in either profile: the rendezvous host defaults to
-  `127.0.0.1` and takes `HCCL_IF_IP` when it is exported, and
-  `HCCL_SOCKET_IFNAME` is forwarded to Gloo/TP only when supplied.
+  `connector_extra_config`, and requires `HCCL_IF_IP` and `HCCL_SOCKET_IFNAME`.
 - `--quantization` is resolved from the checkpoint: A5's FP8/W4A8 checkpoint
   decides, A3's int8 W8A8 loads through `ascend`.
 - Both keep the case's DSV4 model-path switches (`multistream_dsv4_dsa_overlap`,
@@ -253,23 +246,28 @@ A2E tile bookkeeping for uneven Attention peers, which this branch does not carr
 `afd_plugin/a2e_layout.py`.
 
 ```bash
-# A5: the profile carries its device mapping and weights path, so no setup is
-# needed beyond the SOC build.
+export AFD_E2E_BACKEND=npu
+export AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash
+# A5: four dies, Attention on 2,3 and FFN on 0,1
+export AFD_E2E_DEVICES=2,3,0,1
+export HCCL_IF_IP=<local-communication-ip>   # optional on A5
+export HCCL_SOCKET_IFNAME=eth0               # optional on A5
 python -m pytest -q -s \
   'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-2a2f]'
-# A3: same shape of run, plus the weights path its profile does not record.
-AFD_NPU_E2E_MODEL=/path/to/DeepSeek-V4-Flash python -m pytest -q -s \
+# A3: eight dies, Attention on 0-3 and FFN on 4-7
+export AFD_E2E_DEVICES=0,1,2,3,4,5,6,7
+export HCCL_IF_IP=<local-communication-ip>   # required on A3
+export HCCL_SOCKET_IFNAME=eth0              # required on A3
+python -m pytest -q -s \
   'tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py::test_deepseek_v4_flash_sync_camp2p[afd-dsv4-flash-sync-camp2p-4a4f]'
 ```
 
-Every override is optional: `AFD_NPU_E2E_MODEL` replaces the recorded weights
-path and is required on A3, `AFD_E2E_DEVICES` replaces the recorded mapping (and
-must keep the profile's die count), and `HCCL_IF_IP` / `HCCL_SOCKET_IFNAME` are
-only needed when the two roles are not on one host. API ports default to
-19380/19381, the AFD rendezvous port to 6456, and the startup timeout to 1800
-seconds; override them with `AFD_NPU_DSV4_SYNC_E2E_API_PORT`,
+Defaults: API ports 19380/19381, AFD rendezvous port 6456, startup timeout
+1800 seconds. Override these using `AFD_NPU_DSV4_SYNC_E2E_API_PORT`,
 `AFD_NPU_DSV4_SYNC_E2E_AFD_PORT`, and `AFD_NPU_E2E_STARTUP_TIMEOUT`.
-`AFD_NPU_E2E_VLLM_BIN` selects the executable.
+`AFD_NPU_E2E_VLLM_BIN` selects the executable. The model and exactly the
+scenario's device count must be supplied; a list sized for the other shape
+fails rather than skips.
 
 ## Run with the Codex skill
 
