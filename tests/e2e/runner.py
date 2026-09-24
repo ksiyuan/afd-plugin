@@ -729,13 +729,7 @@ def build_vllm_command(
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
     if args.scenario in DSV4_SCENARIOS:
-        afd_config.update(
-            dsv4_config.additional_config(
-                verbatim_launch=bool(
-                    sync_profile is not None and sync_profile.verbatim_launch,
-                ),
-            ),
-        )
+        afd_config.update(dsv4_config.additional_config())
     cmd = [
         args.vllm_bin,
         "serve",

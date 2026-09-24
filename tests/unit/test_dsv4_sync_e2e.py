@@ -166,12 +166,13 @@ def test_dsv4_sync_fixed_deployment(monkeypatch, tmp_path, scenario):
             assert "--quantization" not in command
         assert "--kv-transfer-config" not in command
         config = json.loads(command[command.index("--additional-config") + 1])
-        if profile.verbatim_launch:
-            # The host script passes only the AFD block.
-            assert set(config) == {"afd"}
-        else:
-            assert config["enable_dsv4_shared_compressor_workspace"] is False
-            assert config["enable_cpu_binding"] is True
+        # Every DSV4 case pins the model-path switches, because the pinned
+        # runtime defaults the multistream DSA overlap to True and that RoPE
+        # path fails to tile on A5.
+        assert config["enable_dsv4_shared_compressor_workspace"] is False
+        assert config["multistream_dsv4_dsa_overlap"] is False
+        assert config["enable_dsa_cp"] is False
+        assert config["enable_cpu_binding"] is True
         # Exact equality also pins the absent keys: CAMP2P rejects both the
         # asynchronous mode and gate-on-Attention.
         expected_afd = {
