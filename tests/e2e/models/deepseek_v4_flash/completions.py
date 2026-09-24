@@ -30,12 +30,12 @@ def evaluate_completions(
     """Run the ten concurrent requests and check every response.
 
     ``check_answer`` requires the content to be exactly the expected sum and the
-    generation to finish with ``stop``, which is what the validated A3 profiles
-    and the asynchronous case answer. A profile whose host does not return
-    reliable answers yet passes ``check_answer=False``: the ten requests must
-    still be served together and each must return a nonempty answer that
-    finished, which is the plumbing this smoke case exists to cover. The exact
-    check stays on for every host that has it.
+    generation to finish with ``stop``, which is what the asynchronous case
+    answers. A profile whose host does not return reliable answers yet passes
+    ``check_answer=False``: the ten requests must still be served together and
+    each must return a nonempty answer that finished, which is the plumbing this
+    smoke case exists to cover. The exact check stays on for every host that has
+    it.
     """
     results: list[dict] = [
         {

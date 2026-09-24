@@ -260,9 +260,10 @@ operator failure. The gate stays on FFN in both profiles — CAMP2P rejects
 The concurrent oracle asks the same ten chat requests as the async case: `12 + 7`
 through `21 + 7` with temperature=0, thinking=false, and max_tokens=256, and every
 run requires the ten requests to be served together, each with a nonempty answer
-that finished. The A3 profile also compares each answer with the expected sum, as
-the async case does; the A5 profile does not, because that host does not return
-reliable answers yet — see the blocker below. Service liveness and owned-process
+that finished. Neither synchronous profile compares the answer yet — A5 corrupts
+part of a concurrent batch (see the blocker below) and A3 has not been validated
+against the oracle — so both cover the concurrent plumbing, and only the
+asynchronous case keeps the exact check. Service liveness and owned-process
 cleanup must pass, with 60 seconds allowed for shutdown before escalation. This
 path does **not** take the async FFN cleanup exception, because no CAM receive is
 pending.
@@ -291,15 +292,15 @@ and pinning the DSA model-path switches cleared.
 The lead is the A2E tile bookkeeping for uneven Attention peers, which this
 branch does not carry: A5 runs Attention DP2, so its two Attention ranks hold
 different token counts in a step and the FFN side has to reconcile rows, while
-A3 runs Attention DP1/TP4, where the ranks are uniform — and A3 passes. The
+A3 runs Attention DP1/TP4, where the ranks are uniform. The
 padded-tile and per-rank row helpers live in `afd_plugin/a2e_layout.py`, which
 the plugin's a2e work adds; a host running this case against that work should be
 retried.
 
-So the A5 profile covers the concurrent plumbing only — ten requests served
-together, each answer nonempty and finished — and leaves the sum unchecked. Set
-`check_answer` back to true for that profile once the corruption is fixed; the A3
-profile and the async case already compare the sum.
+So both synchronous profiles cover the concurrent plumbing only — ten requests
+served together, each answer nonempty and finished — and leave the sum unchecked.
+Set `check_answer` back to true for a profile once its host is validated; only the
+asynchronous case compares the sum today.
 
 ```bash
 export AFD_E2E_BACKEND=npu

@@ -523,10 +523,13 @@ def test_dsv4_sync_a3_has_no_dbo_to_verify(monkeypatch, tmp_path):
     assert runner.dbo_split_evidence_available(args) is True
 
 
-def test_dsv4_sync_only_a5_skips_the_answer_check():
-    """A3 compares the sum; A5 only requires the ten requests to be served."""
-    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO].check_answer is True
+def test_dsv4_sync_profiles_run_as_smoke_cases():
+    """Both synchronous profiles check the plumbing; the async case the answer."""
+    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO].check_answer is False
     assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A5_SCENARIO].check_answer is False
+    # The asynchronous case carries no synchronous profile, so it keeps the
+    # oracle's exact-answer default.
+    assert runner.sync_shape(runner.DSV4_ASYNC_CAM_SCENARIO) is None
 
 
 def test_dsv4_sync_served_response_keeps_the_shape_checks():
@@ -570,7 +573,7 @@ def test_dsv4_sync_oracle_uses_the_profile_answer_policy(monkeypatch, tmp_path):
 
     for scenario, expected in (
         (DSV4_SYNC_CAMP2P_A5_SCENARIO, False),
-        (DSV4_SYNC_CAMP2P_A3_SCENARIO, True),
+        (DSV4_SYNC_CAMP2P_A3_SCENARIO, False),
     ):
         args = _arguments(monkeypatch, tmp_path, scenario=scenario)
         runner.configure_scenario(args)

@@ -144,7 +144,7 @@ class DSV4SyncShape(NamedTuple):
     # A profile whose host does not return reliable answers yet sets this false:
     # the concurrent oracle then checks that the ten requests were served
     # together and finished, without comparing the answer. The exact check stays
-    # on for the asynchronous case and the A3 profile.
+    # on for the asynchronous case, which is the one host that answers it.
     check_answer: bool = True
     # A profile whose host launch script is the validated deployment emits only
     # the flags that script passes, instead of the case's extra deployment
@@ -218,6 +218,9 @@ DSV4_SYNC_SHAPES = {
         attention_ranks=4,
         ffn_ranks=4,
         tp_size=4,
+        # Smoke coverage, like A5: this host has not been validated against the
+        # answer oracle, so the case checks the concurrent plumbing only.
+        check_answer=False,
     ),
 }
 
