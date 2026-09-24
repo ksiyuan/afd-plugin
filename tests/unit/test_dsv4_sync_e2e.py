@@ -163,6 +163,7 @@ def test_dsv4_sync_main_uses_concurrent_requests_and_longer_cleanup(
     monkeypatch,
     tmp_path,
     scenario,
+    capsys,
 ):
     args = _arguments(monkeypatch, tmp_path, scenario=scenario)
     cleanup_options = {}
@@ -199,8 +200,16 @@ def test_dsv4_sync_main_uses_concurrent_requests_and_longer_cleanup(
     )
     assert runner.main() == 0
     assert evaluations == ["concurrent"]
-    # The DBO coverage gate follows the profile: only the A5 case enables DBO.
-    assert len(dbo_checks) == int(DSV4_SYNC_SHAPES[scenario].enable_dbo)
+    # The DBO coverage gate only runs where the runtime logs a two-ubatch split
+    # line; the A5 profile exercises DBO without machine verification and says
+    # so in its output.
+    profile = DSV4_SYNC_SHAPES[scenario]
+    expected_checks = int(
+        profile.enable_dbo and profile.dbo_split_evidence_available,
+    )
+    assert len(dbo_checks) == expected_checks
+    notice = "[dbo-coverage]" in capsys.readouterr().out
+    assert notice is (profile.enable_dbo and not profile.dbo_split_evidence_available)
     assert cleanup_options["termination_timeout_s"] == 60
     assert cleanup_options["deferred_sigkill_pgids"] == ()
 
@@ -416,6 +425,35 @@ def test_dsv4_sync_a3_environment_needs_no_cam_package(monkeypatch):
     assert env["AFD_FORCE_BALANCED_TOPK_IDS"] == "0"
     assert "CAM_CUST_OPAPI_LIB_PATH" not in env
     assert "HCCL_BUFFSIZE" not in env
+
+
+def test_dsv4_sync_a5_dbo_needs_no_debug_logging(monkeypatch, tmp_path):
+    """The A5 runtime logs no split line, so DBO keeps the caller's log level."""
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    args = _arguments(
+        monkeypatch,
+        tmp_path,
+        scenario=DSV4_SYNC_CAMP2P_A5_SCENARIO,
+    )
+    runner.configure_scenario(args)
+    assert args.enable_dbo is True
+    assert runner.dbo_split_evidence_available(args) is False
+
+    env = runner.build_env("2,3", args, role="attention")
+
+    assert "VLLM_LOGGING_LEVEL" not in env
+
+
+def test_dsv4_sync_a3_has_no_dbo_to_verify(monkeypatch, tmp_path):
+    args = _arguments(
+        monkeypatch,
+        tmp_path,
+        scenario=DSV4_SYNC_CAMP2P_A3_SCENARIO,
+    )
+    runner.configure_scenario(args)
+
+    assert args.enable_dbo is False
+    assert runner.dbo_split_evidence_available(args) is True
 
 
 def test_dsv4_sync_a5_environment_follows_the_launch_script(monkeypatch):
