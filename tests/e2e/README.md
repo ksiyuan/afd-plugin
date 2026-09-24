@@ -255,12 +255,15 @@ without ACL graph capture, for a host whose capture path trips a runtime
 operator failure. The gate stays on FFN in both profiles — CAMP2P rejects
 `compute_gate_on_attention=true`. KV transfer is not enabled.
 
-The concurrent oracle and its assertions match the async case: ten chat
-requests ask for `12 + 7` through `21 + 7` with temperature=0, thinking=false,
-and max_tokens=256; every response must contain one nonempty answer and finish
-with `stop`. Service liveness and owned-process cleanup must pass, with 60
-seconds allowed for shutdown before escalation. This path does **not** take the
-async FFN cleanup exception, because no CAM receive is pending.
+The concurrent oracle asks the same ten chat requests as the async case: `12 + 7`
+through `21 + 7` with temperature=0, thinking=false, and max_tokens=256. The A3
+profile keeps the async case's exact check — one nonempty answer that is the sum,
+finished with `stop` — while the A5 profile only requires the sum to appear in
+the response and the generation to end in a normal terminal state (`stop`, or a
+full token budget), because that checkpoint narrates the addition before
+answering and can run past the sum. Service liveness and owned-process cleanup
+must pass, with 60 seconds allowed for shutdown before escalation. This path does
+**not** take the async FFN cleanup exception, because no CAM receive is pending.
 
 The A5 script enables native DBO at 2/12; the case does not. The DBO split path
 is the current suspect for the DSA attention operator tiling failure seen on

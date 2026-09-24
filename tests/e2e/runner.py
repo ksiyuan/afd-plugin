@@ -1028,10 +1028,14 @@ def run_completion_evaluation(args: argparse.Namespace) -> None:
 
 
 def run_concurrent_completion_evaluation(args: argparse.Namespace) -> None:
+    profile = sync_shape(args.scenario)
     evaluate_completions(
         url=f"http://{args.api_host}:{attention_api_port(args)}/v1/chat/completions",
         model=served_model_name(args, "attention"),
         output_path=Path(args.completion_output_path),
+        # A synchronous profile may state that its checkpoint does not answer
+        # with the sum alone; every other scenario keeps the exact check.
+        strict_answer=True if profile is None else profile.strict_answer,
     )
 
 
