@@ -37,7 +37,7 @@ def _afd_host(shape: DSV4SyncShape) -> str:
     launch script passes explicitly. The A5 script starts both roles on the
     loopback address and needs no NIC variable.
     """
-    if shape.environment.nic_env_required:
+    if shape.nic_env_required:
         return required_env("HCCL_IF_IP")
     return os.environ.get("HCCL_IF_IP") or DSV4_SYNC_LOCAL_AFD_HOST
 
@@ -91,18 +91,17 @@ def build_environment(scenario: str) -> dict[str, str]:
     installed.
     """
     shape = DSV4_SYNC_SHAPES[scenario]
-    environment = shape.environment
     env = os.environ.copy()
-    if environment.nic_env_required:
+    if shape.nic_env_required:
         interface = required_env("HCCL_SOCKET_IFNAME")
         required_env("HCCL_IF_IP")
     else:
         interface = os.environ.get("HCCL_SOCKET_IFNAME", "")
-    if environment.keep_hccl_buffsize:
+    if shape.keep_hccl_buffsize:
         env.setdefault("HCCL_BUFFSIZE", str(DSV4_SYNC_HCCL_BUFFER_SIZE_MB))
     else:
         env.pop("HCCL_BUFFSIZE", None)
-    if environment.force_spawn:
+    if shape.force_spawn:
         env.update(
             {
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -113,7 +112,7 @@ def build_environment(scenario: str) -> dict[str, str]:
         env.pop("VLLM_WORKER_MULTIPROC_METHOD", None)
         env.pop("AFD_FORCE_SPAWN_MULTIPROCESSING", None)
     env.setdefault("VLLM_USE_V1", "1")
-    env.setdefault("PYTORCH_NPU_ALLOC_CONF", environment.npu_alloc_conf)
+    env.setdefault("PYTORCH_NPU_ALLOC_CONF", shape.npu_alloc_conf)
     env.update(
         {
             "HCCL_CONNECT_TIMEOUT": "1800",

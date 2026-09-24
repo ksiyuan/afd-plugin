@@ -75,21 +75,6 @@ DSV4_SYNC_CONNECTOR_EXTRA_CONFIG = {
 }
 
 
-class DSV4SyncEnvironment(NamedTuple):
-    """Process environment the host's recorded launch script relies on."""
-
-    # The recorded A3 rendezvous uses the caller's address, so it requires the
-    # NIC variables; the A5 script starts both roles on 127.0.0.1.
-    nic_env_required: bool = True
-    # AFD forces spawn multiprocessing so workers re-initialize the device in a
-    # fresh process. The A5 launch script relies on the platform default.
-    force_spawn: bool = True
-    # CAMP2P sizes its own AFD domains, so an inherited global HCCL_BUFFSIZE
-    # must not leak in. A5 exports HCCL_BUFFSIZE instead of per-domain sizing.
-    keep_hccl_buffsize: bool = False
-    npu_alloc_conf: str = DSV4_SYNC_ALLOC_CONF_EXPANDABLE
-
-
 # DeepSeek V4 does not fit on one Attention or one FFN die: A5 needs at least
 # 2A2F and A3 at least 4A4F. Each host runs the deployment its recorded launch
 # script uses, because the two hosts differ in more than rank count:
@@ -107,6 +92,17 @@ class DSV4SyncShape(NamedTuple):
     attention_ranks: int
     ffn_ranks: int
     tp_size: int
+    # Process environment that host's launch script relies on. AFD forces spawn
+    # multiprocessing so workers re-initialize the device in a fresh process, and
+    # the A5 script relies on the platform default instead.
+    force_spawn: bool = True
+    # CAMP2P sizes its own AFD domains, so an inherited global HCCL_BUFFSIZE must
+    # not leak in; A5 exports one instead of sizing per domain. The recorded A3
+    # rendezvous uses the caller's address and so requires the NIC variables,
+    # while the A5 script starts both roles on 127.0.0.1.
+    keep_hccl_buffsize: bool = False
+    npu_alloc_conf: str = DSV4_SYNC_ALLOC_CONF_EXPANDABLE
+    nic_env_required: bool = True
     enable_expert_parallel: bool = False
     use_graph: bool = False
     cudagraph_capture_size: int = 0
@@ -139,7 +135,6 @@ class DSV4SyncShape(NamedTuple):
     # Exact `--compilation-config` JSON when the script passes one; the runner
     # then omits its own capture-size flags.
     compilation_config: dict[str, object] | None = None
-    environment: DSV4SyncEnvironment = DSV4SyncEnvironment()
 
     @property
     def device_count(self) -> int:
@@ -185,12 +180,12 @@ DSV4_SYNC_SHAPES = {
         # concurrent plumbing — ten requests served and finished — and leaves
         # the sum to the hosts that answer it.
         check_answer=False,
-        environment=DSV4SyncEnvironment(
-            nic_env_required=False,
-            force_spawn=False,
-            keep_hccl_buffsize=True,
-            npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
-        ),
+        # The A5 script runs both roles on one host, keeps the platform's
+        # multiprocessing start method, and exports its own HCCL_BUFFSIZE.
+        nic_env_required=False,
+        force_spawn=False,
+        keep_hccl_buffsize=True,
+        npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
     ),
     DSV4_SYNC_CAMP2P_A3_SCENARIO: DSV4SyncShape(
         attention_ranks=4,
