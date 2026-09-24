@@ -142,12 +142,12 @@ settings live alongside the model entrypoint. It does not run
 GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
 FFN cleanup exception above and is not selected by the four-device PR gate.
 
-`afd-dsv4-flash-sync-camp2p-2a2f` (A5) and `afd-dsv4-flash-sync-camp2p-4a4f`
+`afd-dsv4-flash-sync-camp2p-2a2f` (A5) and `afd-dsv4-flash-sync-camp2p-8a8f`
 (A3) are the synchronous siblings of that case: local-only DSV4 Flash runs over
 `CAMP2pAFDConnector`, each following its host's recorded launch profile — A5 on
 four devices as Attention DP2/TP1 with expert parallelism, ACL graph capture, and
-a 4096 context; A3 on eight as Attention DP1/TP4 with the expert-parallel world
-at one and the 8192/1024 budget. Neither needs a CAM vendor package: the plugin's
+a 4096 context; A3 on sixteen as Attention DP2/TP4 and FFN DP8/TP1 with expert
+parallelism, eager, on the 8192/1024 budget. Neither needs a CAM vendor package: the plugin's
 own a2e/e2a operators carry the activations and, for the DSV4 Hash layers, the
 token ids the FFN-side gate routes with. Both keep the case's DSV4 model-path
 switches and the gate on FFN, and neither compares the answer: they are smoke

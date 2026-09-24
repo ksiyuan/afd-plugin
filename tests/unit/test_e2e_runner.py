@@ -486,7 +486,9 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ),
         (
             dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,
-            (False, False, False, 4, 4, 1, 4, 4, False),
+            # Sixteen dies: Attention DP2/TP4 and FFN DP8/TP1 with expert
+            # parallelism, the shape its recorded deployment uses.
+            (False, False, False, 8, 8, 1, 4, 1, True),
         ),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1, True)),
