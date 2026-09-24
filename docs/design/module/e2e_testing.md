@@ -26,7 +26,9 @@ validation_paths:
   - "tests/e2e/models/deepseek_v2_lite/test_deepseek_v2_lite.py"
   - "tests/e2e/models/deepseek_v2_lite/test_async_cam_npu.py"
   - "tests/e2e/models/deepseek_v4_flash/test_async_cam_npu.py"
+  - "tests/e2e/models/deepseek_v4_flash/test_sync_camp2p_npu.py"
   - "tests/unit/test_dsv4_e2e.py"
+  - "tests/unit/test_dsv4_sync_e2e.py"
   - "tests/e2e/environment.py"
   - "tests/e2e/models/deepseek_v4_flash/config.py"
   - "tests/e2e/models/deepseek_v4_flash/completions.py"
@@ -140,6 +142,38 @@ settings live alongside the model entrypoint. It does not run
 GSM8K or claim general accuracy coverage. It uses the same scoped async NPU
 FFN cleanup exception above and is not selected by the four-device PR gate.
 
+`afd-dsv4-flash-sync-camp2p-2a2f` (A5) and `afd-dsv4-flash-sync-camp2p-4a4f`
+(A3) are the synchronous siblings of that case: local-only DSV4 Flash runs over
+`CAMP2pAFDConnector`, each following its host's recorded launch profile.
+DeepSeek V4 does not fit on a single Attention or FFN die, so A5 runs 2A2F on
+four devices and A3 4A4F on eight, and the two profiles differ in more than rank
+count: A5 reproduces its host's recorded `vllm serve` launch flags — Attention
+DP2/TP1 and FFN DP2/TP1 with expert parallelism, that script's own
+`--compilation-config` (`FULL_DECODE_ONLY`, capture 16), native DBO at 2/12, a
+4096 context, and no API server count, seed, block size, batch or memory budget,
+prefix-caching, or chunked-prefill flag — while A3 shards by tensor parallel
+with the expert-parallel world at one, eager, with the 8192/1024 budget and the
+case's deployment flags. A5 keeps the case's DSV4 model-path switches
+(`multistream_dsv4_dsa_overlap=false` among them), because the pinned runtime
+defaults that overlap on and its RoPE path fails to tile on A5. It passes no
+`--quantization` either and sizes no CAMP2P
+domain itself, keeping the script's global `HCCL_BUFFSIZE`; A3 carries
+`connector_extra_config` with only `hccl_buffer_size` and `quant_mode=0` and
+resolves the Ascend quantization method from its checkpoint. Neither needs a CAM
+vendor package: the plugin's own
+a2e/e2a operators carry both the activations and, for the DSV4 Hash layers, the
+token ids the FFN-side gate routes with, so this is the transport available on
+both A3 and A5 once the ops are built for the target SOC. Because CAMP2P rejects
+gate-on-Attention and any nonzero CAM quantization mode, the gate stays on FFN
+in both profiles. Each case reuses the ten-request concurrent oracle of the
+async case, takes the same 60-second shutdown grace, and deliberately does
+**not** take the async FFN cleanup exception: no CAM receive is pending on this
+path. A5 runs native DBO; because the coverage gate matches vLLM's GPU model
+runner debug line that prints the created `UBatchSlice` objects and the pinned
+Ascend NPU runtime logs no equivalent line, that profile exercises DBO without
+machine-verifying the split, keeps the caller's logging level, and reports the
+gap instead of failing on it.
+
 The 2A1F cases (`afd-eager-2a1f`, `afd-graph-2a1f`, `afd-graph-dbo-2a1f`) are
 local-only scenarios: they use three of the four devices (two Attention ranks,
 one FFN rank) and run outside CI.
@@ -166,16 +200,23 @@ unverified.
 | Task | GSM8K | GSM8K |
 | Few-shot examples | 8 | 8 |
 | Generated-token limit | 512 | 512 |
-| Samples | first 7 | first 7 |
+| Samples | first 7; DBO gates floor at 24 | first 7; the DeepSeek `afd-graph-dbo-2a1f` case floors at 24 |
 | Metric | GSM8K exact match | GSM8K exact match |
 | Minimum accuracy | 0.27 | 0.27 |
 | Cases | four legacy cases plus four CUDA ModelRunnerV2 cases | six Qwen3 MoE / Qwen3.6 MoE cases plus DeepSeek-V2-Lite `afd-graph-dbo-2a1f` |
 
-An accuracy of `0.27` requires at least 2 correct answers out of 7.
+An accuracy of `0.27` requires at least 2 correct answers out of 7 (7 out
+of 24 in DBO scenarios).
 
 - PR and weekly CI leave `AFD_GSM8K_LIMIT` unset.
 - Set `AFD_GSM8K_LIMIT=all` locally for a full 1319-sample run.
 - Other limits are for local debugging, not CI gates.
+- DBO scenarios (`--enable-dbo`) run GSM8K with 12 concurrent requests and
+  floor the sample count at 24: a sequential client never satisfies the
+  DP-wide split agreement, so live requests would never run as two ubatches
+  and only warmup/capture would exercise the split path. The gate asserts
+  that at least one live two-ubatch step was recorded; `AFD_GSM8K_LIMIT=all`
+  still bypasses the floor.
 - CI leaves `AFD_GSM8K_THRESHOLD` unset or raises it.
 - Use the official GSM8K task, `HF_HOME`, and `results_*.json`. Do not commit a
   seven-row dataset or custom task YAML.

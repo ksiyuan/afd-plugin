@@ -31,6 +31,10 @@ from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_ATTENTION_TP_SIZE,
     DSV4_FFN_RANKS,
     DSV4_PROCESS_TERMINATION_TIMEOUT_S,
+    DSV4_SCENARIOS,
+    DSV4_SYNC_CAMP2P_SCENARIOS,
+    DSV4_SYNC_SHAPES,
+    sync_shape,
 )
 from tests.e2e.process_utils import (
     kill_processes_matching_environment,
@@ -50,6 +54,11 @@ ASYNC_UBATCH_ATTENTION_TP_SIZE = 2
 ASYNC_UBATCH_NUM_STAGES = 2
 ASYNC_UBATCH_BATCH_SIZE = 2
 V2_SYNC_CONNECTOR = "P2pNcclAFDConnector"
+# Graph capture and DBO defaults for the scenarios that do not carry their own
+# launch profile; the DSV4 synchronous profiles override both.
+DEFAULT_CUDAGRAPH_CAPTURE_SIZE = 8
+DEFAULT_DBO_DECODE_TOKEN_THRESHOLD = 1
+DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD = 8
 V2_SCENARIOS = (
     "afd-v2-eager-1a1f",
     "afd-v2-eager-dp2",
@@ -85,6 +94,12 @@ DEFAULT_GSM8K_THRESHOLD = 0.27
 COMPLETION_REQUEST_TIMEOUT_S = 120
 COMPLETION_MAX_TOKENS = 32
 COMPLETION_TEMPERATURE = 0
+DBO_EVAL_NUM_CONCURRENT = 12
+DBO_EVAL_MIN_SAMPLES = 2 * DBO_EVAL_NUM_CONCURRENT
+DBO_EVAL_NUM_UBATCHES = 2
+# The engine logs one DEBUG line per executed step carrying its ubatch slice
+# list; a step line containing UBatchSlice entries is a live two-ubatch run.
+DBO_SPLIT_EVIDENCE_ENTRY = "UBatchSlice("
 ACCOUNTING_PROMPT = (
     "<|im_start|>system\n"
     "You are a professional accountant. Answer questions using accounting "
@@ -125,6 +140,8 @@ def main() -> int:
     processes: list[subprocess.Popen[str]] = []
     processes_by_role: dict[str, subprocess.Popen[str]] = {}
     log_threads: list[threading.Thread] = []
+    dbo_split_steps: list[float] = []
+    dbo_eval_started_at: float | None = None
     handled_signals = (signal.SIGTERM, signal.SIGINT)
     previous_handlers = {signum: signal.getsignal(signum) for signum in handled_signals}
     received_signal: int | None = None
@@ -184,7 +201,7 @@ def main() -> int:
             )
             processes.append(process)
             processes_by_role[role] = process
-            log_threads.append(stream_output(role, process))
+            log_threads.append(stream_output(role, process, dbo_split_steps))
             ensure_alive(process, f"{label} process exited during startup")
 
         wait_for_openai_api(args, processes)
@@ -192,10 +209,25 @@ def main() -> int:
 
         if args.scenario == ASYNC_CAM_SCENARIO:
             run_completion_evaluation(args)
-        elif args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+        elif args.scenario in DSV4_SCENARIOS:
             run_concurrent_completion_evaluation(args)
         else:
+            if args.enable_dbo:
+                dbo_eval_started_at = time.time()
             run_gsm8k_evaluation(args)
+        if args.enable_dbo:
+            if dbo_split_evidence_available(args):
+                assert_dbo_live_split_coverage(
+                    dbo_split_steps,
+                    dbo_eval_started_at,
+                    args,
+                )
+            else:
+                print(
+                    "\n[dbo-coverage] this profile runs DBO on a runtime that "
+                    "logs no two-ubatch split line, so the split is exercised "
+                    "but not machine-verified here",
+                )
 
         ensure_processes_alive(processes)
     finally:
@@ -215,7 +247,7 @@ def main() -> int:
                         processes,
                         termination_timeout_s=(
                             DSV4_PROCESS_TERMINATION_TIMEOUT_S
-                            if args.scenario == DSV4_ASYNC_CAM_SCENARIO
+                            if args.scenario in DSV4_SCENARIOS
                             else PROCESS_TERMINATION_TIMEOUT_S
                         ),
                         deferred_sigkill_pgids=deferred_sigkill_pgids,
@@ -283,7 +315,7 @@ def parse_args() -> argparse.Namespace:
             "afd-graph-dbo-2a2f",
             ASYNC_CAM_SCENARIO,
             ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
+            *DSV4_SCENARIOS,
             *V2_SCENARIOS,
         ],
         required=True,
@@ -391,7 +423,7 @@ def configure_scenario(args: argparse.Namespace) -> None:
     """Set topology and features for the selected fixed scenario."""
     is_async_cam = args.scenario == ASYNC_CAM_SCENARIO
     is_async_ubatch = args.scenario == ASYNC_UBATCH_SCENARIO
-    is_dsv4 = args.scenario == DSV4_ASYNC_CAM_SCENARIO
+    is_dsv4 = args.scenario in DSV4_SCENARIOS
     scenario_settings = {
         "baseline-graph": (True, True, False, 4, 0),
         "afd-eager-2a1f": (False, False, False, 2, 1),
@@ -428,6 +460,14 @@ def configure_scenario(args: argparse.Namespace) -> None:
         "afd-v2-graph-dp2": (False, True, False, 2, 2),
         "afd-v2-graph-tp2": (False, True, False, 2, 2),
     }
+    for sync_scenario, sync_profile in DSV4_SYNC_SHAPES.items():
+        scenario_settings[sync_scenario] = (
+            False,
+            dsv4_config.sync_use_graph(sync_profile),
+            sync_profile.enable_dbo,
+            sync_profile.attention_ranks,
+            sync_profile.ffn_ranks,
+        )
     baseline, use_graph, enable_dbo, attention_ranks, ffn_ranks = scenario_settings[
         args.scenario
     ]
@@ -437,8 +477,11 @@ def configure_scenario(args: argparse.Namespace) -> None:
     args.num_attention_ranks = attention_ranks
     args.num_ffn_ranks = ffn_ranks
     args.tp_size = 1
-    if is_dsv4:
+    active_sync_profile = sync_shape(args.scenario)
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         args.attention_tp_size = DSV4_ATTENTION_TP_SIZE
+    elif active_sync_profile is not None:
+        args.attention_tp_size = active_sync_profile.tp_size
     elif is_async_cam:
         args.attention_tp_size = ASYNC_CAM_ATTENTION_TP_SIZE
     elif is_async_ubatch:
@@ -447,7 +490,15 @@ def configure_scenario(args: argparse.Namespace) -> None:
         args.attention_tp_size = 2
     else:
         args.attention_tp_size = 1
-    args.ffn_tp_size = 2 if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS else 1
+    if args.scenario in V2_TENSOR_PARALLEL_SCENARIOS:
+        args.ffn_tp_size = 2
+    elif active_sync_profile is not None:
+        # A synchronous DSV4 profile sizes the FFN side exactly like its
+        # Attention side: A5 shards by data parallel with expert parallelism,
+        # A3 by tensor parallel.
+        args.ffn_tp_size = active_sync_profile.tp_size
+    else:
+        args.ffn_tp_size = 1
     args.use_v2_model_runner = args.scenario in V2_SCENARIOS
     if args.use_v2_model_runner:
         if args.afd_async or args.afd_connector == ASYNC_AFD_CONNECTOR:
@@ -506,13 +557,36 @@ def configure_scenario(args: argparse.Namespace) -> None:
             for arg in args.common_vllm_arg
         ):
             args.common_vllm_arg.extend(["--gpu-memory-utilization", "0.8"])
-    if is_dsv4:
+    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
         dsv4_config.configure_scenario(args)
+    elif args.scenario in DSV4_SYNC_CAMP2P_SCENARIOS:
+        dsv4_config.configure_sync_camp2p_scenario(args)
     if use_graph:
-        args.cudagraph_capture_size = 8
+        args.cudagraph_capture_size = (
+            active_sync_profile.cudagraph_capture_size
+            if active_sync_profile is not None
+            else DEFAULT_CUDAGRAPH_CAPTURE_SIZE
+        )
     if enable_dbo:
-        args.dbo_decode_token_threshold = 1
-        args.dbo_prefill_token_threshold = 8
+        args.dbo_decode_token_threshold = (
+            active_sync_profile.dbo_decode_token_threshold
+            if active_sync_profile is not None
+            else DEFAULT_DBO_DECODE_TOKEN_THRESHOLD
+        )
+        args.dbo_prefill_token_threshold = (
+            active_sync_profile.dbo_prefill_token_threshold
+            if active_sync_profile is not None
+            else DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD
+        )
+        # A DSV4 sync profile says whether its launch script keeps chunked
+        # prefill alongside DBO; every other DBO scenario disables it.
+        if (
+            active_sync_profile is None
+            or active_sync_profile.dbo_disables_chunked_prefill
+        ) and not any(
+            arg == "--no-enable-chunked-prefill" for arg in args.common_vllm_arg
+        ):
+            args.common_vllm_arg.append("--no-enable-chunked-prefill")
 
 
 def parse_csv(value: str) -> list[str]:
@@ -550,15 +624,12 @@ def validate_topology(
     if args.use_v2_model_runner and args.device_backend != "gpu":
         raise ValueError("ModelRunnerV2 E2E scenarios require GPU")
     if (
-        args.scenario
-        in (
-            ASYNC_CAM_SCENARIO,
-            ASYNC_UBATCH_SCENARIO,
-            DSV4_ASYNC_CAM_SCENARIO,
-        )
+        args.scenario in (ASYNC_CAM_SCENARIO, ASYNC_UBATCH_SCENARIO)
         and args.device_backend != "npu"
     ):
         raise ValueError("async CAM scenarios require NPU")
+    if args.scenario in DSV4_SCENARIOS and args.device_backend != "npu":
+        raise ValueError("DSV4 scenarios require NPU")
     for role, rank_count in (
         ("attention", args.num_attention_ranks),
         ("ffn", args.num_ffn_ranks),
@@ -633,6 +704,7 @@ def build_vllm_command(
     )
     role_dp_size = max(1, role_total_ranks // tp_size)
     is_npu = args.device_backend == "npu"
+    sync_profile = sync_shape(args.scenario)
     connector = args.afd_connector or (
         "CAMP2pAFDConnector" if is_npu else "P2pNcclAFDConnector"
     )
@@ -656,7 +728,7 @@ def build_vllm_command(
     )
     if connector_extra_config:
         afd_config["afd"]["connector_extra_config"] = connector_extra_config
-    if args.scenario == DSV4_ASYNC_CAM_SCENARIO:
+    if args.scenario in DSV4_SCENARIOS:
         afd_config.update(dsv4_config.additional_config())
     cmd = [
         args.vllm_bin,
@@ -670,10 +742,19 @@ def build_vllm_command(
         str(role_dp_size),
         "--tensor-parallel-size",
         str(tp_size),
-        "--enable-expert-parallel",
-        "--additional-config",
-        json.dumps(afd_config, separators=(",", ":")),
     ]
+    if sync_profile is None or sync_profile.enable_expert_parallel:
+        # Non-DSV4 AFD scenarios always run expert parallel. The A5 DSV4 sync
+        # profile follows its launch script, which runs Attention DP2/TP1 and
+        # FFN DP2/TP1 with expert parallelism; the A3 profile shards by tensor
+        # parallel and keeps the expert-parallel world at one.
+        cmd.append("--enable-expert-parallel")
+    cmd.extend(
+        [
+            "--additional-config",
+            json.dumps(afd_config, separators=(",", ":")),
+        ],
+    )
     if args.use_v2_model_runner:
         cmd.extend(
             [
@@ -682,12 +763,32 @@ def build_vllm_command(
                 "--no-async-scheduling",
             ],
         )
-    if args.cuda_graph_full_decode_only:
-        capture_size = str(args.cudagraph_capture_size)
+    profile_compilation_config = (
+        None
+        if sync_profile is None
+        else dsv4_config.sync_compilation_config(sync_profile)
+    )
+    if profile_compilation_config is not None:
+        # A profile that carries its host script's compilation config passes it
+        # verbatim, so the runner adds none of its own capture-size flags.
         cmd.extend(
             [
-                "--max-num-seqs",
-                capture_size,
+                "--compilation-config",
+                json.dumps(profile_compilation_config, separators=(",", ":")),
+            ],
+        )
+    elif args.cuda_graph_full_decode_only:
+        capture_size = str(args.cudagraph_capture_size)
+        # A scenario that fixes its own `--max-num-seqs` (the DSV4 launch
+        # profiles do) keeps it: the capture size only has to cover it.
+        max_num_seqs_args = (
+            []
+            if any(arg == "--max-num-seqs" for arg in args.common_vllm_arg)
+            else ["--max-num-seqs", capture_size]
+        )
+        cmd.extend(
+            [
+                *max_num_seqs_args,
                 "--max-cudagraph-capture-size",
                 capture_size,
                 "--cudagraph-capture-sizes",
@@ -765,6 +866,19 @@ def uses_npu_async_process_cleanup(args: argparse.Namespace) -> bool:
     )
 
 
+def dbo_split_evidence_available(args: argparse.Namespace) -> bool:
+    """Return whether the scenario's runtime logs a two-ubatch split line.
+
+    The DBO coverage gate matches vLLM's GPU model runner debug line that prints
+    the created `UBatchSlice` objects, which is also why a DBO run forces
+    `VLLM_LOGGING_LEVEL=DEBUG`. The pinned Ascend NPU runtime prints no such
+    line, so a profile that runs DBO there exercises the split without
+    machine-verifying it and keeps the caller's logging level.
+    """
+    profile = sync_shape(args.scenario)
+    return True if profile is None else profile.dbo_split_evidence_available
+
+
 def decode_bench_connector_config() -> str:
     return json.dumps(
         {
@@ -801,6 +915,8 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
         str(DEFAULT_GSM8K_SAMPLE_LIMIT),
     )
     sample_limit = None if configured_limit == "all" else int(configured_limit)
+    if args.enable_dbo and sample_limit is not None:
+        sample_limit = max(sample_limit, DBO_EVAL_MIN_SAMPLES)
     expected_sample_count = (
         GSM8K_FULL_SAMPLE_COUNT if sample_limit is None else sample_limit
     )
@@ -812,6 +928,8 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
         if args.scenario == ASYNC_UBATCH_SCENARIO
         else {}
     )
+    if args.enable_dbo:
+        scenario_options["num_concurrent"] = DBO_EVAL_NUM_CONCURRENT
     role = "baseline" if args.baseline else "attention"
     results = _run_lm_eval(
         f"http://{args.api_host}:{attention_api_port(args)}",
@@ -837,6 +955,36 @@ def run_gsm8k_evaluation(args: argparse.Namespace) -> None:
             f"GSM8K accuracy {accuracy:.4f} is below the required "
             f"threshold {minimum_accuracy:.4f}",
         )
+
+
+def assert_dbo_live_split_coverage(
+    split_step_times: list[float],
+    eval_started_at: float | None,
+    args: argparse.Namespace,
+) -> None:
+    live_split_steps = sum(
+        1
+        for received_at in split_step_times
+        if eval_started_at is None or received_at >= eval_started_at
+    )
+    if live_split_steps:
+        print(
+            "\n[dbo-coverage] live DBO split coverage confirmed: "
+            f"{live_split_steps} two-ubatch step(s) recorded in the "
+            f"evaluation window",
+        )
+        return
+    raise RuntimeError(
+        "DBO was enabled but no live request was ever split into "
+        f"{DBO_EVAL_NUM_UBATCHES} ubatches: 0 two-ubatch steps were recorded "
+        "inside the evaluation window (warmup/capture-only execution does "
+        f"not count). Client concurrency: {DBO_EVAL_NUM_CONCURRENT}, sample "
+        f"floor: {DBO_EVAL_MIN_SAMPLES}. Thresholds: "
+        f"dbo_decode_token_threshold={args.dbo_decode_token_threshold}, "
+        f"dbo_prefill_token_threshold={args.dbo_prefill_token_threshold}. "
+        "Increase the client concurrency until both attention ranks hold "
+        "enough real tokens for two non-empty ubatches.",
+    )
 
 
 def run_completion_evaluation(args: argparse.Namespace) -> None:
@@ -903,6 +1051,8 @@ def build_env(
         env["VLLM_PLUGINS"] = "ascend" if args.device_backend == "npu" else ""
     else:
         env["VLLM_PLUGINS"] = "ascend,afd" if args.device_backend == "npu" else "afd"
+    if args.enable_dbo and dbo_split_evidence_available(args):
+        env["VLLM_LOGGING_LEVEL"] = "DEBUG"
     env["PYTHONUNBUFFERED"] = "1"
     if e2e_run_id is not None:
         if role is None:
@@ -947,11 +1097,18 @@ def start_process(
 def stream_output(
     name: str,
     process: subprocess.Popen[str],
+    dbo_split_steps: list[float] | None = None,
 ) -> threading.Thread:
     def worker() -> None:
         assert process.stdout is not None
         for line in process.stdout:
             print(f"[{name}] {line}", end="")
+            if (
+                dbo_split_steps is not None
+                and name == "attention"
+                and DBO_SPLIT_EVIDENCE_ENTRY in line
+            ):
+                dbo_split_steps.append(time.time())
 
     thread = threading.Thread(target=worker, name=f"{name}-log-stream", daemon=True)
     thread.start()

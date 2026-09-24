@@ -12,6 +12,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,7 @@ from tests.e2e.accuracy import gsm8k as helpers_gsm8k
 from tests.e2e.models.deepseek_v2_lite import (
     test_deepseek_v2_lite as deepseek_v2_lite_e2e,
 )
+from tests.e2e.models.deepseek_v4_flash import config as dsv4_config
 from tests.e2e.models.qwen3_6 import test_qwen3_6 as qwen3_6_e2e
 from tests.e2e.models.qwen3_moe import test_qwen3_moe as qwen3_moe_e2e
 
@@ -474,6 +476,16 @@ def test_parse_args_rejects_legacy_fixed_scenario_options(monkeypatch, legacy_ar
         ("afd-eager-async-cam", (False, False, False, 2, 2, 1, 2, 1, False)),
         ("afd-async-ubatch", (False, False, False, 2, 1, 1, 2, 1, False)),
         (runner.DSV4_ASYNC_CAM_SCENARIO, (False, False, False, 8, 8, 1, 4, 1, False)),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A5_SCENARIO,
+            # The A5 profile runs Attention DP2/TP1 and FFN DP2/TP1 with ACL
+            # graph capture and native DBO, exactly like its launch script.
+            (False, True, True, 2, 2, 1, 1, 1, False),
+        ),
+        (
+            dsv4_config.DSV4_SYNC_CAMP2P_A3_SCENARIO,
+            (False, False, False, 4, 4, 1, 4, 4, False),
+        ),
         ("afd-v2-eager-1a1f", (False, False, False, 1, 1, 1, 1, 1, True)),
         ("afd-v2-eager-dp2", (False, False, False, 2, 2, 1, 1, 1, True)),
         ("afd-v2-eager-tp2", (False, False, False, 2, 2, 1, 2, 2, True)),
@@ -507,11 +519,29 @@ def test_configure_scenario_overwrites_fixed_topology_and_features(
         args.ffn_tp_size,
         args.use_v2_model_runner,
     ) == expected
+    # A scenario that carries its own launch profile (the DSV4 synchronous
+    # cases) uses that profile's graph and DBO settings instead of the defaults.
+    profile = dsv4_config.sync_shape(scenario)
     if args.cuda_graph_full_decode_only:
-        assert args.cudagraph_capture_size == 8
+        expected_capture_size = (
+            profile.cudagraph_capture_size
+            if profile is not None
+            else runner.DEFAULT_CUDAGRAPH_CAPTURE_SIZE
+        )
+        assert args.cudagraph_capture_size == expected_capture_size
     if args.enable_dbo:
-        assert args.dbo_decode_token_threshold == 1
-        assert args.dbo_prefill_token_threshold == 8
+        expected_decode_threshold = (
+            profile.dbo_decode_token_threshold
+            if profile is not None
+            else runner.DEFAULT_DBO_DECODE_TOKEN_THRESHOLD
+        )
+        expected_prefill_threshold = (
+            profile.dbo_prefill_token_threshold
+            if profile is not None
+            else runner.DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD
+        )
+        assert args.dbo_decode_token_threshold == expected_decode_threshold
+        assert args.dbo_prefill_token_threshold == expected_prefill_threshold
 
 
 def test_async_cam_scenario_builds_dp1tp2_attention_and_dp2tp1_ffn():
@@ -869,6 +899,31 @@ def test_run_lm_eval_passes_max_gen_toks_to_local_completions(
     command = popen_calls[0]
     model_args = command[command.index("--model_args") + 1]
     assert "max_gen_toks=321" in model_args.split(",")
+
+
+def test_run_lm_eval_passes_num_concurrent_to_local_completions(
+    monkeypatch,
+    tmp_path,
+):
+    popen_calls = []
+
+    def fake_popen(command, **_kwargs):
+        popen_calls.append(command)
+        raise RuntimeError("stop after inspecting lm-eval invocation")
+
+    monkeypatch.setattr(helpers_gsm8k.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="stop after inspecting"):
+        helpers_gsm8k._run_lm_eval(
+            "http://127.0.0.1:8000",
+            "model",
+            output_path=str(tmp_path / "results"),
+            num_concurrent=12,
+        )
+
+    command = popen_calls[0]
+    model_args = command[command.index("--model_args") + 1]
+    assert "num_concurrent=12" in model_args.split(",")
 
 
 def test_run_lm_eval_reads_timestamped_results_file(monkeypatch, tmp_path):
@@ -1297,6 +1352,29 @@ def test_run_gsm8k_evaluation_uses_batch_two_for_async_token_split(
     assert calls[0][2]["batch_size"] == 2
 
 
+def test_run_gsm8k_evaluation_concurrency_and_sample_floor_for_dbo(monkeypatch):
+    args = _args()
+    args.scenario = "afd-graph-dbo-2a1f"
+    args.device_backend = "gpu"
+    runner.configure_scenario(args)
+    calls = []
+    monkeypatch.delenv("AFD_GSM8K_LIMIT", raising=False)
+
+    def fake_run_lm_eval(base_url, model_name, **kwargs):
+        calls.append((base_url, model_name, kwargs))
+        return {
+            "n-samples": {"gsm8k": {"effective": runner.DBO_EVAL_MIN_SAMPLES}},
+            "results": {"gsm8k": {"exact_match": 0.27}},
+        }
+
+    monkeypatch.setattr(runner, "_run_lm_eval", fake_run_lm_eval)
+
+    runner.run_gsm8k_evaluation(args)
+
+    assert calls[0][2]["num_concurrent"] == runner.DBO_EVAL_NUM_CONCURRENT
+    assert calls[0][2]["limit"] == runner.DBO_EVAL_MIN_SAMPLES
+
+
 def test_run_gsm8k_evaluation_rejects_an_incomplete_full_dataset(
     monkeypatch,
 ):
@@ -1619,3 +1697,79 @@ def test_v2_model_entry_builds_runner_command_with_exact_devices(
 
     assert command[command.index("--attention-devices") + 1] == attention_devices
     assert command[command.index("--ffn-devices") + 1] == ffn_devices
+
+
+def test_configure_scenario_separates_prefill_and_decode_steps_for_dbo():
+    args = _args()
+    args.scenario = "afd-graph-dbo-2a1f"
+    args.common_vllm_arg = ["--unrelated-arg"]
+    runner.configure_scenario(args)
+
+    assert "--no-enable-chunked-prefill" in args.common_vllm_arg
+
+    args.scenario = "afd-graph-2a1f"
+    args.common_vllm_arg = ["--unrelated-arg"]
+    runner.configure_scenario(args)
+
+    assert "--no-enable-chunked-prefill" not in args.common_vllm_arg
+
+
+def test_build_env_enables_debug_logging_for_dbo_scenarios(monkeypatch):
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+
+    args = _args()
+    args.scenario = "afd-graph-dbo-2a1f"
+    runner.configure_scenario(args)
+    dbo_env = runner.build_env("0,1", args, role="attention")
+
+    assert dbo_env["VLLM_LOGGING_LEVEL"] == "DEBUG"
+
+    args.scenario = "afd-graph-2a1f"
+    runner.configure_scenario(args)
+    plain_env = runner.build_env("0,1", args, role="attention")
+
+    assert "VLLM_LOGGING_LEVEL" not in plain_env
+
+
+def test_stream_output_records_attention_split_steps(monkeypatch):
+    split_steps: list[float] = []
+    process: Any = argparse.Namespace(
+        stdout=io.StringIO(
+            "DEBUG [gpu_model_runner.py] ubatch_slices: [UBatchSlice(...)], ...\n"
+            "DEBUG [gpu_model_runner.py] ubatch_slices: None, ...\n"
+            "INFO serving\n",
+        ),
+    )
+    timestamps = iter([101.0, 102.0])
+    monkeypatch.setattr(runner.time, "time", lambda: next(timestamps))
+
+    thread = runner.stream_output("attention", process, split_steps)
+    thread.join(timeout=5)
+
+    assert split_steps == [101.0]
+
+
+def test_assert_dbo_live_split_coverage_passes_when_steps_in_window(monkeypatch):
+    args = _args()
+    args.device_backend = "gpu"
+    monkeypatch.setattr(runner.time, "time", lambda: 102.0)
+
+    runner.assert_dbo_live_split_coverage([101.0, 101.4], 100.0, args)
+
+
+def test_assert_dbo_live_split_coverage_fails_on_warmup_only(monkeypatch):
+    args = _args()
+    args.device_backend = "gpu"
+    monkeypatch.setattr(runner.time, "time", lambda: 102.0)
+
+    with pytest.raises(RuntimeError, match="no live request was ever split"):
+        runner.assert_dbo_live_split_coverage([99.0], 100.0, args)
+
+
+def test_assert_dbo_live_split_coverage_fails_without_evidence(monkeypatch):
+    args = _args()
+    args.device_backend = "gpu"
+    monkeypatch.setattr(runner.time, "time", lambda: 102.0)
+
+    with pytest.raises(RuntimeError, match="no live request was ever split"):
+        runner.assert_dbo_live_split_coverage([], 100.0, args)

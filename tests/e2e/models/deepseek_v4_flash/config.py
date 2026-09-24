@@ -1,16 +1,57 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Fixed DSV4 Flash async CAM deployment and acceptance parameters."""
+"""Fixed DSV4 Flash deployment and acceptance parameters.
+
+Two transports are covered: the asynchronous CAM connector, and the
+synchronous CAMP2P connector, which needs no CAM vendor package.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
+from typing import NamedTuple
 
 DSV4_ASYNC_CAM_SCENARIO = "afd-dsv4-flash-async-cam-dp2tp4-ep8"
+DSV4_SYNC_CAMP2P_A5_SCENARIO = "afd-dsv4-flash-sync-camp2p-2a2f"
+DSV4_SYNC_CAMP2P_A3_SCENARIO = "afd-dsv4-flash-sync-camp2p-4a4f"
+DSV4_SYNC_CAMP2P_SCENARIOS = (
+    DSV4_SYNC_CAMP2P_A5_SCENARIO,
+    DSV4_SYNC_CAMP2P_A3_SCENARIO,
+)
+DSV4_SCENARIOS = (DSV4_ASYNC_CAM_SCENARIO, *DSV4_SYNC_CAMP2P_SCENARIOS)
 DSV4_ATTENTION_RANKS = 8
 DSV4_FFN_RANKS = 8
 DSV4_ATTENTION_TP_SIZE = 4
+
+
+DSV4_SYNC_CAMP2P_CONNECTOR = "CAMP2pAFDConnector"
+# CAMP2P sizes its AFD HCCL domains through this override; the A5 and A3 runs
+# used 2048 MB. quant_mode stays 0, the only mode the runtime accepts today.
+DSV4_SYNC_HCCL_BUFFER_SIZE_MB = 2048
+DSV4_SYNC_QUANT_MODE = 0
+DSV4_ASCEND_QUANTIZATION = "ascend"
+# `--quantization none` means "pass no --quantization at all" and let the
+# checkpoint's own quantization_config decide.
+DSV4_CHECKPOINT_QUANTIZATION = "none"
+DSV4_SYNC_QUANTIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION"
+# Context, batch, and memory budget. The asynchronous case keeps the 16-die
+# budget it was validated with; the synchronous cases default to the smaller
+# profile the A5 and A3 launch scripts use, because DeepSeek V4 out-of-memory
+# on A3 is usually the context/batch budget rather than the shard count. Every
+# value is overridable so a host can be tuned without editing the case.
+DSV4_MAX_MODEL_LEN = "1048576"
+DSV4_MAX_NUM_BATCHED_TOKENS = "8192"
+DSV4_MAX_NUM_SEQS = "16"
+DSV4_MEMORY_UTILIZATION = "0.7"
+DSV4_SYNC_MAX_MODEL_LEN = "8192"
+DSV4_SYNC_MAX_NUM_BATCHED_TOKENS = "1024"
+DSV4_SYNC_MAX_MODEL_LEN_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_MODEL_LEN"
+DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_BATCHED_TOKENS"
+DSV4_SYNC_MAX_NUM_SEQS_ENV = "AFD_NPU_DSV4_SYNC_E2E_MAX_NUM_SEQS"
+DSV4_SYNC_MEMORY_UTILIZATION_ENV = "AFD_NPU_DSV4_SYNC_E2E_MEMORY_UTILIZATION"
 DSV4_CONCURRENT_REQUESTS = 10
 DSV4_REQUEST_TIMEOUT_S = 300
 DSV4_COMPLETION_MAX_TOKENS = 256
@@ -19,11 +60,363 @@ DSV4_PROMPT_SECOND_OPERAND = 7
 # Sixteen NPU workers take longer than the small cases to destroy HCCL
 # resources; the observed launcher shutdown alone exceeded 20 seconds.
 DSV4_PROCESS_TERMINATION_TIMEOUT_S = 60
+# The A5 recorded launch script runs a 4096 context with ACL graph capture and
+# native DBO instead of the eager 8192/1024 deployment the A3 profile records.
+DSV4_SYNC_A5_MAX_MODEL_LEN = "4096"
+DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE = 16
+DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD = 2
+DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD = 12
+DSV4_SYNC_ALLOC_CONF_EXPANDABLE = "expandable_segments:True"
+DSV4_SYNC_ALLOC_CONF_PLAIN = "expandable_segments:False"
+# Force eager execution for a host whose graph-capture path fails at runtime.
+DSV4_SYNC_EAGER_ENV = "AFD_NPU_DSV4_SYNC_E2E_EAGER"
+# The A5 script runs both roles on one host and announces the loopback address.
+DSV4_SYNC_LOCAL_AFD_HOST = "127.0.0.1"
+# The A3 profile sizes its CAMP2P domains per domain instead of through the
+# caller's global HCCL_BUFFSIZE.
+DSV4_SYNC_CONNECTOR_EXTRA_CONFIG = {
+    "hccl_buffer_size": DSV4_SYNC_HCCL_BUFFER_SIZE_MB,
+    "quant_mode": DSV4_SYNC_QUANT_MODE,
+}
+
+
+class DSV4SyncEnvironment(NamedTuple):
+    """Process environment the host's recorded launch script relies on."""
+
+    # The recorded A3 rendezvous uses the caller's address, so it requires the
+    # NIC variables; the A5 script starts both roles on 127.0.0.1.
+    nic_env_required: bool = True
+    # AFD forces spawn multiprocessing so workers re-initialize the device in a
+    # fresh process. The A5 launch script relies on the platform default.
+    force_spawn: bool = True
+    # CAMP2P sizes its own AFD domains, so an inherited global HCCL_BUFFSIZE
+    # must not leak in. A5 exports HCCL_BUFFSIZE instead of per-domain sizing.
+    keep_hccl_buffsize: bool = False
+    npu_alloc_conf: str = DSV4_SYNC_ALLOC_CONF_EXPANDABLE
+
+
+# DeepSeek V4 does not fit on one Attention or one FFN die: A5 needs at least
+# 2A2F and A3 at least 4A4F. Each host runs the deployment its recorded launch
+# script uses, because the two hosts differ in more than rank count:
+#
+# - A5 runs Attention DP2/TP1 and FFN DP2/TP1 with expert parallelism, ACL graph
+#   capture over 16 decodes, native DBO, and the script's 4096 context. It omits
+#   `--quantization`, `connector_extra_config`, and the multithread loader, and
+#   exports HCCL_BUFFSIZE=2048 itself.
+# - A3 shards by tensor parallel with the expert-parallel world at one, eager,
+#   with the 8192/1024 budget the A3 launch profile records.
+class DSV4SyncShape(NamedTuple):
+    """Fixed synchronous CAMP2P deployment profile for one host class."""
+
+    attention_ranks: int
+    ffn_ranks: int
+    tp_size: int
+    enable_expert_parallel: bool = False
+    use_graph: bool = False
+    cudagraph_capture_size: int = 0
+    enable_dbo: bool = False
+    dbo_decode_token_threshold: int = 0
+    dbo_prefill_token_threshold: int = 0
+    # A5 keeps chunked prefill enabled alongside DBO, as its script does.
+    dbo_disables_chunked_prefill: bool = True
+    # The DBO coverage gate matches vLLM's GPU model runner debug line that
+    # prints the created `UBatchSlice` objects. The pinned Ascend NPU runtime
+    # logs no such line, so a profile that runs DBO there exercises it without
+    # machine-verifying the split, and needs no forced DEBUG logging.
+    dbo_split_evidence_available: bool = True
+    max_model_len: str = DSV4_SYNC_MAX_MODEL_LEN
+    # None omits the flag entirely so vLLM's own default applies.
+    max_num_batched_tokens: str | None = DSV4_SYNC_MAX_NUM_BATCHED_TOKENS
+    max_num_seqs: str | None = DSV4_MAX_NUM_SEQS
+    memory_utilization: str | None = DSV4_MEMORY_UTILIZATION
+    multithread_load: bool = True
+    connector_extra_config: dict[str, int] | None = DSV4_SYNC_CONNECTOR_EXTRA_CONFIG
+    quantization_from_checkpoint: bool = True
+    # A profile whose host launch script is the validated deployment emits only
+    # the flags that script passes, instead of the case's extra deployment
+    # defaults (API server count, seed, block size, prefix caching, chunked
+    # prefill, and the Attention data-parallel address).
+    verbatim_launch: bool = False
+    # Exact `--compilation-config` JSON when the script passes one; the runner
+    # then omits its own capture-size flags.
+    compilation_config: dict[str, object] | None = None
+    environment: DSV4SyncEnvironment = DSV4SyncEnvironment()
+
+    @property
+    def device_count(self) -> int:
+        return self.attention_ranks + self.ffn_ranks
+
+
+DSV4_SYNC_SHAPES = {
+    DSV4_SYNC_CAMP2P_A5_SCENARIO: DSV4SyncShape(
+        attention_ranks=2,
+        ffn_ranks=2,
+        tp_size=1,
+        enable_expert_parallel=True,
+        use_graph=True,
+        cudagraph_capture_size=DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE,
+        enable_dbo=True,
+        dbo_decode_token_threshold=DSV4_SYNC_A5_DBO_DECODE_TOKEN_THRESHOLD,
+        dbo_prefill_token_threshold=DSV4_SYNC_A5_DBO_PREFILL_TOKEN_THRESHOLD,
+        dbo_disables_chunked_prefill=False,
+        dbo_split_evidence_available=False,
+        max_model_len=DSV4_SYNC_A5_MAX_MODEL_LEN,
+        max_num_batched_tokens=None,
+        max_num_seqs=None,
+        memory_utilization=None,
+        multithread_load=False,
+        connector_extra_config=None,
+        quantization_from_checkpoint=False,
+        verbatim_launch=True,
+        compilation_config={
+            "cudagraph_capture_sizes": [DSV4_SYNC_A5_CUDAGRAPH_CAPTURE_SIZE],
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+        },
+        environment=DSV4SyncEnvironment(
+            nic_env_required=False,
+            force_spawn=False,
+            keep_hccl_buffsize=True,
+            npu_alloc_conf=DSV4_SYNC_ALLOC_CONF_PLAIN,
+        ),
+    ),
+    DSV4_SYNC_CAMP2P_A3_SCENARIO: DSV4SyncShape(
+        attention_ranks=4,
+        ffn_ranks=4,
+        tp_size=4,
+    ),
+}
+
+
+def sync_use_graph(shape: DSV4SyncShape) -> bool:
+    """Return whether the profile captures ACL graphs instead of running eager.
+
+    A host whose graph-capture path trips a runtime operator failure can be
+    switched to eager without editing the case by setting
+    `AFD_NPU_DSV4_SYNC_E2E_EAGER` to a truthy value.
+    """
+    return shape.use_graph and not _env_flag(DSV4_SYNC_EAGER_ENV)
+
+
+def sync_compilation_config(shape: DSV4SyncShape) -> dict[str, object] | None:
+    """Return the profile's exact `--compilation-config`, or None when eager."""
+    if not sync_use_graph(shape):
+        return None
+    return shape.compilation_config
+
+
+def _env_flag(name: str) -> bool:
+    """Return whether an environment switch is set to a truthy value."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sync_shape(scenario: str) -> DSV4SyncShape | None:
+    """Return the synchronous launch profile of a scenario, if it has one."""
+    return DSV4_SYNC_SHAPES.get(scenario)
+
+
+def _declared_quant_method(model: str) -> str | None:
+    """Return the quantization method the checkpoint config declares, if any."""
+    try:
+        config = json.loads((Path(model) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    quantization_config = config.get("quantization_config")
+    if not isinstance(quantization_config, dict):
+        return None
+    method = quantization_config.get("quant_method")
+    return method if isinstance(method, str) and method else None
+
+
+def sync_camp2p_quantization(model: str, shape: DSV4SyncShape) -> str | None:
+    """Resolve the `--quantization` value a synchronous case should pass.
+
+    The A5 profile follows its launch script, which passes no `--quantization`
+    at all and lets the FP8/W4A8 checkpoint decide. The A3 int8 W8A8 checkpoint
+    is loaded through the Ascend method, so that profile resolves `ascend` from
+    the checkpoint's own declaration and omits the flag when the checkpoint
+    declares something else. An explicit `AFD_NPU_DSV4_SYNC_E2E_QUANTIZATION`
+    overrides either profile, and `none` omits the flag entirely.
+    """
+    override = os.environ.get(DSV4_SYNC_QUANTIZATION_ENV)
+    if override is not None:
+        value = override.strip()
+        if not value or value.lower() == DSV4_CHECKPOINT_QUANTIZATION:
+            return None
+        return value
+    if not shape.quantization_from_checkpoint:
+        return None
+    declared = _declared_quant_method(model)
+    if declared is not None and declared != DSV4_ASCEND_QUANTIZATION:
+        return None
+    return DSV4_ASCEND_QUANTIZATION
+
+
+def _positive_int(value: str, name: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return parsed
+
+
+def _positive_float(value: str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    if not 0 < parsed <= 1:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    return parsed
+
+
+def _optional_positive_int(name: str, default: str | None) -> str | None:
+    """Validate an optional budget value; None keeps vLLM's own default."""
+    value = os.environ.get(name, default)
+    if value is None:
+        return None
+    return str(_positive_int(value, name))
+
+
+def _optional_positive_float(name: str, default: str | None) -> str | None:
+    """Validate an optional budget value; None keeps vLLM's own default."""
+    value = os.environ.get(name, default)
+    if value is None:
+        return None
+    return str(_positive_float(value, name))
+
+
+def sync_runtime_profile(shape: DSV4SyncShape) -> dict[str, str | None]:
+    """Resolve a synchronous case's context, batch, and memory budget.
+
+    Each value starts from the host profile's recorded launch setting and can
+    be retuned for that host through the environment. None means the flag is
+    not passed at all, so vLLM's own default applies — the A5 script overrides
+    none of the batch or memory limits. The ten concurrent oracle requests must
+    be able to run together, so an explicit `--max-num-seqs` cannot drop below
+    their count.
+    """
+    max_num_seqs = _optional_positive_int(
+        DSV4_SYNC_MAX_NUM_SEQS_ENV,
+        shape.max_num_seqs,
+    )
+    if max_num_seqs is not None and int(max_num_seqs) < DSV4_CONCURRENT_REQUESTS:
+        raise ValueError(
+            f"{DSV4_SYNC_MAX_NUM_SEQS_ENV} must be at least "
+            f"{DSV4_CONCURRENT_REQUESTS} for the concurrent oracle",
+        )
+    return {
+        "max_model_len": str(
+            _positive_int(
+                os.environ.get(DSV4_SYNC_MAX_MODEL_LEN_ENV, shape.max_model_len),
+                DSV4_SYNC_MAX_MODEL_LEN_ENV,
+            ),
+        ),
+        "max_num_batched_tokens": _optional_positive_int(
+            DSV4_SYNC_MAX_NUM_BATCHED_TOKENS_ENV,
+            shape.max_num_batched_tokens,
+        ),
+        "max_num_seqs": max_num_seqs,
+        "memory_utilization": _optional_positive_float(
+            DSV4_SYNC_MEMORY_UTILIZATION_ENV,
+            shape.memory_utilization,
+        ),
+    }
+
+
+def _configure_dsv4_arguments(
+    args: argparse.Namespace,
+    quantization: str | None,
+    *,
+    max_model_len: str = DSV4_MAX_MODEL_LEN,
+    max_num_batched_tokens: str | None = DSV4_MAX_NUM_BATCHED_TOKENS,
+    max_num_seqs: str | None = DSV4_MAX_NUM_SEQS,
+    memory_utilization: str | None = DSV4_MEMORY_UTILIZATION,
+    multithread_load: bool = True,
+    verbatim_launch: bool = False,
+) -> None:
+    """Apply the fixed model arguments shared by every DSV4 scenario.
+
+    `quantization` is the `--quantization` value to pass, or None to omit the
+    flag so the checkpoint's own configuration decides. The remaining keyword
+    arguments default to the asynchronous case's fixed deployment; the
+    synchronous cases resolve them per host, because the recorded A5 and A3
+    deployments differ from the 16-die asynchronous case. A None budget value
+    omits that flag entirely so vLLM's own default applies, and
+    `multithread_load` selects the scripted multithreaded weight loader.
+
+    `verbatim_launch` emits only what a recorded `vllm serve` script passes,
+    because for that host the script is the validated deployment: no API server
+    count, seed, block size, prefix-caching, or chunked-prefill flag. Tokenizer
+    mode and the remote-code flag stay, since the concurrent oracle needs the
+    model's chat template and tokenizer.
+    """
+    if args.completion_output_path is None:
+        raise ValueError("--completion-output-path is required for DSV4")
+    # Keep these local cases aligned with the DSV4 prefill scripts.
+    # Reject ad-hoc overrides so a case ID denotes one fixed deployment.
+    if args.common_vllm_arg or args.attention_vllm_arg or args.ffn_vllm_arg:
+        raise ValueError("DSV4 scenario does not accept extra vLLM arguments")
+    if args.use_decode_bench_connector:
+        raise ValueError("DSV4 scenario runs without a KV transfer connector")
+    deployment_defaults = (
+        [] if verbatim_launch else ["--api-server-count", "1", "--seed", "1024"]
+    )
+    args.common_vllm_arg = [
+        *deployment_defaults,
+        "--max-model-len",
+        max_model_len,
+        *(
+            ["--max-num-batched-tokens", max_num_batched_tokens]
+            if max_num_batched_tokens is not None
+            else []
+        ),
+        *(["--max-num-seqs", max_num_seqs] if max_num_seqs is not None else []),
+        *([] if verbatim_launch else ["--block-size", "128"]),
+        *(
+            ["--gpu-memory-utilization", memory_utilization]
+            if memory_utilization is not None
+            else []
+        ),
+        *(["--quantization", quantization] if quantization is not None else []),
+        "--tokenizer-mode",
+        "deepseek_v4",
+        *(
+            [
+                "--model-loader-extra-config",
+                json.dumps({"enable_multithread_load": True, "num_threads": 128}),
+            ]
+            if multithread_load
+            else []
+        ),
+        "--trust-remote-code",
+        *(
+            []
+            if verbatim_launch
+            else ["--no-enable-prefix-caching", "--enable-chunked-prefill"]
+        ),
+    ]
+    args.attention_vllm_arg = [
+        *(
+            []
+            if verbatim_launch
+            else [
+                "--data-parallel-address",
+                args.afd_host,
+                "--no-disable-hybrid-kv-cache-manager",
+            ]
+        ),
+        "--tool-call-parser",
+        "deepseek_v4",
+        "--enable-auto-tool-choice",
+        "--reasoning-parser",
+        "deepseek_v4",
+    ]
 
 
 def configure_scenario(args: argparse.Namespace) -> None:
-    if args.completion_output_path is None:
-        raise ValueError("--completion-output-path is required for DSV4")
+    """Configure the 16-NPU asynchronous CAM deployment."""
     args.afd_connector = "CAMAsyncAFDConnector"
     args.afd_async = True
     args.compute_gate_on_attention = True
@@ -38,50 +431,48 @@ def configure_scenario(args: argparse.Namespace) -> None:
             }
         )
     ]
-    # Keep this local 16-NPU case aligned with the DSV4 prefill scripts.
-    # Reject ad-hoc overrides so its case ID denotes one fixed deployment.
-    if args.common_vllm_arg or args.attention_vllm_arg or args.ffn_vllm_arg:
-        raise ValueError("DSV4 scenario does not accept extra vLLM arguments")
-    if args.use_decode_bench_connector:
-        raise ValueError("DSV4 scenario runs without a KV transfer connector")
-    args.common_vllm_arg = [
-        "--api-server-count",
-        "1",
-        "--seed",
-        "1024",
-        "--max-model-len",
-        "1048576",
-        "--max-num-batched-tokens",
-        "8192",
-        "--max-num-seqs",
-        "16",
-        "--block-size",
-        "128",
-        "--gpu-memory-utilization",
-        "0.7",
-        "--quantization",
-        "ascend",
-        "--tokenizer-mode",
-        "deepseek_v4",
-        "--model-loader-extra-config",
-        json.dumps({"enable_multithread_load": True, "num_threads": 128}),
-        "--trust-remote-code",
-        "--no-enable-prefix-caching",
-        "--enable-chunked-prefill",
-    ]
-    args.attention_vllm_arg = [
-        "--data-parallel-address",
-        args.afd_host,
-        "--no-disable-hybrid-kv-cache-manager",
-        "--tool-call-parser",
-        "deepseek_v4",
-        "--enable-auto-tool-choice",
-        "--reasoning-parser",
-        "deepseek_v4",
-    ]
+    _configure_dsv4_arguments(args, DSV4_ASCEND_QUANTIZATION)
+
+
+def configure_sync_camp2p_scenario(args: argparse.Namespace) -> None:
+    """Configure a synchronous CAMP2P deployment from its host profile.
+
+    The caller selects the A5 (2A2F) or A3 (4A4F) host through the scenario;
+    both keep the gate on FFN, because CAMP2P carries the Hash-layer token ids
+    over the a2e ids channel, and neither needs a CAM vendor package. The rest
+    of the deployment follows that host's recorded launch script: its rank
+    layout and expert parallelism, graph capture, native DBO, the context and
+    batch budget, the weight loader, and whether the case or the caller's shell
+    sizes the CAMP2P HCCL domains.
+    """
+    shape = DSV4_SYNC_SHAPES[args.scenario]
+    args.afd_connector = DSV4_SYNC_CAMP2P_CONNECTOR
+    args.afd_async = False
+    args.compute_gate_on_attention = False
+    args.afd_connector_extra_config = (
+        []
+        if shape.connector_extra_config is None
+        else [json.dumps(shape.connector_extra_config, separators=(",", ":"))]
+    )
+    _configure_dsv4_arguments(
+        args,
+        sync_camp2p_quantization(args.model, shape),
+        multithread_load=shape.multithread_load,
+        verbatim_launch=shape.verbatim_launch,
+        **sync_runtime_profile(shape),
+    )
 
 
 def additional_config() -> dict[str, bool]:
+    """Return the DSV4 model-path switches every DSV4 case pins.
+
+    These are not deployment preferences. The pinned Ascend runtime defaults
+    `multistream_dsv4_dsa_overlap` to True (`vllm_ascend/ascend_config.py`), and
+    that path drives the DSA RoPE through `inplace_partial_rotary_mul`, whose
+    tiling function rejects the shapes A5 hands it. The case therefore keeps the
+    switch off, alongside the DSA context-parallel and shared-compressor paths
+    it does not cover.
+    """
     return {
         "enable_cpu_binding": True,
         "enable_force_load_balance": False,
