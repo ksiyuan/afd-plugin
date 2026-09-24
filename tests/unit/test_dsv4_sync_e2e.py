@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.e2e import runner
+from tests.e2e.models.deepseek_v4_flash import completions
 from tests.e2e.models.deepseek_v4_flash import test_sync_camp2p_npu as entrypoint
 from tests.e2e.models.deepseek_v4_flash.config import (
     DSV4_SYNC_CAMP2P_A3_SCENARIO,
@@ -517,6 +518,63 @@ def test_dsv4_sync_a3_has_no_dbo_to_verify(monkeypatch, tmp_path):
 
     assert args.enable_dbo is False
     assert runner.dbo_split_evidence_available(args) is True
+
+
+def test_dsv4_sync_a5_states_the_sum_inside_a_longer_answer():
+    """Only the A5 profile relaxes the answer check, and only to a stated sum."""
+    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A3_SCENARIO].strict_answer is True
+    assert DSV4_SYNC_SHAPES[DSV4_SYNC_CAMP2P_A5_SCENARIO].strict_answer is False
+
+    assert completions.states_expected_sum(
+        "The first number is 21, the second is 7. The sum is 28.",
+        28,
+    )
+    assert completions.states_expected_sum("The sum is 28.28", 28)
+    assert not completions.states_expected_sum("999", 28)
+    # An integer that merely contains the digits is not the stated sum.
+    assert not completions.states_expected_sum("128", 28)
+
+
+def test_dsv4_sync_relaxed_answer_keeps_the_terminal_state_check():
+    """A narrated answer still has to end in a terminal state it may reach."""
+    narrated = {
+        "choices": [
+            {"message": {"content": "The sum is 28."}, "finish_reason": "length"},
+        ],
+    }
+    completions.validate_response(narrated, strict_answer=False)
+    with pytest.raises(RuntimeError, match="did not finish normally"):
+        completions.validate_response(narrated)
+
+    tool_call = {
+        "choices": [
+            {"message": {"content": "The sum is 28."}, "finish_reason": "tool_calls"},
+        ],
+    }
+    with pytest.raises(RuntimeError, match="did not finish normally"):
+        completions.validate_response(tool_call, strict_answer=False)
+
+
+def test_dsv4_sync_oracle_uses_the_profile_answer_policy(monkeypatch, tmp_path):
+    """The runner hands each profile's own answer policy to the oracle."""
+    seen: dict = {}
+
+    def capture(**kwargs: object) -> None:
+        seen.clear()
+        seen.update(kwargs)
+
+    monkeypatch.setattr(runner, "evaluate_completions", capture)
+
+    for scenario, expected in (
+        (DSV4_SYNC_CAMP2P_A5_SCENARIO, False),
+        (DSV4_SYNC_CAMP2P_A3_SCENARIO, True),
+    ):
+        args = _arguments(monkeypatch, tmp_path, scenario=scenario)
+        runner.configure_scenario(args)
+
+        runner.run_concurrent_completion_evaluation(args)
+
+        assert seen["strict_answer"] is expected
 
 
 def test_dsv4_sync_a5_environment_follows_the_launch_script(monkeypatch):
