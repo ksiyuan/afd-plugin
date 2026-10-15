@@ -9,10 +9,11 @@ used by CPU-safe tests.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import inspect
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -158,6 +159,65 @@ def graph_run_mode(
     return AFDGraphRunMode.EAGER
 
 
+UBATCH_PREPARE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"input_batch", "cg_mode", "for_capture"}
+)
+
+
+def positional_parameter_names(target: Callable[..., object]) -> tuple[str, ...]:
+    """Return the public positional parameter names of a callable."""
+
+    try:
+        parameters = inspect.signature(target).parameters.values()
+    except (TypeError, ValueError):
+        return ()
+    return tuple(
+        parameter.name
+        for parameter in parameters
+        if parameter.name != "self"
+        and parameter.kind
+        in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+    )
+
+
+def resolve_prepare_inputs(
+    target: Callable[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> dict[str, object]:
+    """Map one upstream preparation call onto the fields AFD reads.
+
+    AFD's capture seam is installed on whatever ``prepare`` the active native
+    runner exposes, so it must not assume the pinned parameter list. Unresolved
+    names are simply absent, and the caller validates what it needs.
+    """
+
+    positional_names = positional_parameter_names(target)
+    resolved: dict[str, object] = {}
+    for name in UBATCH_PREPARE_FIELDS:
+        if name in kwargs:
+            resolved[name] = kwargs[name]
+            continue
+        if name in positional_names:
+            index = positional_names.index(name)
+            if index < len(args):
+                resolved[name] = args[index]
+    return resolved
+
+
+def describe_prepare_call(
+    target: Callable[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> str:
+    """Describe an observed preparation call for a drift error message."""
+
+    return (
+        f"prepare{positional_parameter_names(target)} "
+        f"positional={len(args)} keywords={tuple(kwargs)}"
+    )
+
+
 def split_capture_preparation_events(
     capture_descs: Iterable[GraphDescriptorT],
 ) -> tuple[list[tuple[GraphDescriptorT, bool]], list[tuple[GraphDescriptorT, bool]]]:
@@ -233,9 +293,13 @@ __all__ = [
     "AFDGraphRunMode",
     "FULL_DECODE_ONLY",
     "GraphDescriptorT",
+    "UBATCH_PREPARE_FIELDS",
     "cudagraph_mode_name",
+    "describe_prepare_call",
     "graph_run_mode",
     "make_ffn_graph_key",
+    "positional_parameter_names",
+    "resolve_prepare_inputs",
     "split_capture_preparation_events",
     "validate_cuda_graph_mode",
 ]

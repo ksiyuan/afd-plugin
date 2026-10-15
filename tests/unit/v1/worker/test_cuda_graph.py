@@ -8,8 +8,11 @@ from afd_plugin.v1.worker.cuda_graph import (
     FULL_DECODE_ONLY,
     AFDGraphRunMode,
     cudagraph_mode_name,
+    describe_prepare_call,
     graph_run_mode,
     make_ffn_graph_key,
+    positional_parameter_names,
+    resolve_prepare_inputs,
     split_capture_preparation_events,
     validate_cuda_graph_mode,
 )
@@ -267,3 +270,57 @@ def test_capture_preparation_events_keep_one_path_when_only_one_is_used():
         [],
         [(ubatch_only[0], True), (ubatch_only[0], False)],
     )
+
+
+def _extra_parameter_prepare(
+    input_batch,
+    block_tables,
+    slot_mappings,
+    cg_mode=None,
+    for_capture=False,
+    extra=None,
+):
+    return extra
+
+
+def test_resolve_prepare_inputs_reads_the_pinned_call_shape():
+    batch = object()
+    previous = _extra_parameter_prepare
+    args = (batch, ("table",), "slots")
+    kwargs = {"cg_mode": "FULL", "for_capture": True}
+
+    resolved = resolve_prepare_inputs(previous, args, kwargs)
+
+    assert resolved == {
+        "input_batch": batch,
+        "cg_mode": "FULL",
+        "for_capture": True,
+    }
+    assert positional_parameter_names(previous) == (
+        "input_batch",
+        "block_tables",
+        "slot_mappings",
+        "cg_mode",
+        "for_capture",
+        "extra",
+    )
+
+
+def test_resolve_prepare_inputs_tolerates_an_unexpected_extra_argument():
+    batch = object()
+    args = (batch, ("table",), "slots", "FULL", True, "surprise")
+
+    resolved = resolve_prepare_inputs(_extra_parameter_prepare, args, {})
+
+    assert resolved["input_batch"] is batch
+    assert resolved["cg_mode"] == "FULL"
+    assert resolved["for_capture"] is True
+    assert "prepare(" in describe_prepare_call(_extra_parameter_prepare, args, {})
+
+
+def test_resolve_prepare_inputs_ignores_unintrospectable_targets():
+    class Unintrospectable:
+        def __call__(self, *args, **kwargs):
+            return None
+
+    assert resolve_prepare_inputs(Unintrospectable(), (object(),), {}) == {}

@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -44,6 +44,7 @@ from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
+from afd_plugin.v1.worker.cuda_graph import resolve_prepare_inputs
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -117,22 +118,19 @@ def _use_afd_ubatch_preparation(
     # branch also bypasses prepare_inputs_to_capture.
     # Patch functionality: decorate native stage state and publish one complete
     # A/F payload before threads start (or before FULL replay).
-    # Signature: matches UBatchRunner.prepare at vLLM ced6857.
+    # Signature: forwards every argument of the prepared method unchanged rather
+    # than restating UBatchRunner.prepare's parameter list, because the seam is
+    # installed on whatever prepare the active native runner exposes and must
+    # not narrow it. The three fields AFD reads are resolved by name.
     # Delegation exception: keep native slicing/attention preparation in the
     # bound method. Remove this seam when upstream offers a prepared-state
     # callback; no runner class or module-global function is replaced here.
-    def prepare(
-        self: UBatchRunner,
-        input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
-        slot_mappings: torch.Tensor,
-        cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-        for_capture: bool = False,
-    ) -> UBatchState:
+    def prepare(self: UBatchRunner, *args: object, **kwargs: object) -> UBatchState:
         # ### PATCH START: bind AFD to native stage state outside graph execution.
-        prepared = original_prepare(
-            input_batch, block_tables, slot_mappings, cg_mode, for_capture
-        )
+        inputs = resolve_prepare_inputs(original_prepare, args, kwargs)
+        input_batch = cast("InputBatch", inputs["input_batch"])
+        cg_mode = cast("CUDAGraphMode", inputs.get("cg_mode", CUDAGraphMode.NONE))
+        prepared = original_prepare(*args, **kwargs)
         if event_tracker is not None:
             _, is_warmup = event_tracker.consume(
                 input_batch.num_reqs,

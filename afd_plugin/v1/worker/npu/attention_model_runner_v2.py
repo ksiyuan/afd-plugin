@@ -24,7 +24,7 @@ from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
@@ -54,13 +54,19 @@ from afd_plugin.v1.worker.attention_metadata import (
     _resolve_world_ranks,
 )
 from afd_plugin.v1.worker.attention_model_runner_v2 import _use_afd_ubatch_preparation
-from afd_plugin.v1.worker.cuda_graph import split_capture_preparation_events
+from afd_plugin.v1.worker.cuda_graph import (
+    describe_prepare_call,
+    resolve_prepare_inputs,
+    split_capture_preparation_events,
+)
 from afd_plugin.validation import validate_npu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
+# Parameter names the DBO capture seam needs from the native preparation call.
+_UBATCH_PREPARE_FIELDS = frozenset({"input_batch", "cg_mode", "for_capture"})
 # E2E evidence marker: one line per two-microbatch ACL graph replay. The E2E
 # runner requires consecutive replays before it accepts a graph + DBO run.
 NPU_DBO_GRAPH_REPLAY_ENTRY = "AFD NPU Attention DBO ACL graph replay;"
@@ -465,13 +471,10 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         # context construction remain in the bound method.
         # Removal plan: delete this wrapper when upstream exposes a capture
         # warmup/capture callback for microbatched graphs.
-        def ubatch_prepare(
-            input_batch: InputBatch,
-            block_tables: tuple[torch.Tensor, ...],
-            slot_mappings: torch.Tensor,
-            cg_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-            for_capture: bool = False,
-        ) -> UBatchState:
+        # The AFD seam must not narrow the upstream signature: it is installed
+        # on whatever prepare the active native runner exposes, so it forwards
+        # every argument through and reads only the fields it validates.
+        def ubatch_prepare(*args: object, **kwargs: object) -> UBatchState:
             nonlocal ubatch_event_index
             # ### PATCH START: stage one exact AFD capture event.
             if ubatch_event_index >= len(ubatch_events):
@@ -480,27 +483,30 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 )
             desc, is_warmup = ubatch_events[ubatch_event_index]
             ubatch_event_index += 1
+            inputs = resolve_prepare_inputs(previous_ubatch_prepare, args, kwargs)
+            input_batch = inputs.get("input_batch")
+            cg_mode = inputs.get("cg_mode")
+            for_capture = inputs.get("for_capture")
             if cg_mode != CUDAGraphMode.FULL or not for_capture:
+                observed = describe_prepare_call(previous_ubatch_prepare, args, kwargs)
                 raise RuntimeError(
                     "AFD NPU ModelRunnerV2 ACL graph ubatch capture "
-                    "descriptor/order drift: expected FULL capture preparation",
+                    "descriptor/order drift: expected FULL capture preparation; "
+                    f"got cg_mode={cg_mode!r} for_capture={for_capture!r} "
+                    f"from {observed}",
                 )
-            if (
-                desc.num_reqs is not None and input_batch.num_reqs != desc.num_reqs
-            ) or input_batch.num_tokens_after_padding != desc.num_tokens:
+            if input_batch is not None and (
+                (desc.num_reqs is not None and input_batch.num_reqs != desc.num_reqs)
+                or input_batch.num_tokens_after_padding != desc.num_tokens
+            ):
+                observed = describe_prepare_call(previous_ubatch_prepare, args, kwargs)
                 raise RuntimeError(
                     "AFD NPU ModelRunnerV2 ACL graph ubatch capture "
                     "descriptor/order drift for "
-                    f"({desc.num_reqs}, {desc.num_tokens})",
+                    f"({desc.num_reqs}, {desc.num_tokens}); got {observed}",
                 )
             _stage_afd_capture_event(self, desc, is_warmup)
-            return previous_ubatch_prepare(
-                input_batch,
-                block_tables,
-                slot_mappings,
-                cg_mode,
-                for_capture,
-            )
+            return previous_ubatch_prepare(*args, **kwargs)
             # ### PATCH END: stage one exact AFD capture event.
 
         v2_cudagraph_utils.prepare_inputs_to_capture = prepare_inputs_to_capture
