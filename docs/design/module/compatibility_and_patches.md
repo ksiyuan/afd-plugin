@@ -146,7 +146,8 @@ Several scoped upstream adaptations live with their semantic owners rather
 than this patch directory. Model dummy runs and V2 execution temporarily wrap
 `create_forward_context`; CUDA worker startup temporarily substitutes the
 native V2 runner symbol; V2 graph capture temporarily wraps native input
-preparation; and full-graph replay installs an instance-local manager hook.
+preparation plus, for Ascend DBO graphs, the native `UBatchRunner.prepare`
+seam; and full-graph replay installs an instance-local manager hook.
 Every scope restores symbols and runner state in `finally`. Connector process
 groups also call private PyTorch/vLLM helpers as described in
 [connector contracts](connector_contracts.md). All of these seams must be

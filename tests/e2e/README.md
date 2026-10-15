@@ -216,7 +216,11 @@ graph case also confirmed matching A/F layouts and consecutive same-layout
 replays. This targeted validation is not a fresh run of the current 19 GPU scenarios.
 The `afd-graph-dbo-2a1f` case also selects
 GPU V2 with a different topology and workload.
-These generic MRV2 scenarios remain CUDA-only. NPU native DBO needs separate
+These generic MRV2 scenarios are selected for CUDA by default. An NPU run of
+`afd-v2-graph-dbo-dp2` with `--device-backend npu` exercises CAMP2P with the
+same DBO and `FULL_DECODE_ONLY` settings; that run additionally requires the
+live split marker and at least two consecutive two-microbatch ACL graph
+replays. NPU native DBO needs separate
 model qualification; Async CAM enables it only on Attention.
 Representative 300-question results and their limits are recorded in
 [PR #425](https://github.com/vllm-project/afd-plugin/pull/425); these comparisons

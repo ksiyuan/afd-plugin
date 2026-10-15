@@ -14,8 +14,9 @@ Ascend services. Use `P2pNcclAFDConnector` for CUDA deployments and
 `CAMP2pAFDConnector` supports prefill and decode in eager mode. V1 ACL graph
 uses `FULL_DECODE_ONLY`; the implemented V2 path also accepts `FULL`.
 V2 accepts eager native DBO with exactly two microbatches and Attention
-DP > 1. V2 DBO graphs remain unsupported; other models and topologies require
-their own evidence.
+DP > 1, and `FULL_DECODE_ONLY` two-microbatch ACL graphs. Use the graph + DBO
+E2E scenario to exercise the combined path; other models and topologies
+require their own evidence.
 
 ## Prerequisites
 
@@ -55,12 +56,19 @@ The connector creates these communication groups:
 
 Select the runner explicitly on both roles with
 `VLLM_USE_V2_MODEL_RUNNER=0` (V1) or `1` (V2). V1 supports the documented
-two-stage ACL graph path. V2 DBO requires `--enforce-eager`, Attention DP > 1,
-exactly two microbatches, and no speculative decoding. V2 also requires
+two-stage ACL graph path. V2 DBO requires Attention DP > 1, exactly two
+microbatches, and no speculative decoding, and accepts either `--enforce-eager`
+or a `FULL_DECODE_ONLY` ACL graph. V2 also requires
 static EP, PP=PCP=DCP=1, and each role's ranks equal to DP x TP; SP MoE and
 compile SP are rejected. Without DBO, V2 accepts eager, `FULL`, or
 `FULL_DECODE_ONLY`. The [NPU testing guide](TESTING.md) separates executor
 checks from model correctness evidence.
+
+Both microbatches of a V2 DBO step are captured into one ACL graph whose replay
+covers both stages, so the graph may only serve the uniform decode shape it was
+captured for: mixed prefill/decode batches and shapes beyond the capture sizes
+fall back to eager two-stage execution. `FULL_DECODE_ONLY` is therefore the
+only accepted V2 DBO graph mode; `FULL` is rejected during validation.
 
 DBO is configured with vLLM CLI flags, not inside the `afd` object:
 
@@ -104,6 +112,31 @@ scheduling.
    FFN computation or communication for the first ubatch.
 4. Attention receives each FFN result through the HCCL group that belongs to
    the same ubatch, then continues processing that ubatch.
+
+### DBO with an ACL graph
+
+ModelRunnerV2 can capture and replay both microbatches of a DBO step in one
+`FULL_DECODE_ONLY` ACL graph. Add the graph flags to the DBO settings:
+
+```bash
+--enable-dbo \
+--dbo-decode-token-threshold 2 \
+--dbo-prefill-token-threshold 12 \
+--ubatch-size 2 \
+--cudagraph-capture-sizes 8 \
+--max-cudagraph-capture-size 8 \
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+```
+
+Both roles must pass the same capture configuration. Attention captures the two
+microbatches together and publishes one warmup and one capture control payload
+per graph; FFN keys its own graph cache by the same per-stage token counts and
+replays the matching graph. Only the uniform decode shapes covered by the
+capture sizes replay; other steps fall back to eager two-stage execution, so
+the run still needs the eager path to work.
+
+`--enforce-eager` and a `FULL_DECODE_ONLY` graph are the two accepted V2 DBO
+execution modes. `FULL` is rejected for DBO.
 
 ## AFD configuration
 

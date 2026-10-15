@@ -57,7 +57,7 @@ See the [recipe index](recipe/README.md) for deployment and benchmark examples.
 | Connector | Platform | Recommend Stage | Sync or Async | Graph Support | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `P2pNcclAFDConnector` | CUDA | Decode | Sync | `FULL_DECODE_ONLY` CUDA graph | FFN ranks are ordered before Attention ranks. `num_attention_ranks` must be greater than or equal to `num_ffn_ranks`; the Attention ranks are spread over the FFN ranks in blocks that differ in size by at most one. See the [DeepSeek V2 Lite recipe](recipe/gpu/P2pNcclAFDConnector/deepseek_v2_lite/README.md). |
-| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | V1 `FULL_DECODE_ONLY`; V2 also `FULL` | Uses HCCL/CAMP2P custom ops. V2 DBO is eager-only with two ubatches and Attention DP > 1. See the [CAMP2P guide](docs/npu/CAM_P2P_CONNECTOR_USER_GUIDE.md). |
+| `CAMP2pAFDConnector` | Ascend NPU | Decode | Sync | V1 `FULL_DECODE_ONLY`; V2 also `FULL` | Uses HCCL/CAMP2P custom ops. V2 DBO uses two ubatches with Attention DP > 1 in eager execution or a `FULL_DECODE_ONLY` two-microbatch ACL graph. See the [CAMP2P guide](docs/npu/CAM_P2P_CONNECTOR_USER_GUIDE.md). |
 | `CAMAsyncAFDConnector` | Ascend NPU | Prefill / decode | Async | Not supported | Experimental eager DP+TP/SP path with native two-microbatch DBO on Attention, including DP1. FFN remains connector-driven; PCP/DCP are unsupported. See the [Async CAM guide](docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md) for configuration and validation limits. |
 
 Connector implementations are grouped by backend package:
@@ -84,8 +84,9 @@ Known gaps:
   equivalence; see the [runtime matrix](docs/design/module/execution_platforms.md#tested-runtime-matrix) for the recorded GPU evidence and separate NPU DBO constraints.
 - GPU and NPU E2E tests are opt-in and require real hardware plus model weights.
 - GPU CUDA graph support is limited to `FULL_DECODE_ONLY`.
-- Native DBO is limited to exactly two ubatches. NPU MRV2 DBO requires eager
-  execution; Async CAM enables DBO only on Attention. Its current native DBO
+- Native DBO is limited to exactly two ubatches. NPU MRV2 DBO accepts eager
+  execution or a `FULL_DECODE_ONLY` two-microbatch ACL graph; `FULL` is rejected
+  for DBO. Async CAM enables DBO only on Attention. Its current native DBO
   path still needs target-device model qualification.
 - Qwen3 MoE currently rejects Attention-side gate placement, sequence-parallel
   MoE, EPLB, pipeline parallelism, speculative decoding, LoRA, and NPU.

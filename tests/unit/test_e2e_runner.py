@@ -1805,6 +1805,21 @@ def test_npu_shared_cases_keep_their_runner_and_commands(scenario):
     assert "--worker-extension-cls" not in command
 
 
+@pytest.mark.parametrize("scenario", sorted(runner.V2_SCENARIOS))
+def test_npu_v2_scenarios_select_the_v2_model_runner(scenario):
+    args = _args()
+    args.scenario = scenario
+    args.device_backend = "npu"
+    runner.configure_scenario(args)
+
+    assert runner.uses_v2_model_runner(args) is True
+    assert (
+        runner.build_env("0", args, role="attention")["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    )
+    # CAMP2P keeps the gate on FFN, which is what V2 validation requires.
+    assert runner.build_vllm_command(args, role="attention")
+
+
 @pytest.mark.parametrize(
     "common_args",
     [
@@ -2088,7 +2103,7 @@ def test_gpu_evidence_window_and_failure_cleanup(monkeypatch, capsys, failure):
     monkeypatch.setattr(
         runner,
         "stream_output",
-        lambda role, _process, _splits, evidence: LogThread(role, evidence),
+        lambda role, _process, _splits, evidence, _replays: LogThread(role, evidence),
     )
     monkeypatch.setattr(
         runner, "wait_for_openai_api", lambda *_args: events.append("ready")
@@ -2221,6 +2236,42 @@ def test_stream_output_records_live_npu_split_control_metadata(monkeypatch):
     thread.join(timeout=5)
 
     assert split_steps == [101.0]
+
+
+def test_stream_output_records_npu_dbo_graph_replays(monkeypatch):
+    replay_steps: list[float] = []
+    entry = runner.NPU_DBO_GRAPH_REPLAY_ENTRY
+    process: Any = argparse.Namespace(
+        stdout=io.StringIO(
+            entry + " world_rank=2 num_tokens=8 num_ubatches=2\n"
+            "INFO unrelated\n" + entry + " world_rank=3 num_tokens=8 num_ubatches=2\n"
+        ),
+    )
+    timestamps = iter([201.0, 202.0])
+    monkeypatch.setattr(runner.time, "time", lambda: next(timestamps))
+
+    thread = runner.stream_output("attention", process, None, None, replay_steps)
+    thread.join(timeout=5)
+
+    assert replay_steps == [201.0, 202.0]
+
+
+def test_assert_npu_dbo_graph_replay_coverage_requires_consecutive_replays(
+    capsys,
+):
+    args = _args()
+    args.device_backend = "npu"
+    args.enable_dbo = True
+    args.cuda_graph_full_decode_only = True
+
+    runner.assert_npu_dbo_graph_replay_coverage([101.0, 101.4], 100.0, args)
+    assert "two-microbatch replay(s) recorded" in capsys.readouterr().out
+
+    with pytest.raises(RuntimeError, match="fewer than 2"):
+        runner.assert_npu_dbo_graph_replay_coverage([101.0], 100.0, args)
+
+    with pytest.raises(RuntimeError, match="fewer than 2"):
+        runner.assert_npu_dbo_graph_replay_coverage([99.0, 99.5], 100.0, args)
 
 
 def test_assert_dbo_live_split_coverage_passes_when_steps_in_window(monkeypatch):

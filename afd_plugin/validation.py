@@ -14,6 +14,7 @@ from afd_plugin.config import (
     parse_afd_config,
 )
 from afd_plugin.v1.worker.cuda_graph import (
+    FULL_DECODE_ONLY,
     cudagraph_mode_name,
     validate_cuda_graph_mode,
 )
@@ -172,8 +173,6 @@ def validate_npu_model_runner_v2_config(
     ):
         raise RuntimeError("AFD ModelRunnerV2 requires static expert parallelism")
     if parallel.enable_dbo or parallel.use_ubatching:
-        if not vllm_config.model_config.enforce_eager:
-            raise RuntimeError("AFD NPU ModelRunnerV2 DBO requires eager execution")
         if (
             expected_role == "attention"
             and parallel.data_parallel_size <= 1
@@ -187,6 +186,19 @@ def validate_npu_model_runner_v2_config(
         if vllm_config.speculative_config is not None:
             raise RuntimeError(
                 "AFD NPU ModelRunnerV2 DBO does not support speculative decoding"
+            )
+        # Two microbatches are captured into one ACL graph whose single replayed
+        # stream carries both stages, so the graph may only serve the uniform
+        # decode shape it was captured for. FULL would also cover mixed
+        # prefill/decode batches, which the shared MLA task-group registry
+        # cannot describe.
+        if (
+            not vllm_config.model_config.enforce_eager
+            and cudagraph_mode_name(vllm_config) != FULL_DECODE_ONLY
+        ):
+            raise RuntimeError(
+                "AFD NPU ModelRunnerV2 DBO graph execution requires "
+                f"{FULL_DECODE_ONLY}",
             )
 
     from afd_plugin.model_executor.models.model_utils import (

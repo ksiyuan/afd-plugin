@@ -110,6 +110,11 @@ GPU_EVIDENCE_PREFIX = "AFD E2E execution: "
 # list; a step line containing UBatchSlice entries is a live two-ubatch run.
 DBO_SPLIT_EVIDENCE_ENTRY = "UBatchSlice("
 NPU_DBO_CONTROL_ENTRY = "AFD NPU Attention send_dp_metadata decision;"
+# ModelRunnerV2's NPU DBO path publishes this once per replayed two-microbatch
+# ACL graph; the harness needs consecutive replays to accept the combined
+# DBO + graph + CAMP2P configuration.
+NPU_DBO_GRAPH_REPLAY_ENTRY = "AFD NPU Attention DBO ACL graph replay;"
+NPU_DBO_GRAPH_REPLAY_MIN_COUNT = 2
 ACCOUNTING_PROMPT = (
     "<|im_start|>system\n"
     "You are a professional accountant. Answer questions using accounting "
@@ -151,6 +156,7 @@ def main() -> int:
     processes_by_role: dict[str, subprocess.Popen[str]] = {}
     log_threads: list[threading.Thread] = []
     dbo_split_steps: list[float] = []
+    dbo_graph_replay_steps: list[float] = []
     gpu_execution_evidence: list[tuple[str, str]] = []
     gpu_evidence_dir: tempfile.TemporaryDirectory[str] | None = None
     gpu_evidence_start: Path | None = None
@@ -219,7 +225,13 @@ def main() -> int:
             processes.append(process)
             processes_by_role[role] = process
             log_threads.append(
-                stream_output(role, process, dbo_split_steps, gpu_execution_evidence)
+                stream_output(
+                    role,
+                    process,
+                    dbo_split_steps,
+                    gpu_execution_evidence,
+                    dbo_graph_replay_steps,
+                )
             )
             ensure_alive(process, f"{label} process exited during startup")
 
@@ -244,6 +256,10 @@ def main() -> int:
             wait_for_gpu_execution_summaries(gpu_execution_evidence, args, processes)
         if args.enable_dbo and args.device_backend == "npu":
             assert_dbo_live_split_coverage(dbo_split_steps, eval_started_at, args)
+            if args.cuda_graph_full_decode_only:
+                assert_npu_dbo_graph_replay_coverage(
+                    dbo_graph_replay_steps, eval_started_at, args
+                )
 
         ensure_processes_alive(processes)
     finally:
@@ -983,6 +999,37 @@ def assert_dbo_live_split_coverage(
     )
 
 
+def assert_npu_dbo_graph_replay_coverage(
+    replay_steps: list[float],
+    eval_started_at: float | None,
+    args: argparse.Namespace,
+) -> None:
+    """Require consecutive two-microbatch ACL graph replays on Ascend NPU.
+
+    A single replay only proves one graph ran. The combined DBO + graph +
+    CAM P2P claim needs at least two, so a run cannot pass on capture warmup
+    or on a one-off replay.
+    """
+    live_replays = sum(
+        1
+        for received_at in replay_steps
+        if eval_started_at is None or received_at >= eval_started_at
+    )
+    if live_replays >= NPU_DBO_GRAPH_REPLAY_MIN_COUNT:
+        print(
+            "\n[dbo-graph-coverage] NPU DBO ACL graph replay confirmed: "
+            f"{live_replays} two-microbatch replay(s) recorded in the "
+            "evaluation window",
+        )
+        return
+    raise RuntimeError(
+        "DBO + ACL graph was requested on NPU but fewer than "
+        f"{NPU_DBO_GRAPH_REPLAY_MIN_COUNT} two-microbatch graph replays were "
+        f"recorded inside the evaluation window (got {live_replays}). "
+        "Graph capture or warmup alone does not prove replay.",
+    )
+
+
 def needs_gpu_execution_evidence(args: argparse.Namespace) -> bool:
     return (
         args.device_backend == "gpu"
@@ -1164,6 +1211,18 @@ def run_concurrent_completion_evaluation(args: argparse.Namespace) -> None:
     )
 
 
+def uses_v2_model_runner(args: argparse.Namespace) -> bool:
+    """Whether the scenario runs the pinned ModelRunnerV2 pairing.
+
+    CUDA has no V1 fallback, so every non-baseline GPU scenario is V2. Ascend
+    keeps its existing native-V1 cases and selects V2 only for the shared V2
+    scenario ids, which is what lets an NPU run exercise the CAMP2P V2 paths.
+    """
+    if args.baseline:
+        return args.device_backend == "gpu"
+    return args.device_backend == "gpu" or args.scenario in V2_SCENARIOS
+
+
 def build_env(
     visible_devices: str,
     args: argparse.Namespace,
@@ -1175,7 +1234,7 @@ def build_env(
     env = os.environ.copy()
     env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "18000")
     env[visible_devices_env_name(args.device_backend)] = visible_devices
-    env["VLLM_USE_V2_MODEL_RUNNER"] = "1" if args.device_backend == "gpu" else "0"
+    env["VLLM_USE_V2_MODEL_RUNNER"] = "1" if uses_v2_model_runner(args) else "0"
     if needs_gpu_execution_evidence(args):
         env["VLLM_SERVER_DEV_MODE"] = "1"
         if gpu_evidence_start is not None:
@@ -1226,6 +1285,7 @@ def stream_output(
     process: subprocess.Popen[str],
     dbo_split_steps: list[float] | None = None,
     gpu_execution_evidence: list[tuple[str, str]] | None = None,
+    dbo_graph_replay_steps: list[float] | None = None,
 ) -> threading.Thread:
     def worker() -> None:
         assert process.stdout is not None
@@ -1248,6 +1308,12 @@ def stream_output(
                 )
             ):
                 dbo_split_steps.append(time.time())
+            if (
+                dbo_graph_replay_steps is not None
+                and name == "attention"
+                and NPU_DBO_GRAPH_REPLAY_ENTRY in line
+            ):
+                dbo_graph_replay_steps.append(time.time())
 
     thread = threading.Thread(target=worker, name=f"{name}-log-stream", daemon=True)
     thread.start()

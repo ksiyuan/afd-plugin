@@ -609,6 +609,59 @@ def test_stage_prepare_uses_independent_builders_and_detaches_cache(monkeypatch)
     assert len(calls) == 2
 
 
+def test_stage_capture_prepare_forwards_full_graph_coordinates(monkeypatch):
+    """A two-microbatch ACL capture must build graph-ready stage metadata."""
+    batch = _ascend_batch()
+    batch.num_reqs = 2
+    batch.num_reqs_after_padding = 4
+    runner = object.__new__(npu_ubatch.NPUUBatchRunner)
+    runner.stage_attn_groups = [object(), object()]
+    runner.model_state = SimpleNamespace(max_model_len=128)
+    runner.parallel_config = object()
+    runner.vllm_config = SimpleNamespace(additional_config={})
+    calls = []
+
+    monkeypatch.setattr(
+        npu_ubatch, "build_attn_metadata", lambda **kwargs: calls.append(kwargs) or {}
+    )
+    monkeypatch.setattr(npu_ubatch, "build_attn_state", lambda *args: "child-state")
+    monkeypatch.setattr(
+        npu_ubatch,
+        "materialize_deepseek_attention_metadata_by_layer",
+        lambda *args: None,
+    )
+
+    runner._prepare_attn(
+        batch,
+        CUDAGraphMode.FULL,
+        (torch.ones((1, 2)),),
+        torch.empty(1, 8),
+        [],
+        None,
+        for_capture=True,
+        ubatch_idx=1,
+    )
+    runner._prepare_attn(
+        batch,
+        CUDAGraphMode.NONE,
+        (torch.ones((1, 2)),),
+        torch.empty(1, 8),
+        [],
+        None,
+        ubatch_idx=0,
+    )
+
+    assert [call["attn_groups"] for call in calls] == runner.stage_attn_groups
+    # FULL capture pads requests to the captured shape; eager keeps the real
+    # request count. Both carry the same real token count.
+    assert calls[0]["num_reqs"] == 4
+    assert calls[0]["num_actual_reqs"] == 2
+    assert calls[0]["for_cudagraph_capture"] is True
+    assert calls[1]["num_reqs"] == 2
+    assert calls[1]["num_actual_reqs"] == 2
+    assert calls[1]["for_cudagraph_capture"] is False
+
+
 def test_native_child_contexts_preserve_dp_and_own_ascend_kwargs(monkeypatch):
     runner = object.__new__(npu_ubatch.NPUUBatchRunner)
     runner.vllm_config = SimpleNamespace(additional_config={})

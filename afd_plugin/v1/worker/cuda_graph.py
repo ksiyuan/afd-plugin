@@ -9,16 +9,24 @@ used by CPU-safe tests.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 FULL_DECODE_ONLY = "FULL_DECODE_ONLY"
 _SUPPORTED_GRAPH_MODES = {FULL_DECODE_ONLY}
+
+
+class GraphDescriptorT(Protocol):
+    """Minimal capture-descriptor view needed to plan AFD capture events."""
+
+    num_tokens: int
+    num_reqs: int | None
+    num_ubatches: int
 
 
 class AFDGraphRunMode(str, Enum):
@@ -150,6 +158,27 @@ def graph_run_mode(
     return AFDGraphRunMode.EAGER
 
 
+def split_capture_preparation_events(
+    capture_descs: Iterable[GraphDescriptorT],
+) -> tuple[list[tuple[GraphDescriptorT, bool]], list[tuple[GraphDescriptorT, bool]]]:
+    """Split one native capture schedule into its two preparation paths.
+
+    A FULL capture prepares every descriptor once for warmup and once for the
+    formal capture, in capture-descriptor order. ``ModelCudaGraphManager``
+    prepares a two-microbatch (DBO) descriptor through ``UBatchRunner.prepare``
+    and every single-batch descriptor through ``prepare_inputs_to_capture``, so
+    a plugin publishing pre-capture control must watch both seams.
+    """
+
+    events = [
+        (desc, is_warmup) for desc in capture_descs for is_warmup in (True, False)
+    ]
+    return (
+        [event for event in events if event[0].num_ubatches <= 1],
+        [event for event in events if event[0].num_ubatches > 1],
+    )
+
+
 def _metadata_values_tuple(values: object) -> tuple[int, ...]:
     tolist = getattr(values, "tolist", None)
     if callable(tolist):
@@ -203,8 +232,10 @@ __all__ = [
     "AFDCUDAGraphPolicy",
     "AFDGraphRunMode",
     "FULL_DECODE_ONLY",
+    "GraphDescriptorT",
     "cudagraph_mode_name",
     "graph_run_mode",
     "make_ffn_graph_key",
+    "split_capture_preparation_events",
     "validate_cuda_graph_mode",
 ]

@@ -10,6 +10,7 @@ from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     graph_run_mode,
     make_ffn_graph_key,
+    split_capture_preparation_events,
     validate_cuda_graph_mode,
 )
 
@@ -225,4 +226,44 @@ def test_graph_run_mode_requires_attention_replaying(
             graph_exists=graph_exists,
         )
         is expected
+    )
+
+
+def _descriptor(num_tokens, num_reqs, num_ubatches=1):
+    return SimpleNamespace(
+        num_tokens=num_tokens,
+        num_reqs=num_reqs,
+        num_ubatches=num_ubatches,
+    )
+
+
+def test_capture_preparation_events_pair_warmup_and_capture_per_descriptor():
+    descriptors = [
+        _descriptor(8, 4),
+        _descriptor(4, 4, num_ubatches=2),
+    ]
+
+    single_events, ubatch_events = split_capture_preparation_events(descriptors)
+
+    assert [(d.num_tokens, warmup) for d, warmup in single_events] == [
+        (8, True),
+        (8, False),
+    ]
+    assert [(d.num_tokens, warmup) for d, warmup in ubatch_events] == [
+        (4, True),
+        (4, False),
+    ]
+
+
+def test_capture_preparation_events_keep_one_path_when_only_one_is_used():
+    single_only = [_descriptor(8, 4)]
+    assert split_capture_preparation_events(single_only) == (
+        [(single_only[0], True), (single_only[0], False)],
+        [],
+    )
+
+    ubatch_only = [_descriptor(4, 4, num_ubatches=2)]
+    assert split_capture_preparation_events(ubatch_only) == (
+        [],
+        [(ubatch_only[0], True), (ubatch_only[0], False)],
     )

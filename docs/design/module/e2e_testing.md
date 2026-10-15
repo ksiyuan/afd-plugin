@@ -111,8 +111,8 @@ cleanup. Production code does not depend on the E2E harness.
 | `afd-v2-graph-dp2` | CUDA ModelRunnerV2 graph, Attention DP2 + FFN DP2 | 4 | V2 data-parallel full-decode graph path. |
 | `afd-v2-eager-tp2` | CUDA ModelRunnerV2 eager, Attention TP2 + FFN TP2 | 4 | V2 tensor-parallel lifecycle and accuracy. |
 | `afd-v2-graph-tp2` | CUDA ModelRunnerV2 graph, Attention TP2 + FFN TP2 | 4 | V2 tensor-parallel full-decode graph path. |
-| `afd-v2-eager-dbo-dp2` | CUDA ModelRunnerV2 eager DBO, Attention DP2 + FFN DP2 | 4 | Accuracy and lifecycle with eager DBO enabled. |
-| `afd-v2-graph-dbo-dp2` | CUDA ModelRunnerV2 graph DBO, Attention DP2 + FFN DP2 | 4 | Accuracy and lifecycle with graph DBO enabled. |
+| `afd-v2-eager-dbo-dp2` | CUDA/NPU ModelRunnerV2 eager DBO, Attention DP2 + FFN DP2 | 4 | Accuracy and lifecycle with eager DBO enabled. |
+| `afd-v2-graph-dbo-dp2` | CUDA/NPU ModelRunnerV2 graph DBO, Attention DP2 + FFN DP2 | 4 | Accuracy and lifecycle with graph DBO enabled. |
 
 CUDA ready/merge CI selects seven DeepSeek-V2-Lite cases: the native baseline
 and the six DP2/TP2/DBO V2 cases. The V2 DP2 cases replace the three duplicate
@@ -129,7 +129,10 @@ cases additionally use a test-only worker extension to collect bounded per-rank
 execution summaries after evaluation. The summaries must prove actual replay
 or two-stage execution; dummy/profile/capture work does not qualify. Pure
 eager and native baseline cases, and performance comparisons, omit the probe.
-NPU DBO retains its live split check from existing runtime logs.
+NPU DBO retains its live split check from existing runtime logs. When the NPU
+run also enables the `FULL_DECODE_ONLY` ACL graph, the same log stream must
+record at least two consecutive two-microbatch graph replays; capture and
+warmup do not qualify.
 CUDA ready/merge CI runs in one 80-minute job. Put slower coverage in a
 scheduled job.
 

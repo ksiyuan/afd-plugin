@@ -165,8 +165,11 @@ gathering. Disable it after diagnosis to keep normal service logs concise.
 legacy field logs a warning and native DBO owns boundaries. Enable DBO only on
 Attention, with exactly two ubatches and both token thresholds at least two.
 For DeepSeek-V2/V3, enable chunked prefill to handle requests crossing the
-child boundary. NPU MRV2 DBO requires eager execution; synchronous CAMP2P
-additionally requires Attention DP > 1, while Async CAM permits DP1.
+child boundary. NPU MRV2 DBO requires either eager execution or a
+`FULL_DECODE_ONLY` two-microbatch ACL graph; synchronous CAMP2P additionally
+requires Attention DP > 1, while Async CAM permits DP1. `FULL` is rejected for
+DBO, and an ACL graph only replays the uniform decode shapes it captured, so
+the eager path must work even when graphs are enabled.
 
 An `NPU DBO peer failed` or `Async CAM receive failed` error means the
 host-side handoff was aborted. Restart the A/F worker group; waking the peer

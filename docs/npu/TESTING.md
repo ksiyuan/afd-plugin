@@ -54,8 +54,10 @@ and eager execution.
 
 For synchronous MRV2 CAMP2P, include eager two-stage execution at Attention
 DP > 1, many-to-one padding, and graph fallback without DBO. MRV2 DBO graphs
-are rejected. Record actual live two-stage execution, response correctness,
-software revisions and teardown outcomes separately.
+require `FULL_DECODE_ONLY`: capture shows two stages, and replay asserts at
+least two consecutive two-microbatch ACL graph replays from the attention log
+marker. Record actual live two-stage execution, response correctness, software
+revisions and teardown outcomes separately.
 
 ## Operator and model gates
 

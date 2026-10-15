@@ -15,6 +15,7 @@ from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
     assert_compatible_afd_stack,
     validate_gpu_model_runner_v2_config,
+    validate_npu_model_runner_v2_config,
 )
 
 
@@ -255,4 +256,90 @@ def test_gpu_validator_rejects_v1_before_importing_model_runtime(
     with pytest.raises(RuntimeError, match="requires ModelRunnerV2"):
         validate_gpu_model_runner_v2_config(
             mrv2_config, expected_role=role, device_type="cuda"
+        )
+
+
+@pytest.fixture
+def npu_mrv2_config(monkeypatch):
+    model_utils = ModuleType("afd_plugin.model_executor.models.model_utils")
+    monkeypatch.setattr(
+        model_utils, "has_afd_model_registration", lambda config: True, raising=False
+    )
+    monkeypatch.setitem(sys.modules, model_utils.__name__, model_utils)
+
+    return SimpleNamespace(
+        additional_config={
+            "afd": {
+                "role": "attention",
+                "connector": "CAMP2pAFDConnector",
+                "num_attention_ranks": 2,
+                "num_ffn_ranks": 2,
+                "compute_gate_on_attention": False,
+            }
+        },
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=True,
+            enable_elastic_ep=False,
+            enable_eplb=False,
+            use_sequence_parallel_moe=False,
+            enable_dbo=True,
+            use_ubatching=True,
+            num_ubatches=2,
+        ),
+        model_config=SimpleNamespace(enforce_eager=True),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+        speculative_config=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "enforce_eager,cudagraph_mode",
+    [(True, "NONE"), (False, "FULL_DECODE_ONLY")],
+)
+def test_npu_v2_dbo_accepts_eager_and_full_decode_only_graph(
+    npu_mrv2_config, enforce_eager, cudagraph_mode
+):
+    npu_mrv2_config.model_config.enforce_eager = enforce_eager
+    npu_mrv2_config.compilation_config.cudagraph_mode = cudagraph_mode
+
+    validate_npu_model_runner_v2_config(
+        npu_mrv2_config, expected_role="attention", device_type="npu"
+    )
+
+
+@pytest.mark.parametrize("cudagraph_mode", ["FULL", "FULL_AND_PIECEWISE"])
+def test_npu_v2_dbo_graph_requires_full_decode_only(npu_mrv2_config, cudagraph_mode):
+    npu_mrv2_config.model_config.enforce_eager = False
+    npu_mrv2_config.compilation_config.cudagraph_mode = cudagraph_mode
+
+    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
+        validate_npu_model_runner_v2_config(
+            npu_mrv2_config, expected_role="attention", device_type="npu"
+        )
+
+
+def test_npu_v2_non_dbo_graph_modes_are_unchanged(npu_mrv2_config):
+    npu_mrv2_config.parallel_config.enable_dbo = False
+    npu_mrv2_config.parallel_config.use_ubatching = False
+    npu_mrv2_config.parallel_config.num_ubatches = 1
+    npu_mrv2_config.model_config.enforce_eager = False
+
+    for cudagraph_mode in ("FULL", "FULL_DECODE_ONLY"):
+        npu_mrv2_config.compilation_config.cudagraph_mode = cudagraph_mode
+        validate_npu_model_runner_v2_config(
+            npu_mrv2_config, expected_role="attention", device_type="npu"
+        )
+
+    npu_mrv2_config.compilation_config.cudagraph_mode = "PIECEWISE"
+    with pytest.raises(RuntimeError, match="ACL graph modes FULL"):
+        validate_npu_model_runner_v2_config(
+            npu_mrv2_config, expected_role="attention", device_type="npu"
         )

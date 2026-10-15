@@ -341,9 +341,11 @@ stream, and wrapper implementation details are owned by
 [execution platforms](execution_platforms.md).
 
 CUDA V2 accepts exactly two native microbatches with Attention DP1 or DP > 1.
-Ascend V2 supports exactly two native microbatches in eager execution:
-synchronous CAMP2P requires Attention DP > 1, while Async CAM also supports
-Attention DP1. Ascend V2 DBO graph capture and replay remain unsupported.
+Ascend V2 supports exactly two native microbatches in eager execution and in
+`FULL_DECODE_ONLY` ACL graphs: synchronous CAMP2P requires Attention DP > 1,
+while Async CAM also supports Attention DP1. Ascend V2 DBO graphs are limited
+to `FULL_DECODE_ONLY`; the FFN daemon keys its own graph cache by the same
+per-stage token counts and replays the matching two-stage graph.
 
 For full-graph capture, the V2 runner
 wraps native input preparation and publishes one warmup and one capture
@@ -394,11 +396,11 @@ the matching platform and connector tests as well.
 Current shared limits are the supported vLLM release and registered role-aware
 model integrations. Ascend V1 native ubatching accepts exactly two ubatches. V2
 requires static EP and no PP/CP. CUDA V2 requires a synchronous control-plane
-connector and supports the two-microbatch path above. Ascend V2 supports eager
-native DBO with exactly two microbatches: synchronous CAMP2P requires Attention
-DP > 1, while Async CAM supports Attention DP1 or DP > 1. Ascend V2 DBO graphs
-remain unsupported. Hardware evidence remains limited to the recorded model and
-configuration cells.
+connector and supports the two-microbatch path above. Ascend V2 supports native
+DBO with exactly two microbatches in eager execution and in `FULL_DECODE_ONLY`
+two-stage ACL graphs: synchronous CAMP2P requires Attention DP > 1, while Async
+CAM supports Attention DP1 or DP > 1. Hardware evidence remains limited to the
+recorded model and configuration cells.
 Platform/connector limits are intentionally centralized in
 [execution platforms](execution_platforms.md#tested-runtime-matrix).
 

@@ -313,7 +313,20 @@ capture and installs an instance-scoped pre-replay hook because native full
 replay creates no `ForwardContext`. V2 does not use `AscendUBatchWrapper` and
 uses native `NPUUBatchRunner` preparation, execution and merge for eager DBO.
 Async CAM additionally enables the native path at DP1; it has no separate MoE
-stage pipeline. DBO graphs remain unsupported in V2.
+stage pipeline.
+
+For synchronous CAMP2P, V2 also supports DBO graphs in `FULL_DECODE_ONLY`.
+Native capture prepares a two-microbatch descriptor through
+`UBatchRunner.prepare` rather than `prepare_inputs_to_capture`, so the AFD
+capture seam watches both preparation paths, publishes one warmup and one
+capture control payload per descriptor, and installs the per-stage AFD sidecar
+through the ubatch preparation it already wraps. Stage attention metadata is
+built with the padded request count and `for_cudagraph_capture=True` so the
+captured graph carries graph-shaped metadata, and one ACL graph covers both
+microbatches. Replay therefore reuses the two-stage control published during
+preparation instead of re-sending a single-stage payload. `FULL` stays
+unsupported for DBO because a single replayed graph would have to serve mixed
+prefill/decode batches through one shared MLA task-group registry.
 
 The FFN runner owns a separate ACL graph cache keyed by stage token counts and
 A/F topology. Warmup runs the eager FFN path. Formal capture updates connector
@@ -372,7 +385,7 @@ does not expand the supported runtime contract.
 | Historical CUDA V1 (removed) + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` CUDA Graph | Native DBO, exactly two ubatches | Registered CUDA model boundaries; Attention-side or FFN-side gate where the model supports it | DeepSeek-V2-Lite eager/graph/DBO accuracy E2E; model, graph, connector, and profiler unit tests |
 | CUDA V2 + `P2pNcclAFDConnector` | Eager or `FULL_DECODE_ONLY` native V2 CUDA Graph | Exactly two native microbatches; Attention DP1 or DP > 1 | Model-specific gate placement; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | DeepSeek-V2-Lite eager/graph DP2 and TP2 E2E; H20 live two-stage execution and representative 300-question comparisons; numerical equivalence is not established. Qwen3.5/3.6 GDN DBO is unsupported; Qwen3 MoE DBO remains supported; DeepSeek-V2-Lite DP1/TP2 Graph + DBO passes 128 GSM8K samples and live two-stage/full-replay assertions |
 | Ascend V1 + `CAMP2pAFDConnector` | Eager or current ACL Graph path | Native DBO, exactly two ubatches | Common and connector-local `compute_gate_on_attention=false`; `connector_extra_config.quant_mode=0`; plugin CANN ops required | V2-Lite 2A2F graph 300-question comparison, 2A1F/2A2F functional checks, and Legacy DBO regressions; runtime, graph, ops, connector, and profiler unit tests |
-| Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Eager native DBO with two ubatches and Attention DP > 1; graphs remain single-batch | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
+| Ascend V2 + `CAMP2pAFDConnector` | Eager, `FULL`, or `FULL_DECODE_ONLY` native V2 ACL Graph | Native DBO with two ubatches and Attention DP > 1, eager or `FULL_DECODE_ONLY` two-stage ACL graph | `compute_gate_on_attention=false`; PP/CP, elastic EP, EPLB, SP MoE, and compile SP rejected; role ranks equal DP x TP | V2-Lite 2A2F FULL 300-question comparison and 2A1F eager/FULL_DECODE_ONLY/FULL functional checks; focused runner, context, validation, and device-contract unit tests |
 | Ascend + `CAMAsyncAFDConnector` | Eager only | Two native DBO microbatches on Attention, including DP1; legacy split selector is ignored | Experimental async path; `async=true`; documented path uses common `compute_gate_on_attention=true`; model runner v1 PCP is unsupported; prefill and decode context parallelism are unsupported; `connector_extra_config.dynamicQuant` is 0 or 1; plugin-owned async CAM ops required | Earlier V2-Lite and DSV4 layered comparisons retain their original scope; native-only migration has local checks and awaits NPU/accuracy validation |
 
 The Async CAM row also supports an MRV2 Attention runner for DeepSeek-V2/V3

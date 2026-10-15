@@ -75,7 +75,7 @@ class NPUUBatchRunner(UBatchRunner):
 
     # Ascend 8d4409d6 asserts ubatch_idx == 0 and always selects builder zero.
     # Feed its existing builder function an independent group per native child;
-    # no request/KV slicing or MRV1 state is reproduced here. Eager only.
+    # no request/KV slicing or MRV1 state is reproduced here.
     def _prepare_attn(
         self,
         input_batch: AscendInputBatch,
@@ -88,14 +88,22 @@ class NPUUBatchRunner(UBatchRunner):
         ubatch_idx: int = 0,
     ) -> dict[str, Any] | None:
         # ### PATCH START: build Ascend metadata from native child coordinates.
-        assert cudagraph_mode == CUDAGraphMode.NONE and not for_capture
         if input_batch.num_tokens == 0:
             # Ascend's existing no-metadata path zeros attention without touching
             # KV. The native context still runs padded tensors and A/F exchange.
             return None
+        # Native AscendModelState.prepare_attn selects the padded request count
+        # only for FULL graphs; every other mode keeps the real request count.
+        # Ascend DBO graphs are captured and replayed as FULL, so a two-stage
+        # graph needs both stages built with the padded counts captured for it.
+        full_graph = cudagraph_mode == CUDAGraphMode.FULL
         metadata = build_attn_metadata(
             attn_groups=self.stage_attn_groups[ubatch_idx],
-            num_reqs=input_batch.num_reqs,
+            num_reqs=(
+                input_batch.num_reqs_after_padding
+                if full_graph
+                else input_batch.num_reqs
+            ),
             num_actual_reqs=input_batch.num_reqs,
             num_tokens=input_batch.num_tokens,
             num_actual_tokens=input_batch.num_tokens,
@@ -122,6 +130,9 @@ class NPUUBatchRunner(UBatchRunner):
                 kv_cache_config,
             ),
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
+            # The builders must emit graph-capturable metadata for both warmup
+            # and formal capture, exactly as native single-batch capture does.
+            for_cudagraph_capture=for_capture,
         )
         materialize_deepseek_attention_metadata_by_layer(
             metadata, input_batch.positions, input_batch.num_tokens

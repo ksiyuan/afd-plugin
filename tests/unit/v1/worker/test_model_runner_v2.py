@@ -575,14 +575,20 @@ def test_npu_v2_validator_keeps_synchronous_sp_rejection(layout):
 
 
 @pytest.mark.parametrize("invalid", [None, "graph", "dp1", "stages", "speculative"])
-def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
-    config = _v2_config(num_attention_ranks=2, data_parallel_size=2)
+def test_npu_v2_dbo_is_sync_dp2_only(invalid):
+    config = _v2_config(
+        num_attention_ranks=2,
+        data_parallel_size=2,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
     config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
     config.parallel_config.enable_dbo = True
     config.parallel_config.use_ubatching = True
     config.parallel_config.num_ubatches = 2
     if invalid == "graph":
-        config.model_config.enforce_eager = False
+        # DBO captures both microbatches into one ACL graph, so only the
+        # uniform decode shape it was captured for may be replayed.
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     elif invalid == "dp1":
         config.parallel_config.data_parallel_size = 1
         config.additional_config["afd"]["num_attention_ranks"] = (
@@ -601,6 +607,51 @@ def test_npu_v2_dbo_is_sync_eager_dp2_only(invalid):
             validate_npu_model_runner_v2_config(
                 config, expected_role="attention", device_type="npu"
             )
+
+
+def test_npu_v2_dbo_accepts_eager_and_full_decode_only_graph():
+    for enforce_eager, cudagraph_mode in (
+        (True, CUDAGraphMode.NONE),
+        (False, CUDAGraphMode.FULL_DECODE_ONLY),
+    ):
+        config = _v2_config(
+            num_attention_ranks=2,
+            data_parallel_size=2,
+            enforce_eager=enforce_eager,
+            cudagraph_mode=cudagraph_mode,
+            cudagraph_capture_sizes=[TEST_CUDAGRAPH_CAPTURE_SIZE],
+            max_cudagraph_capture_size=TEST_CUDAGRAPH_CAPTURE_SIZE,
+        )
+        config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
+        config.parallel_config.enable_dbo = True
+        config.parallel_config.use_ubatching = True
+        config.parallel_config.num_ubatches = 2
+
+        validate_npu_model_runner_v2_config(
+            config, expected_role="attention", device_type="npu"
+        )
+
+
+@pytest.mark.parametrize(
+    "cudagraph_mode",
+    [CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE],
+)
+def test_npu_v2_dbo_graph_requires_full_decode_only(cudagraph_mode):
+    config = _v2_config(
+        num_attention_ranks=2,
+        data_parallel_size=2,
+        enforce_eager=False,
+        cudagraph_mode=cudagraph_mode,
+    )
+    config.additional_config["afd"]["connector"] = "CAMP2pAFDConnector"
+    config.parallel_config.enable_dbo = True
+    config.parallel_config.use_ubatching = True
+    config.parallel_config.num_ubatches = 2
+
+    with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
+        validate_npu_model_runner_v2_config(
+            config, expected_role="attention", device_type="npu"
+        )
 
 
 @pytest.mark.parametrize(
