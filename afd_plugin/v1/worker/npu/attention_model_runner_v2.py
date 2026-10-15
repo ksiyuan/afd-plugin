@@ -24,7 +24,7 @@ from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
-from vllm.v1.worker.gpu.input_batch import InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchState
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
@@ -487,7 +487,24 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             inputs = resolve_prepare_arguments(
                 previous_ubatch_prepare, args, kwargs, UBATCH_PREPARE_POSITIONS
             )
-            input_batch = inputs.get("input_batch")
+            # The seam is stored in the runner's instance dictionary, so the
+            # native caller may place the runner itself among the positional
+            # arguments. Identify the prepared batch by type instead of by
+            # position: the batch is the InputBatch, the runner never is.
+            input_batch = next(
+                (value for value in args if isinstance(value, InputBatch)),
+                None,
+            )
+            if input_batch is None:
+                resolved = inputs.get("input_batch")
+                if isinstance(resolved, InputBatch):
+                    input_batch = resolved
+            logger.debug(
+                "AFD NPU ubatch prepare call; arguments=%s input_batch=%s signature=%s",
+                tuple(type(value).__name__ for value in args),
+                "missing" if input_batch is None else "found",
+                describe_prepare_call(previous_ubatch_prepare, args, kwargs),
+            )
             cg_mode = inputs.get("cg_mode")
             for_capture = inputs.get("for_capture")
             if cg_mode != CUDAGraphMode.FULL or not for_capture:
