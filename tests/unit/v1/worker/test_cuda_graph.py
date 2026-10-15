@@ -6,13 +6,14 @@ import pytest
 
 from afd_plugin.v1.worker.cuda_graph import (
     FULL_DECODE_ONLY,
+    UBATCH_PREPARE_POSITIONS,
     AFDGraphRunMode,
     cudagraph_mode_name,
     describe_prepare_call,
     graph_run_mode,
     make_ffn_graph_key,
     positional_parameter_names,
-    resolve_prepare_inputs,
+    resolve_prepare_arguments,
     split_capture_preparation_events,
     validate_cuda_graph_mode,
 )
@@ -283,13 +284,20 @@ def _extra_parameter_prepare(
     return extra
 
 
-def test_resolve_prepare_inputs_reads_the_pinned_call_shape():
+def _opaque_prepare(*args, **kwargs):
+    """A wrapper whose signature introspection cannot expose parameter names."""
+    return args
+
+
+def test_resolve_prepare_arguments_reads_the_pinned_call_shape():
     batch = object()
     previous = _extra_parameter_prepare
     args = (batch, ("table",), "slots")
     kwargs = {"cg_mode": "FULL", "for_capture": True}
 
-    resolved = resolve_prepare_inputs(previous, args, kwargs)
+    resolved = resolve_prepare_arguments(
+        previous, args, kwargs, UBATCH_PREPARE_POSITIONS
+    )
 
     assert resolved == {
         "input_batch": batch,
@@ -306,11 +314,13 @@ def test_resolve_prepare_inputs_reads_the_pinned_call_shape():
     )
 
 
-def test_resolve_prepare_inputs_tolerates_an_unexpected_extra_argument():
+def test_resolve_prepare_arguments_tolerates_an_unexpected_extra_argument():
     batch = object()
     args = (batch, ("table",), "slots", "FULL", True, "surprise")
 
-    resolved = resolve_prepare_inputs(_extra_parameter_prepare, args, {})
+    resolved = resolve_prepare_arguments(
+        _extra_parameter_prepare, args, {}, UBATCH_PREPARE_POSITIONS
+    )
 
     assert resolved["input_batch"] is batch
     assert resolved["cg_mode"] == "FULL"
@@ -318,9 +328,24 @@ def test_resolve_prepare_inputs_tolerates_an_unexpected_extra_argument():
     assert "prepare(" in describe_prepare_call(_extra_parameter_prepare, args, {})
 
 
-def test_resolve_prepare_inputs_ignores_unintrospectable_targets():
-    class Unintrospectable:
-        def __call__(self, *args, **kwargs):
-            return None
+def test_resolve_prepare_arguments_falls_back_to_positions_for_opaque_targets():
+    """An unintrospectable wrapper must not lose the fields AFD validates.
 
-    assert resolve_prepare_inputs(Unintrospectable(), (object(),), {}) == {}
+    The hardware failure this guards against reported a missing input_batch
+    because the resolved signature exposed no parameter names.
+    """
+    batch = object()
+    args = (batch, ("table",), "slots", "FULL", True)
+
+    assert positional_parameter_names(_opaque_prepare) == ()
+    assert resolve_prepare_arguments(
+        _opaque_prepare, args, {}, UBATCH_PREPARE_POSITIONS
+    ) == {"input_batch": batch, "cg_mode": "FULL", "for_capture": True}
+
+
+def test_resolve_prepare_arguments_omits_names_it_cannot_resolve():
+    resolved = resolve_prepare_arguments(
+        _opaque_prepare, (object(),), {}, UBATCH_PREPARE_POSITIONS
+    )
+
+    assert tuple(resolved) == ("input_batch",)

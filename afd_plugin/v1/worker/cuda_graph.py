@@ -162,6 +162,13 @@ def graph_run_mode(
 UBATCH_PREPARE_FIELDS: Final[frozenset[str]] = frozenset(
     {"input_batch", "cg_mode", "for_capture"}
 )
+# Fallback argument positions for the pinned native preparation call shape:
+# (input_batch, block_tables, slot_mappings, cg_mode, for_capture).
+UBATCH_PREPARE_POSITIONS: Final[Mapping[str, int]] = {
+    "input_batch": 0,
+    "cg_mode": 3,
+    "for_capture": 4,
+}
 
 
 def positional_parameter_names(target: Callable[..., object]) -> tuple[str, ...]:
@@ -180,28 +187,32 @@ def positional_parameter_names(target: Callable[..., object]) -> tuple[str, ...]
     )
 
 
-def resolve_prepare_inputs(
+def resolve_prepare_arguments(
     target: Callable[..., object],
     args: tuple[object, ...],
     kwargs: dict[str, object],
+    positions: Mapping[str, int],
 ) -> dict[str, object]:
-    """Map one upstream preparation call onto the fields AFD reads.
+    """Resolve named preparation arguments from one unprepared call.
 
-    AFD's capture seam is installed on whatever ``prepare`` the active native
-    runner exposes, so it must not assume the pinned parameter list. Unresolved
-    names are simply absent, and the caller validates what it needs.
+    The AFD capture seam is installed on whatever ``prepare`` the active native
+    runner exposes and must forward it untouched, so it reads the few fields it
+    needs instead of restating the signature. Names are first matched against
+    the target's own signature; when that cannot be introspected -- a wrapper
+    exposing ``*args``, a C-level callable -- the pinned call positions are the
+    fallback, since both native preparation call sites pass the input batch
+    first. A name that resolves to neither is absent rather than wrong.
     """
 
-    positional_names = positional_parameter_names(target)
+    names = positional_parameter_names(target)
     resolved: dict[str, object] = {}
-    for name in UBATCH_PREPARE_FIELDS:
+    for name, fallback_position in positions.items():
         if name in kwargs:
             resolved[name] = kwargs[name]
             continue
-        if name in positional_names:
-            index = positional_names.index(name)
-            if index < len(args):
-                resolved[name] = args[index]
+        position = names.index(name) if name in names else fallback_position
+        if 0 <= position < len(args):
+            resolved[name] = args[position]
     return resolved
 
 
@@ -294,12 +305,13 @@ __all__ = [
     "FULL_DECODE_ONLY",
     "GraphDescriptorT",
     "UBATCH_PREPARE_FIELDS",
+    "UBATCH_PREPARE_POSITIONS",
     "cudagraph_mode_name",
     "describe_prepare_call",
     "graph_run_mode",
     "make_ffn_graph_key",
     "positional_parameter_names",
-    "resolve_prepare_inputs",
+    "resolve_prepare_arguments",
     "split_capture_preparation_events",
     "validate_cuda_graph_mode",
 ]

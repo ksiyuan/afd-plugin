@@ -55,8 +55,9 @@ from afd_plugin.v1.worker.attention_metadata import (
 )
 from afd_plugin.v1.worker.attention_model_runner_v2 import _use_afd_ubatch_preparation
 from afd_plugin.v1.worker.cuda_graph import (
+    UBATCH_PREPARE_POSITIONS,
     describe_prepare_call,
-    resolve_prepare_inputs,
+    resolve_prepare_arguments,
     split_capture_preparation_events,
 )
 from afd_plugin.validation import validate_npu_model_runner_v2_config
@@ -483,7 +484,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 )
             desc, is_warmup = ubatch_events[ubatch_event_index]
             ubatch_event_index += 1
-            inputs = resolve_prepare_inputs(previous_ubatch_prepare, args, kwargs)
+            inputs = resolve_prepare_arguments(
+                previous_ubatch_prepare, args, kwargs, UBATCH_PREPARE_POSITIONS
+            )
             input_batch = inputs.get("input_batch")
             cg_mode = inputs.get("cg_mode")
             for_capture = inputs.get("for_capture")

@@ -44,7 +44,10 @@ from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
-from afd_plugin.v1.worker.cuda_graph import resolve_prepare_inputs
+from afd_plugin.v1.worker.cuda_graph import (
+    UBATCH_PREPARE_POSITIONS,
+    resolve_prepare_arguments,
+)
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
@@ -127,8 +130,10 @@ def _use_afd_ubatch_preparation(
     # callback; no runner class or module-global function is replaced here.
     def prepare(self: UBatchRunner, *args: object, **kwargs: object) -> UBatchState:
         # ### PATCH START: bind AFD to native stage state outside graph execution.
-        inputs = resolve_prepare_inputs(original_prepare, args, kwargs)
-        input_batch = cast("InputBatch", inputs["input_batch"])
+        inputs = resolve_prepare_arguments(
+            original_prepare, args, kwargs, UBATCH_PREPARE_POSITIONS
+        )
+        input_batch = cast("InputBatch", inputs.get("input_batch", args[0]))
         cg_mode = cast("CUDAGraphMode", inputs.get("cg_mode", CUDAGraphMode.NONE))
         prepared = original_prepare(*args, **kwargs)
         if event_tracker is not None:
