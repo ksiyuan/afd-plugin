@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MethodType
@@ -46,12 +47,15 @@ from afd_plugin.v1.worker.attention_metadata import (
 )
 from afd_plugin.v1.worker.cuda_graph import (
     UBATCH_PREPARE_POSITIONS,
+    positional_parameter_names,
     resolve_prepare_arguments,
 )
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+logger = logging.getLogger(__name__)
 
 _AFD_FULLGRAPH_HOOK_MARKER = "_afd_fullgraph_replay_hook_active"
 
@@ -130,6 +134,12 @@ def _use_afd_ubatch_preparation(
     # callback; no runner class or module-global function is replaced here.
     def prepare(self: UBatchRunner, *args: object, **kwargs: object) -> UBatchState:
         # ### PATCH START: bind AFD to native stage state outside graph execution.
+        logger.debug(
+            "AFD ubatch prepare call; signature=%s positional=%d keywords=%s",
+            positional_parameter_names(original_prepare),
+            len(args),
+            tuple(kwargs),
+        )
         inputs = resolve_prepare_arguments(
             original_prepare, args, kwargs, UBATCH_PREPARE_POSITIONS
         )
