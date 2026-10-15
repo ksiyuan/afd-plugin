@@ -20,7 +20,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker import utils as v2_worker_utils
 from vllm.v1.worker.gpu import cudagraph_utils as v2_cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
@@ -47,7 +47,8 @@ from afd_plugin.v1.worker.attention_metadata import (
 )
 from afd_plugin.v1.worker.cuda_graph import (
     UBATCH_PREPARE_POSITIONS,
-    positional_parameter_names,
+    describe_prepare_call,
+    resolve_parameter_names,
     resolve_prepare_arguments,
 )
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
@@ -136,14 +137,19 @@ def _use_afd_ubatch_preparation(
         # ### PATCH START: bind AFD to native stage state outside graph execution.
         logger.debug(
             "AFD ubatch prepare call; signature=%s positional=%d keywords=%s",
-            positional_parameter_names(original_prepare),
+            resolve_parameter_names(original_prepare, args),
             len(args),
             tuple(kwargs),
         )
         inputs = resolve_prepare_arguments(
             original_prepare, args, kwargs, UBATCH_PREPARE_POSITIONS
         )
-        input_batch = cast("InputBatch", inputs.get("input_batch", args[0]))
+        input_batch = inputs.get("input_batch")
+        if input_batch is None:
+            raise RuntimeError(
+                "AFD ubatch preparation could not locate the input batch; "
+                f"got {describe_prepare_call(original_prepare, args, kwargs)}",
+            )
         cg_mode = cast("CUDAGraphMode", inputs.get("cg_mode", CUDAGraphMode.NONE))
         prepared = original_prepare(*args, **kwargs)
         if event_tracker is not None:

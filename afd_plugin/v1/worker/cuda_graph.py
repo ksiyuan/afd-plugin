@@ -162,13 +162,58 @@ def graph_run_mode(
 UBATCH_PREPARE_FIELDS: Final[frozenset[str]] = frozenset(
     {"input_batch", "cg_mode", "for_capture"}
 )
-# Fallback argument positions for the pinned native preparation call shape:
-# (input_batch, block_tables, slot_mappings, cg_mode, for_capture).
+# Fallback argument positions for the pinned native preparation call shape when
+# no signature can be read: (self, input_batch, block_tables, slot_mappings,
+# cg_mode, for_capture) as observed from a seam stored as a plain function.
 UBATCH_PREPARE_POSITIONS: Final[Mapping[str, int]] = {
-    "input_batch": 0,
-    "cg_mode": 3,
-    "for_capture": 4,
+    "input_batch": 1,
+    "cg_mode": 4,
+    "for_capture": 5,
 }
+
+
+def resolve_parameter_names(
+    target: Callable[..., object],
+    args: tuple[object, ...],
+) -> tuple[str, ...]:
+    """Return the parameter names that line up with one observed argument tuple.
+
+    A seam installed as a plain function in an instance dictionary is not bound
+    by the descriptor protocol, so the native caller may hand it the instance as
+    the first positional argument. Candidate parameter lists are therefore
+    matched by arity: the one whose length equals the offered argument count
+    lines up, and the public one is preferred when several do.
+    """
+
+    candidates: list[tuple[str, ...]] = []
+    inspected: list[object] = [target]
+    if inspect.isfunction(target):
+        # Only a plain function can have been stored unbound in an instance
+        # dictionary. ``type`` of anything else exposes constructor noise.
+        inspected.append(type(target))
+    for candidate in inspected:
+        try:
+            parameters = inspect.signature(candidate).parameters.values()
+        except (TypeError, ValueError):
+            continue
+        names = tuple(
+            parameter.name
+            for parameter in parameters
+            if parameter.kind
+            in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+        )
+        if names:
+            candidates.append(names)
+
+    public = [
+        names for names in candidates if "self" not in names and len(names) == len(args)
+    ]
+    if public:
+        return public[0]
+    aligned = [names for names in candidates if len(names) == len(args)]
+    if aligned:
+        return aligned[0]
+    return candidates[0] if candidates else ()
 
 
 def positional_parameter_names(target: Callable[..., object]) -> tuple[str, ...]:
@@ -181,7 +226,7 @@ def positional_parameter_names(target: Callable[..., object]) -> tuple[str, ...]
     return tuple(
         parameter.name
         for parameter in parameters
-        if parameter.name != "self"
+        if parameter.name not in ("self",)
         and parameter.kind
         in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
     )
@@ -197,14 +242,13 @@ def resolve_prepare_arguments(
 
     The AFD capture seam is installed on whatever ``prepare`` the active native
     runner exposes and must forward it untouched, so it reads the few fields it
-    needs instead of restating the signature. Names are first matched against
-    the target's own signature; when that cannot be introspected -- a wrapper
-    exposing ``*args``, a C-level callable -- the pinned call positions are the
-    fallback, since both native preparation call sites pass the input batch
-    first. A name that resolves to neither is absent rather than wrong.
+    needs instead of restating the signature. Names line up with the observed
+    argument tuple when a signature can be read; otherwise the pinned positions
+    are the fallback. A name that resolves to neither is absent rather than
+    wrong.
     """
 
-    names = positional_parameter_names(target)
+    names = resolve_parameter_names(target, args)
     resolved: dict[str, object] = {}
     for name, fallback_position in positions.items():
         if name in kwargs:
@@ -224,7 +268,7 @@ def describe_prepare_call(
     """Describe an observed preparation call for a drift error message."""
 
     return (
-        f"prepare{positional_parameter_names(target)} "
+        f"prepare{resolve_parameter_names(target, args)} "
         f"positional={len(args)} keywords={tuple(kwargs)}"
     )
 
@@ -311,6 +355,7 @@ __all__ = [
     "graph_run_mode",
     "make_ffn_graph_key",
     "positional_parameter_names",
+    "resolve_parameter_names",
     "resolve_prepare_arguments",
     "split_capture_preparation_events",
     "validate_cuda_graph_mode",

@@ -289,6 +289,20 @@ def _opaque_prepare(*args, **kwargs):
     return args
 
 
+class _MethodSeam:
+    """Stands in for a runner whose prepare seam is stored as a plain function."""
+
+    def prepare(
+        self,
+        input_batch,
+        block_tables,
+        slot_mappings,
+        cg_mode=None,
+        for_capture=False,
+    ):
+        return input_batch
+
+
 def test_resolve_prepare_arguments_reads_the_pinned_call_shape():
     batch = object()
     previous = _extra_parameter_prepare
@@ -314,6 +328,43 @@ def test_resolve_prepare_arguments_reads_the_pinned_call_shape():
     )
 
 
+def test_resolve_prepare_arguments_skips_a_leading_instance():
+    """An unbound seam receives the runner as its first positional argument.
+
+    This is how the capture seam is really installed: a plain function written
+    into the runner's instance dictionary, so the caller supplies the instance
+    and ``input_batch`` lands one slot later. The hardware failure this guards
+    against read position 0, picked up the runner itself, and reported
+
+        'NPUUBatchRunner' object has no attribute 'num_reqs'
+    """
+    runner = SimpleNamespace(prepare=_MethodSeam.prepare)
+    batch = SimpleNamespace(num_reqs=4)
+    args = (runner, batch, ("table",), "slots", "FULL", True)
+
+    resolved = resolve_prepare_arguments(
+        _MethodSeam.prepare, args, {}, UBATCH_PREPARE_POSITIONS
+    )
+
+    assert resolved == {"input_batch": batch, "cg_mode": "FULL", "for_capture": True}
+
+
+def test_resolve_prepare_arguments_reads_a_plain_bound_call():
+    runner = _MethodSeam()
+    batch = SimpleNamespace(num_reqs=4)
+    kwargs = {"cg_mode": "FULL", "for_capture": True}
+
+    resolved = resolve_prepare_arguments(
+        runner.prepare, (batch, ("table",), "slots"), kwargs, UBATCH_PREPARE_POSITIONS
+    )
+
+    assert resolved == {
+        "input_batch": batch,
+        "cg_mode": "FULL",
+        "for_capture": True,
+    }
+
+
 def test_resolve_prepare_arguments_tolerates_an_unexpected_extra_argument():
     batch = object()
     args = (batch, ("table",), "slots", "FULL", True, "surprise")
@@ -329,13 +380,9 @@ def test_resolve_prepare_arguments_tolerates_an_unexpected_extra_argument():
 
 
 def test_resolve_prepare_arguments_falls_back_to_positions_for_opaque_targets():
-    """An unintrospectable wrapper must not lose the fields AFD validates.
-
-    The hardware failure this guards against reported a missing input_batch
-    because the resolved signature exposed no parameter names.
-    """
+    """An unintrospectable wrapper must not lose the fields AFD validates."""
     batch = object()
-    args = (batch, ("table",), "slots", "FULL", True)
+    args = (object(), batch, ("table",), "slots", "FULL", True)
 
     assert positional_parameter_names(_opaque_prepare) == ()
     assert resolve_prepare_arguments(
@@ -348,4 +395,4 @@ def test_resolve_prepare_arguments_omits_names_it_cannot_resolve():
         _opaque_prepare, (object(),), {}, UBATCH_PREPARE_POSITIONS
     )
 
-    assert tuple(resolved) == ("input_batch",)
+    assert tuple(resolved) == ()
