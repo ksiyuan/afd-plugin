@@ -13,7 +13,7 @@ import inspect
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -172,48 +172,48 @@ UBATCH_PREPARE_POSITIONS: Final[Mapping[str, int]] = {
 }
 
 
-def resolve_parameter_names(
-    target: Callable[..., object],
-    args: tuple[object, ...],
-) -> tuple[str, ...]:
-    """Return the parameter names that line up with one observed argument tuple.
+def build_signature_matched_wrapper(
+    forward_to: Callable[..., object],
+    wrapper_name: str,
+    template: Callable[..., object],
+) -> Callable[..., object]:
+    """Build a pass-through forwarder carrying ``template``'s calling convention.
 
-    A seam installed as a plain function in an instance dictionary is not bound
-    by the descriptor protocol, so the native caller may hand it the instance as
-    the first positional argument. Candidate parameter lists are therefore
-    matched by arity: the one whose length equals the offered argument count
-    lines up, and the public one is preferred when several do.
+    A seam that replaces a bound method is invoked by parameter name, so a
+    wrapper written as ``*args, **kwargs`` reorders its arguments and fails with
+    "got multiple values for argument". Emitting the wrapper with the replaced
+    callable's own parameter names and defaults keeps positional and keyword
+    binding identical, and every parameter is forwarded by name so the original
+    calling intent survives.
     """
 
-    candidates: list[tuple[str, ...]] = []
-    inspected: list[object] = [target]
-    if inspect.isfunction(target):
-        # Only a plain function can have been stored unbound in an instance
-        # dictionary. ``type`` of anything else exposes constructor noise.
-        inspected.append(type(target))
-    for candidate in inspected:
-        try:
-            parameters = inspect.signature(candidate).parameters.values()
-        except (TypeError, ValueError):
-            continue
-        names = tuple(
-            parameter.name
-            for parameter in parameters
-            if parameter.kind
-            in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-        )
-        if names:
-            candidates.append(names)
-
-    public = [
-        names for names in candidates if "self" not in names and len(names) == len(args)
+    signature = inspect.signature(template)
+    parameters = ", ".join(
+        _parameter_source(parameter) for parameter in signature.parameters.values()
+    )
+    forwarded = [
+        parameter.name
+        for parameter in signature.parameters.values()
+        if parameter.kind is not parameter.VAR_KEYWORD
     ]
-    if public:
-        return public[0]
-    aligned = [names for names in candidates if len(names) == len(args)]
-    if aligned:
-        return aligned[0]
-    return candidates[0] if candidates else ()
+    namespace: dict[str, object] = {"_afd_forward_to": forward_to}
+    source = (
+        f"def {wrapper_name}({parameters}):\n"
+        f"    return _afd_forward_to({', '.join(forwarded)})\n"
+    )
+    exec(source, namespace)  # noqa: S102 - parameter names come from a signature
+    wrapper = namespace[wrapper_name]
+    if not callable(wrapper):  # pragma: no cover - defensive
+        raise RuntimeError(f"could not build the {wrapper_name} wrapper")
+    return cast("Callable[..., object]", wrapper)
+
+
+def _parameter_source(parameter: inspect.Parameter) -> str:
+    if parameter.kind is parameter.VAR_POSITIONAL:
+        return f"*{parameter.name}"
+    if parameter.kind is parameter.VAR_KEYWORD:
+        return f"**{parameter.name}"
+    return parameter.name
 
 
 def positional_parameter_names(target: Callable[..., object]) -> tuple[str, ...]:
@@ -226,7 +226,7 @@ def positional_parameter_names(target: Callable[..., object]) -> tuple[str, ...]
     return tuple(
         parameter.name
         for parameter in parameters
-        if parameter.name not in ("self",)
+        if parameter.name != "self"
         and parameter.kind
         in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
     )
@@ -238,17 +238,14 @@ def resolve_prepare_arguments(
     kwargs: dict[str, object],
     positions: Mapping[str, int],
 ) -> dict[str, object]:
-    """Resolve named preparation arguments from one unprepared call.
+    """Resolve named preparation arguments from one observed call.
 
-    The AFD capture seam is installed on whatever ``prepare`` the active native
-    runner exposes and must forward it untouched, so it reads the few fields it
-    needs instead of restating the signature. Names line up with the observed
-    argument tuple when a signature can be read; otherwise the pinned positions
-    are the fallback. A name that resolves to neither is absent rather than
-    wrong.
+    Names are matched against the call target's signature when it can be read,
+    and against the pinned positions otherwise. A name that resolves to neither
+    is absent rather than wrong.
     """
 
-    names = resolve_parameter_names(target, args)
+    names = positional_parameter_names(target)
     resolved: dict[str, object] = {}
     for name, fallback_position in positions.items():
         if name in kwargs:
@@ -268,7 +265,7 @@ def describe_prepare_call(
     """Describe an observed preparation call for a drift error message."""
 
     return (
-        f"prepare{resolve_parameter_names(target, args)} "
+        f"prepare{positional_parameter_names(target)} "
         f"positional={len(args)} keywords={tuple(kwargs)}"
     )
 
@@ -350,12 +347,12 @@ __all__ = [
     "GraphDescriptorT",
     "UBATCH_PREPARE_FIELDS",
     "UBATCH_PREPARE_POSITIONS",
+    "build_signature_matched_wrapper",
     "cudagraph_mode_name",
     "describe_prepare_call",
     "graph_run_mode",
     "make_ffn_graph_key",
     "positional_parameter_names",
-    "resolve_parameter_names",
     "resolve_prepare_arguments",
     "split_capture_preparation_events",
     "validate_cuda_graph_mode",

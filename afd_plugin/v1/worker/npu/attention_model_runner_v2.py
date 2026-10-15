@@ -56,6 +56,7 @@ from afd_plugin.v1.worker.attention_metadata import (
 from afd_plugin.v1.worker.attention_model_runner_v2 import _use_afd_ubatch_preparation
 from afd_plugin.v1.worker.cuda_graph import (
     UBATCH_PREPARE_POSITIONS,
+    build_signature_matched_wrapper,
     describe_prepare_call,
     resolve_prepare_arguments,
     split_capture_preparation_events,
@@ -472,9 +473,9 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
         # context construction remain in the bound method.
         # Removal plan: delete this wrapper when upstream exposes a capture
         # warmup/capture callback for microbatched graphs.
-        # The AFD seam must not narrow the upstream signature: it is installed
-        # on whatever prepare the active native runner exposes, so it forwards
-        # every argument through and reads only the fields it validates.
+        # The AFD seam replaces a bound native method, so it is emitted with that
+        # method's own parameter names: a *args/**kwargs seam reorders the native
+        # call and fails with "got multiple values for argument".
         def ubatch_prepare(*args: object, **kwargs: object) -> UBatchState:
             nonlocal ubatch_event_index
             # ### PATCH START: stage one exact AFD capture event.
@@ -487,10 +488,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
             inputs = resolve_prepare_arguments(
                 previous_ubatch_prepare, args, kwargs, UBATCH_PREPARE_POSITIONS
             )
-            # The seam is stored in the runner's instance dictionary, so the
-            # native caller may place the runner itself among the positional
-            # arguments. Identify the prepared batch by type instead of by
-            # position: the batch is the InputBatch, the runner never is.
+            # Identify the prepared batch by type rather than position: the
+            # batch is the InputBatch, whatever else the native call passes.
             input_batch = next(
                 (value for value in args if isinstance(value, InputBatch)),
                 None,
@@ -500,7 +499,7 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 if isinstance(resolved, InputBatch):
                     input_batch = resolved
             logger.debug(
-                "AFD NPU ubatch prepare call; arguments=%s input_batch=%s signature=%s",
+                "AFD NPU ubatch prepare call; arguments=%s input_batch=%s previous=%s",
                 tuple(type(value).__name__ for value in args),
                 "missing" if input_batch is None else "found",
                 describe_prepare_call(previous_ubatch_prepare, args, kwargs),
@@ -537,7 +536,14 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 "prepare",
                 ubatch_runner.prepare,
             )
-            ubatch_runner.prepare = MethodType(ubatch_prepare, ubatch_runner)
+            # The native caller binds prepare by parameter name, so the seam is
+            # emitted with the replaced method's own parameter names instead of
+            # reading the call generically.
+            ubatch_runner.prepare = build_signature_matched_wrapper(
+                ubatch_prepare,
+                "afd_npu_ubatch_prepare",
+                previous_ubatch_prepare,
+            )
         try:
             with (
                 _use_afd_ubatch_preparation(self, None)

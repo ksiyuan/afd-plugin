@@ -23,7 +23,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, UBatchState
+from vllm.v1.worker.gpu.ubatch_utils import UBatchState
 
 from afd_plugin.compat.patches.gpu_mrv2_ubatching import (
     use_gpu_mrv2_dbo_dispatch,
@@ -47,8 +47,8 @@ from afd_plugin.v1.worker.attention_metadata import (
 )
 from afd_plugin.v1.worker.cuda_graph import (
     UBATCH_PREPARE_POSITIONS,
+    build_signature_matched_wrapper,
     describe_prepare_call,
-    resolve_parameter_names,
     resolve_prepare_arguments,
 )
 from afd_plugin.validation import validate_gpu_model_runner_v2_config
@@ -126,21 +126,15 @@ def _use_afd_ubatch_preparation(
     # branch also bypasses prepare_inputs_to_capture.
     # Patch functionality: decorate native stage state and publish one complete
     # A/F payload before threads start (or before FULL replay).
-    # Signature: forwards every argument of the prepared method unchanged rather
-    # than restating UBatchRunner.prepare's parameter list, because the seam is
-    # installed on whatever prepare the active native runner exposes and must
-    # not narrow it. The three fields AFD reads are resolved by name.
+    # Signature: the installed seam carries the replaced method's own parameter
+    # names, because the native caller binds prepare positionally by name and a
+    # generic *args seam reorders the call. The three fields AFD reads are
+    # resolved from the observed arguments.
     # Delegation exception: keep native slicing/attention preparation in the
     # bound method. Remove this seam when upstream offers a prepared-state
     # callback; no runner class or module-global function is replaced here.
-    def prepare(self: UBatchRunner, *args: object, **kwargs: object) -> UBatchState:
+    def prepare(*args: object, **kwargs: object) -> UBatchState:
         # ### PATCH START: bind AFD to native stage state outside graph execution.
-        logger.debug(
-            "AFD ubatch prepare call; signature=%s positional=%d keywords=%s",
-            resolve_parameter_names(original_prepare, args),
-            len(args),
-            tuple(kwargs),
-        )
         inputs = resolve_prepare_arguments(
             original_prepare, args, kwargs, UBATCH_PREPARE_POSITIONS
         )
@@ -171,7 +165,11 @@ def _use_afd_ubatch_preparation(
         return prepared
         # ### PATCH END: bind AFD to native stage state outside graph execution.
 
-    ubatch_runner.prepare = MethodType(prepare, ubatch_runner)
+    ubatch_runner.prepare = build_signature_matched_wrapper(
+        prepare,
+        "afd_ubatch_prepare",
+        original_prepare,
+    )
     try:
         yield
     finally:

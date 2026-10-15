@@ -8,6 +8,7 @@ from afd_plugin.v1.worker.cuda_graph import (
     FULL_DECODE_ONLY,
     UBATCH_PREPARE_POSITIONS,
     AFDGraphRunMode,
+    build_signature_matched_wrapper,
     cudagraph_mode_name,
     describe_prepare_call,
     graph_run_mode,
@@ -303,6 +304,73 @@ class _MethodSeam:
         return input_batch
 
 
+def test_signature_matched_wrapper_keeps_the_replaced_calling_convention():
+    """The seam must bind exactly like the method it replaces.
+
+    A seam written as *args/**kwargs reorders a positional-by-name native call
+    and fails with "got multiple values for argument". The generated wrapper
+    therefore carries the replaced method's own parameter names.
+    """
+    seen: list[tuple[object, ...]] = []
+
+    def seam(*args, **kwargs):
+        seen.append(args)
+        return "seam"
+
+    class Runner:
+        def prepare(
+            self,
+            input_batch,
+            block_tables,
+            slot_mappings,
+            cg_mode=None,
+            for_capture=False,
+        ):
+            return input_batch
+
+    runner = Runner()
+    runner.prepare = build_signature_matched_wrapper(
+        seam, "afd_prepare", runner.prepare
+    )
+
+    result = runner.prepare(
+        "batch", ("table",), "slots", cg_mode="FULL", for_capture=True
+    )
+
+    assert result == "seam"
+    assert seen == [("batch", ("table",), "slots", "FULL", True)]
+    assert positional_parameter_names(runner.prepare) == (
+        "input_batch",
+        "block_tables",
+        "slot_mappings",
+        "cg_mode",
+        "for_capture",
+    )
+
+
+def test_signature_matched_wrapper_keeps_self_for_an_unbound_seam():
+    """An instance-dictionary seam receives the instance like the method did."""
+    seen: list[tuple[object, ...]] = []
+
+    def seam(*args, **kwargs):
+        seen.append(args)
+        return "seam"
+
+    class Runner:
+        def prepare(self, input_batch, cg_mode=None, for_capture=False):
+            return input_batch
+
+    runner = Runner()
+    # A plain function in the instance dictionary is never bound by the
+    # descriptor protocol, so the caller supplies the instance.
+    runner.prepare = build_signature_matched_wrapper(
+        seam, "afd_prepare", Runner.prepare
+    )
+
+    assert runner.prepare(runner, "batch", "FULL", True) == "seam"
+    assert seen == [(runner, "batch", "FULL", True)]
+
+
 def test_resolve_prepare_arguments_reads_the_pinned_call_shape():
     batch = object()
     previous = _extra_parameter_prepare
@@ -326,27 +394,6 @@ def test_resolve_prepare_arguments_reads_the_pinned_call_shape():
         "for_capture",
         "extra",
     )
-
-
-def test_resolve_prepare_arguments_skips_a_leading_instance():
-    """An unbound seam receives the runner as its first positional argument.
-
-    This is how the capture seam is really installed: a plain function written
-    into the runner's instance dictionary, so the caller supplies the instance
-    and ``input_batch`` lands one slot later. The hardware failure this guards
-    against read position 0, picked up the runner itself, and reported
-
-        'NPUUBatchRunner' object has no attribute 'num_reqs'
-    """
-    runner = SimpleNamespace(prepare=_MethodSeam.prepare)
-    batch = SimpleNamespace(num_reqs=4)
-    args = (runner, batch, ("table",), "slots", "FULL", True)
-
-    resolved = resolve_prepare_arguments(
-        _MethodSeam.prepare, args, {}, UBATCH_PREPARE_POSITIONS
-    )
-
-    assert resolved == {"input_batch": batch, "cg_mode": "FULL", "for_capture": True}
 
 
 def test_resolve_prepare_arguments_reads_a_plain_bound_call():
