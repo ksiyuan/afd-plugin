@@ -171,12 +171,12 @@ def _use_afd_fullgraph_replay_hook(
         del manager_state[_AFD_FULLGRAPH_HOOK_MARKER]
 
 
-def _stage_afd_capture_event(
+def _stage_afd_capture_single_event(
     runner: AFDNPUAttentionModelRunnerV2,
     desc: v2_cudagraph_utils.BatchExecutionDescriptor,
     is_warmup: bool,
 ) -> None:
-    """Publish the AFD warmup/capture event for one native preparation."""
+    """Publish the AFD warmup/capture event for one single-batch preparation."""
 
     runner._is_warmup = is_warmup
     runner._afd_is_graph_capturing = not is_warmup
@@ -184,6 +184,31 @@ def _stage_afd_capture_event(
     runner.send_dp_metadata(
         runner.build_capture_dp_metadata(int(desc.num_tokens)), None
     )
+    runner._afd_suppress_metadata_send = True
+
+
+def _stage_afd_capture_ubatch_event(
+    runner: AFDNPUAttentionModelRunnerV2,
+    prepared: UBatchState,
+    num_tokens: int,
+    is_warmup: bool,
+) -> None:
+    """Publish the AFD warmup/capture event for one two-microbatch preparation.
+
+    One native preparation publishes exactly one payload: the per-stage sidecars
+    are installed and that complete payload is sent once. A second sender in the
+    same preparation would give the remote FFN more payloads than preparation
+    steps, which desynchronizes the roles into a blocking send/receive pair.
+    """
+
+    runner._is_warmup = is_warmup
+    runner._afd_is_graph_capturing = not is_warmup
+    runner.install_mrv2_ubatch_metadata(
+        prepared.slices,
+        prepared.forward_contexts,
+        num_tokens,
+    )
+    runner.send_dp_metadata(None, prepared.slices)
     runner._afd_suppress_metadata_send = True
 
 
@@ -455,16 +480,16 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     f"expected ({desc.num_reqs}, {desc.num_tokens}), got "
                     f"({num_reqs}, {num_tokens})",
                 )
-            _stage_afd_capture_event(self, desc, is_warmup)
+            _stage_afd_capture_single_event(self, desc, is_warmup)
             return attention_state
             # ### PATCH END: stage one exact AFD capture event.
 
         # Patch reason: a two-microbatch native capture prepares its stages
         # through the ubatch runner, bypassing prepare_inputs_to_capture.
-        # Patch functionality: bind the matching AFD warmup/capture event to
-        # that preparation, which the native capture already runs outside the
-        # graph. The stage metadata and control payload stay owned by
-        # _use_afd_ubatch_preparation below.
+        # Patch functionality: run the native preparation, then publish that one
+        # prepared transaction's complete stage control. This seam owns the
+        # whole sequence, so no second sender runs during capture -- the remote
+        # FFN receives exactly one payload per preparation step.
         # Signature: matches UBatchRunner.prepare at vLLM ced6857.
         # Upstream source: vllm/v1/worker/gpu/ubatch_utils.py,
         # UBatchRunner.prepare; commit
@@ -524,8 +549,14 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     "descriptor/order drift for "
                     f"({desc.num_reqs}, {desc.num_tokens}); got {observed}",
                 )
-            _stage_afd_capture_event(self, desc, is_warmup)
-            return previous_ubatch_prepare(*args, **kwargs)
+            prepared = previous_ubatch_prepare(*args, **kwargs)
+            _stage_afd_capture_ubatch_event(
+                self,
+                prepared,
+                int(desc.num_tokens),
+                is_warmup,
+            )
+            return prepared
             # ### PATCH END: stage one exact AFD capture event.
 
         v2_cudagraph_utils.prepare_inputs_to_capture = prepare_inputs_to_capture
@@ -545,13 +576,8 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                 previous_ubatch_prepare,
             )
         try:
-            with (
-                _use_afd_ubatch_preparation(self, None)
-                if ubatch_events
-                else nullcontext(),
-                use_afd_metadata_provider(
-                    self.install_afd_metadata_on_forward_context,
-                ),
+            with use_afd_metadata_provider(
+                self.install_afd_metadata_on_forward_context,
             ):
                 result = super().capture_model(profile_only=profile_only)
             if event_index != len(single_events):
