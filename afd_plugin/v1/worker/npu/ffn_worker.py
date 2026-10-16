@@ -174,6 +174,13 @@ class AFDNPUFFNWorker(NPUWorker):
             is_warmup = payload.is_warmup
             is_profile = payload.is_profile
             is_graph_replaying = payload.is_graph_replaying
+            print(
+                "[AFD-DBG] ffn payload "
+                f"key={self.model_runner._make_graph_key(dp_metadata_list)} "
+                f"capturing={is_attn_graph_capturing} warmup={is_warmup} "
+                f"replaying={is_graph_replaying}",
+                flush=True,
+            )
 
             self.model_runner.execute_ffn_step(
                 dp_metadata_list=dp_metadata_list,
@@ -181,6 +188,11 @@ class AFDNPUFFNWorker(NPUWorker):
                 is_warmup=is_warmup,
                 is_profile=is_profile,
                 is_graph_replaying=is_graph_replaying,
+            )
+            print(
+                "[AFD-DBG] ffn step-done "
+                f"key={self.model_runner._make_graph_key(dp_metadata_list)}",
+                flush=True,
             )
             torch.npu.synchronize()
 

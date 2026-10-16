@@ -181,8 +181,20 @@ def _stage_afd_capture_single_event(
     runner._is_warmup = is_warmup
     runner._afd_is_graph_capturing = not is_warmup
     runner._afd_pending_metadata = runner.build_afd_metadata(None, int(desc.num_tokens))
+    print(
+        "[AFD-DBG] attn send single "
+        f"tokens={int(desc.num_tokens)} warmup={is_warmup} "
+        f"rank={runner.connector.world_rank}",
+        flush=True,
+    )
     runner.send_dp_metadata(
         runner.build_capture_dp_metadata(int(desc.num_tokens)), None
+    )
+    print(
+        "[AFD-DBG] attn send single done "
+        f"tokens={int(desc.num_tokens)} warmup={is_warmup} "
+        f"rank={runner.connector.world_rank}",
+        flush=True,
     )
     runner._afd_suppress_metadata_send = True
 
@@ -208,7 +220,19 @@ def _stage_afd_capture_ubatch_event(
         prepared.forward_contexts,
         num_tokens,
     )
+    print(
+        "[AFD-DBG] attn send stages "
+        f"stages={len(prepared.slices)} tokens={num_tokens} warmup={is_warmup} "
+        f"rank={runner.connector.world_rank}",
+        flush=True,
+    )
     runner.send_dp_metadata(None, prepared.slices)
+    print(
+        "[AFD-DBG] attn send stages done "
+        f"stages={len(prepared.slices)} tokens={num_tokens} warmup={is_warmup} "
+        f"rank={runner.connector.world_rank}",
+        flush=True,
+    )
     runner._afd_suppress_metadata_send = True
 
 
@@ -422,6 +446,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     "descriptors",
                 )
         single_events, ubatch_events = split_capture_preparation_events(capture_descs)
+        shapes = [(d.num_reqs, d.num_tokens, d.num_ubatches) for d in capture_descs]
+        print(
+            f"[AFD-DBG] attn capture start descs={shapes} "
+            f"single={len(single_events)} ubatch={len(ubatch_events)}",
+            flush=True,
+        )
         event_index = 0
         ubatch_event_index = 0
         original_prepare = v2_cudagraph_utils.prepare_inputs_to_capture
@@ -480,6 +510,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     f"expected ({desc.num_reqs}, {desc.num_tokens}), got "
                     f"({num_reqs}, {num_tokens})",
                 )
+            print(
+                "[AFD-DBG] attn single prepare "
+                f"desc=({desc.num_reqs},{desc.num_tokens}) warmup={is_warmup} "
+                f"ubatches={desc.num_ubatches}",
+                flush=True,
+            )
             _stage_afd_capture_single_event(self, desc, is_warmup)
             return attention_state
             # ### PATCH END: stage one exact AFD capture event.
@@ -550,6 +586,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     f"({desc.num_reqs}, {desc.num_tokens}); got {observed}",
                 )
             prepared = previous_ubatch_prepare(*args, **kwargs)
+            print(
+                "[AFD-DBG] attn ubatch prepared "
+                f"desc=({desc.num_reqs},{desc.num_tokens}) warmup={is_warmup} "
+                f"stages={len(prepared.slices)}",
+                flush=True,
+            )
             _stage_afd_capture_ubatch_event(
                 self,
                 prepared,
