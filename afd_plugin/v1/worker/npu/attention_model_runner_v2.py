@@ -220,17 +220,19 @@ def _stage_afd_capture_ubatch_event(
         prepared.forward_contexts,
         num_tokens,
     )
+    stage_tokens = [int(ub.num_tokens) for ub in prepared.slices]
     print(
         "[AFD-DBG] attn send stages "
-        f"stages={len(prepared.slices)} tokens={num_tokens} warmup={is_warmup} "
+        f"stages={len(prepared.slices)} stage_tokens={stage_tokens} "
+        f"tokens={num_tokens} warmup={is_warmup} "
         f"rank={runner.connector.world_rank}",
         flush=True,
     )
     runner.send_dp_metadata(None, prepared.slices)
     print(
         "[AFD-DBG] attn send stages done "
-        f"stages={len(prepared.slices)} tokens={num_tokens} warmup={is_warmup} "
-        f"rank={runner.connector.world_rank}",
+        f"stages={len(prepared.slices)} stage_tokens={stage_tokens} "
+        f"warmup={is_warmup} rank={runner.connector.world_rank}",
         flush=True,
     )
     runner._afd_suppress_metadata_send = True
@@ -585,9 +587,14 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
                     "descriptor/order drift for "
                     f"({desc.num_reqs}, {desc.num_tokens}); got {observed}",
                 )
+            print(
+                "[AFD-DBG] attn ubatch prepare ENTER "
+                f"desc=({desc.num_reqs},{desc.num_tokens}) warmup={is_warmup}",
+                flush=True,
+            )
             prepared = previous_ubatch_prepare(*args, **kwargs)
             print(
-                "[AFD-DBG] attn ubatch prepared "
+                "[AFD-DBG] attn ubatch prepare DONE "
                 f"desc=({desc.num_reqs},{desc.num_tokens}) warmup={is_warmup} "
                 f"stages={len(prepared.slices)}",
                 flush=True,
