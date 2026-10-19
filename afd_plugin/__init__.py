@@ -139,6 +139,35 @@ _MODEL_REGISTRATIONS = MappingProxyType(
 )
 
 
+def _configure_afd_logging() -> None:
+    """Attach AFD loggers to the logging configuration vLLM installs.
+
+    vLLM configures only the ``vllm`` logger hierarchy, so records from
+    ``afd_plugin.*`` propagate to an unconfigured root logger and are dropped.
+    Plugin diagnostics, including the worker loop's exception report, therefore
+    never reach the log and an AFD failure can look like a silent stall. Give
+    the plugin logger the same handler and level vLLM uses, keeping its own
+    records separate from vLLM's.
+    """
+
+    import logging
+
+    from vllm import envs
+    from vllm.logger import init_logger
+
+    # Builds vLLM's configuration once and returns this logger.
+    init_logger("afd_plugin")
+    afd_logger = logging.getLogger("afd_plugin")
+    afd_logger.setLevel(envs.VLLM_LOGGING_LEVEL)
+    afd_logger.propagate = False
+    if afd_logger.handlers:
+        return
+    # Reuse vLLM's handlers so the plugin honors VLLM_LOGGING_STREAM and its
+    # formatter instead of installing a second, differently formatted stream.
+    for handler in logging.getLogger("vllm").handlers:
+        afd_logger.addHandler(handler)
+
+
 def register_afd() -> None:
     """Entry point for ``vllm.general_plugins``.
 
@@ -158,6 +187,8 @@ def register_afd() -> None:
         _logger.debug("AFD plugin: vLLM not found, skipping runtime registration")
         _registered = True
         return
+
+    _configure_afd_logging()
 
     try:
         from afd_plugin.compat.vllm import assert_vllm_version_supported
